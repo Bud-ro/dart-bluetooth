@@ -1,0 +1,20 @@
+# Dart / Flutter
+.dart_tool/
+.packages
+build/
+pubspec.lock
+*.iml
+
+# Native build artifacts
+*.dylib
+*.so
+*.dll
+*.o
+*.obj
+.cxx/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store

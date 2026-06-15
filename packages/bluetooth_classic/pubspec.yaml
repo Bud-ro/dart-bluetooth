@@ -1,0 +1,47 @@
+name: bluetooth_classic
+description: >-
+  Cross-platform Bluetooth Classic (RFCOMM serial) for Dart and Flutter. One
+  package, usable from a pure-Dart CLI and from Flutter apps, with no native
+  build dependency on Flutter. Windows, macOS, Linux, Android and iOS.
+version: 0.1.0
+repository: https://github.com/carson/dart-bluetooth
+topics:
+  - bluetooth
+  - serial
+  - rfcomm
+  - ffi
+
+# NOTE: This package is intentionally Flutter-free at the Dart dependency level.
+# `package:objective_c` and `package:jni` both pull in the Flutter SDK and are
+# therefore NOT used. Native interop goes through a hand-written C ABI called via
+# `dart:ffi` + `NativeCallable`. The `flutter:` plugin block below does not
+# require a `flutter` dependency, so `dart pub get` works in a Dart-only CLI.
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  ffi: ^2.1.0
+  dbus: ^0.7.10
+  meta: ^1.15.0
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0
+  ffigen: ^20.0.0
+  native_toolchain_c: ^0.19.1
+  hooks: ^2.0.0
+  code_assets: ^1.2.0
+
+# Flutter plugin metadata. Building/running as a pure Dart package ignores this
+# block entirely. Flutter apps use it to compile & bundle the native sources.
+# Windows + Linux declare no native build: Windows uses raw FFI to system DLLs,
+# Linux uses D-Bus, so there is nothing to compile.
+flutter:
+  plugin:
+    platforms:
+      macos:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
+      android:
+        ffiPlugin: true
