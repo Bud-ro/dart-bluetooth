@@ -175,17 +175,12 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     final address = device.address;
     final uuidValue = serviceUuid.value;
     final ch = channel ?? 0;
-    final openFuture = Isolate.run(() {
-      final lib = AndroidBindings.open(); // lookups only; no re-register
-      final addrPtr = address.toNativeUtf8();
-      final uuidPtr = uuidValue.toNativeUtf8();
-      try {
-        return lib.open(token, addrPtr.cast(), ch, uuidPtr.cast());
-      } finally {
-        calloc.free(addrPtr);
-        calloc.free(uuidPtr);
-      }
-    });
+    // Run the blocking open via a top-level function (NOT an inline closure):
+    // the computation sent to Isolate.run must be sendable, and an inline closure
+    // in this method can capture non-sendable context. Mirrors the Windows path.
+    final openFuture = Isolate.run(
+      () => _androidOpen(token, address, ch, uuidValue),
+    );
 
     final int handle;
     try {
@@ -205,6 +200,17 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
       throw BluetoothTimeoutException(
         'RFCOMM connect timed out',
         timeout: timeout,
+      );
+    } on BluetoothException {
+      unawaited(transport.close());
+      rethrow;
+    } catch (e) {
+      // Any other worker-isolate failure (FFI load, isolate error, …) maps to a
+      // domain exception rather than leaking a raw ArgumentError/etc.
+      unawaited(transport.close());
+      throw BluetoothConnectionException(
+        'RFCOMM connect to ${device.address} failed',
+        cause: e,
       );
     }
     if (handle == 0) {
@@ -309,6 +315,22 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
       isConnected: (j['connected'] as bool?) ?? false,
       deviceClass: (j['classOfDevice'] as num?)?.toInt(),
     );
+  }
+}
+
+/// Runs the blocking native `open` on a helper isolate. Top-level (not a method
+/// closure) so the computation sent to [Isolate.run] captures only its sendable
+/// args. Opens its own bindings (lookups only — the global JNI callbacks were
+/// registered once on the main isolate and still deliver there).
+int _androidOpen(int token, String address, int channel, String uuid) {
+  final lib = AndroidBindings.open();
+  final addrPtr = address.toNativeUtf8();
+  final uuidPtr = uuid.toNativeUtf8();
+  try {
+    return lib.open(token, addrPtr.cast(), channel, uuidPtr.cast());
+  } finally {
+    calloc.free(addrPtr);
+    calloc.free(uuidPtr);
   }
 }
 
