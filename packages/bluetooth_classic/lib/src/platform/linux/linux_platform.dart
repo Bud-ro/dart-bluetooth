@@ -243,39 +243,6 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
   }
 
   @override
-  Stream<ConnectionState> connectionStateChanges(DeviceId device) {
-    late StreamController<ConnectionState> controller;
-    StreamSubscription<DBusPropertiesChangedSignal>? sub;
-    final obj = _obj(_devicePath(device));
-    controller = StreamController<ConnectionState>.broadcast(
-      onListen: () async {
-        try {
-          final p = await obj.getProperty(_deviceIface, 'Connected');
-          controller.add(
-            (p as DBusBoolean).value
-                ? ConnectionState.connected
-                : ConnectionState.disconnected,
-          );
-        } catch (_) {
-          /* ignore */
-        }
-        sub = obj.propertiesChanged.listen((sig) {
-          final c = sig.changedProperties['Connected'];
-          if (c is DBusBoolean) {
-            controller.add(
-              c.value
-                  ? ConnectionState.connected
-                  : ConnectionState.disconnected,
-            );
-          }
-        });
-      },
-      onCancel: () async => sub?.cancel(),
-    );
-    return controller.stream;
-  }
-
-  @override
   Future<void> pair(DeviceId device) async {
     try {
       await _obj(_devicePath(device)).callMethod(_deviceIface, 'Pair', []);

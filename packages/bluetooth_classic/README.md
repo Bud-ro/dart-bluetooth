@@ -43,7 +43,7 @@ dependencies:
 | Platform | Backend | Native build? | Notes |
 | --- | --- | --- | --- |
 | **Windows** 10+ | Winsock `AF_BTH`/`BTHPROTO_RFCOMM` + `bthprops.cpl` via `dart:ffi` | none (system DLLs) | Primary target. |
-| **Linux** | BlueZ over D-Bus (`package:dbus`) | none | Works on Raspberry Pi OS out of the box. |
+| **Linux** | BlueZ over D-Bus (`package:dbus`) | none | Raspberry Pi may need `bluetoothd --compat` for SPP (see below). |
 | **macOS** | IOBluetooth via an Obj-C C-ABI wrapper + `dart:ffi` | from source (native-assets hook / SPM) | Requires a non-zero RFCOMM channel — resolved from SDP. |
 | **Android** | Kotlin + C JNI shim via `dart:ffi` | CMake (`ffiPlugin`) | Needs runtime BT permissions. |
 | **iOS** | ExternalAccessory (`EASession`) | from source (native-assets hook / SPM) | **MFi accessories only** — see below. |
@@ -70,13 +70,15 @@ adds no Dart dependency.
 - `bondedAndDiscovered()` — paired **and** currently in range
 - `discoverServices(device)` — SDP lookup (RFCOMM channels)
 - `connect(device, {channel, serviceUuid, timeout})` → `BluetoothConnection`
-- `connectionState(device)`, `pair()`/`unpair()` (best-effort, optional)
+- `pair()`/`unpair()` (best-effort, optional)
 
 `BluetoothConnection`:
 
 - `input` — `Stream<Uint8List>`; **closes on disconnect** (clean EOF)
 - `add(bytes)` — synchronous, never blocks (drained off the calling isolate)
-- `write(bytes)` / `flush()` — backpressure-aware
+- `write(bytes)` (= `add` + `flush`); `flush()` awaits the OS accepting queued
+  bytes on Windows/Linux and is best-effort on macOS/iOS/Android (writes are
+  handed off synchronously and in order, but there's no OS drain ack)
 - `stateChanges`, `state`, `isConnected`
 - `close()` (immediate) / `finish()` (flush then close)
 
@@ -121,6 +123,11 @@ never connect on iOS** via Bluetooth Classic — `connect` throws
 `BluetoothUnsupportedException`. Use the planned
 [`bluetooth_le`](../bluetooth_le) package (BLE) for non-MFi devices on iOS.
 
+On iOS a device's `DeviceId` is the accessory's `connectionID`, which is
+**session-scoped** — it changes when the accessory reconnects and across app
+launches. Don't persist it; always re-fetch devices from `bondedDevices()` each
+session and connect using the fresh instance.
+
 ### Android
 Request runtime permissions before scanning/connecting: `BLUETOOTH_CONNECT` and
 `BLUETOOTH_SCAN` on Android 12+ (API 31+), or `BLUETOOTH`/`BLUETOOTH_ADMIN` plus
@@ -128,10 +135,14 @@ Request runtime permissions before scanning/connecting: `BLUETOOTH_CONNECT` and
 prompt the user with a permissions plugin of your choice.
 
 ### Linux / Raspberry Pi
-Needs BlueZ + D-Bus (preinstalled on Raspberry Pi OS and most desktops). For the
-Serial Port Profile you may need to enable SPP once:
-`sudo sdptool add SP` (older images) or ensure the device is paired via
-`bluetoothctl`. No build step — it's pure Dart over D-Bus.
+Needs BlueZ + D-Bus (preinstalled on Raspberry Pi OS and most desktops). No build
+step — it's pure Dart over D-Bus. The calling user must be in the `bluetooth`
+group (otherwise BlueZ returns access-denied, surfaced as
+`BluetoothPermissionException`). For the Serial Port Profile you typically need:
+- `bluetoothd` running with the compat profile: `ExecStart=… bluetoothd --compat`
+  (or `-C`) — many distro defaults omit it, so SPP isn't registered out of the box.
+- the device paired/bonded first (via `bluetoothctl`), and on older images
+  `sudo sdptool add SP`.
 
 ## Examples
 

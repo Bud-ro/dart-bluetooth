@@ -108,10 +108,6 @@ abstract class BluetoothClassicPlatform {
     Duration? timeout,
   });
 
-  /// Connection-state transitions for [device] at the OS (ACL) level, distinct
-  /// from any RFCOMM channel this package opened.
-  Stream<ConnectionState> connectionStateChanges(DeviceId device);
-
   /// Pairs with [device]. Optional capability — may throw
   /// [BluetoothUnsupportedException].
   Future<void> pair(DeviceId device);

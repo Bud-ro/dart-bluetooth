@@ -137,10 +137,6 @@ class WindowsBluetoothClassic extends BluetoothClassicPlatform {
   }
 
   @override
-  Stream<ConnectionState> connectionStateChanges(DeviceId device) =>
-      const Stream<ConnectionState>.empty();
-
-  @override
   Future<void> pair(
     DeviceId device,
   ) async => throw const BluetoothUnsupportedException(

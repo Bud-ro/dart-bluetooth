@@ -176,10 +176,6 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
   }
 
   @override
-  Stream<ConnectionState> connectionStateChanges(DeviceId device) =>
-      const Stream<ConnectionState>.empty();
-
-  @override
   Future<void> pair(DeviceId device) async =>
       throw const BluetoothUnsupportedException(
         'Programmatic pairing is not yet wired on Android; bond via system UI.',

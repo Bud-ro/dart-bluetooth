@@ -117,11 +117,6 @@ class BluetoothClassic {
     return BluetoothConnection.wrap(device, transport);
   }
 
-  /// OS-level (ACL) connection state changes for [device], independent of any
-  /// RFCOMM channel this package opened.
-  Stream<ConnectionState> connectionState(BluetoothDevice device) =>
-      _platform.connectionStateChanges(device.id);
-
   /// Pairs with [device]. Optional capability; may throw
   /// [BluetoothUnsupportedException].
   Future<void> pair(BluetoothDevice device) => _platform.pair(device.id);

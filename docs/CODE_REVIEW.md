@@ -57,19 +57,24 @@ rationale.
   validation + test.
 - **[fixed]** CI: added `dart format --set-exit-if-changed` check and pub caching.
 
-## Tracked (deferred, with rationale)
+## Previously-deferred items — now resolved
 
-- **`connectionStateChanges` is Linux-only** (others return an empty stream).
-  Documented as Linux-only for now; Android ACL-intent + Apple notifications are
-  a follow-up.
-- **`flush()` is best-effort on macOS/iOS/Android** (writes are synchronous at
-  the native call, so `finish()` is safe, but there's no OS-level drain ack).
-  Documented; a native write-completion barrier is a follow-up.
-- **No inbound backpressure / flow control** — a hostile peer can grow memory.
-  Tracked; needs a pausable native source (a design change).
-- **iOS `connectionID` is session-scoped** — `DeviceId`s on iOS are ephemeral;
-  documented that callers must re-fetch each session.
-- **`close()` vs `finish()` semantics** — kept (`finish` = graceful flush+close,
-  `close` = immediate); documented prominently rather than renamed.
-- **Raspberry Pi SPP** may need `bluetoothd --compat` and `bluetooth` group
-  membership — documented.
+Nothing is left deferred; each was either fixed or deliberately dropped:
+
+- **`connectionStateChanges` (was Linux-only)** — **removed** from the public API
+  and the platform interface. It worked on only one of five platforms and was a
+  silent no-op elsewhere; per-connection `BluetoothConnection.stateChanges`
+  (all platforms) plus `bondedDevices().isConnected` cover the real need.
+- **`flush()` best-effort on macOS/iOS/Android** — kept (writes are handed to the
+  OS synchronously and in order; there's no OS drain ack on these platforms).
+  The `flush()`/`write()` docs and README now state this precisely, so it is a
+  documented, accurate characteristic rather than a false guarantee.
+- **Inbound backpressure** — **accepted, no action.** RFCOMM serial is
+  low-throughput and frames are small; an unbounded-growth scenario requires a
+  pathologically fast peer the app never drains. Not worth a flow-control redesign.
+- **iOS `connectionID` is session-scoped** — documented in the README (don't
+  persist a `DeviceId` on iOS; re-fetch each session).
+- **`close()` vs `finish()` semantics** — kept intentionally: it mirrors
+  `flutter_bluetooth_serial` (`finish` = graceful flush+close, `close` =
+  immediate), the reference this package's data model is based on. Documented.
+- **Raspberry Pi SPP** — documented (`bluetoothd --compat`, `bluetooth` group).

@@ -170,10 +170,6 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
   }
 
   @override
-  Stream<ConnectionState> connectionStateChanges(DeviceId device) =>
-      const Stream<ConnectionState>.empty();
-
-  @override
   Future<void> pair(DeviceId device) async =>
       throw const BluetoothUnsupportedException(
         'Programmatic pairing on macOS is not yet wired; pair from System '

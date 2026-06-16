@@ -42,8 +42,6 @@ class FakeBluetoothClassicPlatform extends BluetoothClassicPlatform {
 
   final StreamController<BluetoothAdapterState> _adapterController =
       StreamController<BluetoothAdapterState>.broadcast();
-  final Map<DeviceId, StreamController<ConnectionState>> _connStateControllers =
-      {};
 
   bool discoveryStarted = false;
   bool discoveryStopped = false;
@@ -64,10 +62,6 @@ class FakeBluetoothClassicPlatform extends BluetoothClassicPlatform {
   void emitAdapterState(BluetoothAdapterState state) {
     _adapterState = state;
     _adapterController.add(state);
-  }
-
-  void emitConnectionState(DeviceId device, ConnectionState state) {
-    _connStateControllers[device]?.add(state);
   }
 
   @override
@@ -152,15 +146,6 @@ class FakeBluetoothClassicPlatform extends BluetoothClassicPlatform {
   }
 
   @override
-  Stream<ConnectionState> connectionStateChanges(DeviceId device) {
-    final c = _connStateControllers.putIfAbsent(
-      device,
-      () => StreamController<ConnectionState>.broadcast(),
-    );
-    return c.stream;
-  }
-
-  @override
   Future<void> pair(DeviceId device) async => paired.add(device);
 
   @override
@@ -169,9 +154,6 @@ class FakeBluetoothClassicPlatform extends BluetoothClassicPlatform {
   @override
   Future<void> dispose() async {
     await _adapterController.close();
-    for (final c in _connStateControllers.values) {
-      await c.close();
-    }
   }
 }
 

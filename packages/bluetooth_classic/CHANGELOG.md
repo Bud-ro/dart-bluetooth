@@ -16,6 +16,9 @@ Initial release.
 - Domain exception hierarchy; `FakeBluetoothClassicPlatform` for tests.
 - All five backends implemented (incl. Linux RFCOMM `Profile1` fd stream);
   native code pending on-device validation per OS.
+- Removed `connectionState(device)` — it was only implementable on Linux and
+  was a silent no-op elsewhere. Use `BluetoothConnection.stateChanges` (all
+  platforms) or `bondedDevices().isConnected`.
 - Hardened after a 10-axis code review: fixed a macOS write use-after-free,
   Android JNI exception-safety / thread-detach / receiver-export / write
   ordering, duplicate disconnect events, Linux profile/socket leaks and error

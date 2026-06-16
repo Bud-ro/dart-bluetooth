@@ -115,10 +115,6 @@ class IosBluetoothClassic extends BluetoothClassicPlatform {
   }
 
   @override
-  Stream<ConnectionState> connectionStateChanges(DeviceId device) =>
-      const Stream<ConnectionState>.empty();
-
-  @override
   Future<void> pair(DeviceId device) async =>
       throw const BluetoothUnsupportedException(
         'iOS handles MFi pairing in Settings; apps cannot initiate it.',
