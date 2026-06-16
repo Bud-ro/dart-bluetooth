@@ -80,3 +80,36 @@ jobs:
           target: google_apis
           working-directory: ${{ env.EXAMPLE }}
           script: flutter test integration_test/headless_behavior_test.dart -d emulator-5554
+
+  # iOS via the Flutter example on a simulator. The simulator has no Bluetooth, so
+  # this confirms the ExternalAccessory backend loads and that calls fail with
+  # domain exceptions (a non-MFi connect/pair must throw BluetoothUnsupported-
+  # Exception). Native code is built as an iOS-simulator code asset by the hook.
+  ios:
+    timeout-minutes: 35
+    name: integration ios (simulator, real backend)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
+      - name: boot iOS simulator
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; ids=[x['udid'] for v in d.values() for x in v if 'iPhone' in x['name']]; print(ids[0])")
+          echo "Booting simulator $UDID"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID"
+          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
+      - name: generate ios runner + pub get
+        working-directory: ${{ env.EXAMPLE }}
+        run: |
+          flutter create --platforms=ios --org lol.carson .
+          flutter pub get
+      - name: real-backend integration tests on simulator
+        working-directory: ${{ env.EXAMPLE }}
+        run: flutter test integration_test/headless_behavior_test.dart -d "$SIM_UDID"
