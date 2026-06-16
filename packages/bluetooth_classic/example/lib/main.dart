@@ -141,7 +141,7 @@ class _HomePageState extends State<HomePage> {
               child: TextField(
                 controller: controller,
                 decoration: const InputDecoration(hintText: 'send...'),
-                onSubmitted: (t) {
+                onSubmitted: (String t) {
                   _send(t);
                   controller.clear();
                 },
