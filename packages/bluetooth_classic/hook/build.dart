@@ -1,12 +1,14 @@
 // Native-assets build hook.
 //
 // Compiles the Apple Objective-C backend from source into a code asset so the
-// `@Native` bindings in lib/src/platform/macos/macos_bindings.dart resolve from
-// a pure-Dart CLI (`dart run`) and a Flutter macOS `flutter build`. The same
-// sources are also compiled by the SPM plugin for `flutter run`.
+// `@Native` bindings (lib/src/platform/{macos,ios}) resolve from a pure-Dart CLI
+// (`dart run`) and a Flutter `flutter build`. The same sources are also compiled
+// by the SPM plugins for `flutter run`.
 //
-// Nothing is built on Windows/Linux (those backends are pure Dart). iOS uses the
-// ExternalAccessory sources (added with the iOS backend).
+// Per target OS:
+//   macOS -> native/apple/macos/bluetooth_classic.m  (IOBluetooth)
+//   iOS   -> native/apple/ios/bluetooth_classic.m    (ExternalAccessory)
+// Windows/Linux build nothing (those backends are pure Dart).
 import 'dart:io';
 
 import 'package:code_assets/code_assets.dart';
@@ -21,35 +23,28 @@ void main(List<String> args) async {
     if (!input.config.buildCodeAssets) return;
 
     final os = input.config.code.targetOS;
-    if (os != OS.macOS && os != OS.iOS) {
-      // Windows/Linux backends need no native build.
-      return;
-    }
+    final (String subdir, List<String> frameworks) = switch (os) {
+      OS.macOS => ('macos', const ['Foundation', 'IOBluetooth']),
+      OS.iOS => ('ios', const ['Foundation', 'ExternalAccessory']),
+      _ => ('', const <String>[]),
+    };
+    if (subdir.isEmpty) return; // Windows/Linux: nothing to build.
 
-    final sources = <String>[
-      input.packageRoot
-          .resolve('native/apple/bluetooth_classic.m')
-          .toFilePath(),
-    ];
-
+    final srcDir = input.packageRoot.resolve('native/apple/$subdir/');
     final builder = CBuilder.library(
       name: _libName,
       assetName: _assetName,
       language: Language.objectiveC,
-      sources: sources,
-      frameworks: const ['Foundation', 'IOBluetooth'],
-      // ARC for the Objective-C wrapper.
+      sources: [srcDir.resolve('bluetooth_classic.m').toFilePath()],
+      includes: [srcDir.toFilePath()],
+      frameworks: frameworks,
       flags: const ['-fobjc-arc'],
     );
 
-    await builder.run(
-      input: input,
-      output: output,
-      logger: null,
-    );
+    await builder.run(input: input, output: output, logger: null);
 
     // Ad-hoc sign on macOS so the signed `dart` executable can load the dylib
-    // under Library Validation. Harmless if it's already signed.
+    // under Library Validation.
     if (os == OS.macOS) {
       final dylib =
           input.outputDirectory.resolve('lib$_libName.dylib').toFilePath();

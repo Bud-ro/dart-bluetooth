@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import '../exceptions.dart';
+import 'ios/ios_platform.dart';
 import 'linux/linux_platform.dart';
 import 'macos/macos_platform.dart';
 import 'platform_interface.dart';
@@ -15,9 +16,9 @@ BluetoothClassicPlatform createDefaultPlatform() {
   if (Platform.isLinux) return LinuxBluetoothClassic();
   if (Platform.isWindows) return WindowsBluetoothClassic();
   if (Platform.isMacOS) return MacosBluetoothClassic();
-  if (Platform.isIOS || Platform.isAndroid) {
-    // iOS (ExternalAccessory) and Android (Kotlin + JNI shim) backends land
-    // with the mobile native sources.
+  if (Platform.isIOS) return IosBluetoothClassic();
+  if (Platform.isAndroid) {
+    // Android (Kotlin + JNI shim) backend lands with the Android native source.
     throw BluetoothUnsupportedException(
       'The ${Platform.operatingSystem} backend is not wired into this build '
       'yet.',
