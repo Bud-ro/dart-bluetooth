@@ -43,6 +43,19 @@ external int bleStartScan(int scanToken, ffi.Pointer<ffi.Char> serviceUuidsCsv);
 @ffi.Native<ffi.Void Function()>(symbol: 'ble_stop_scan')
 external void bleStopScan();
 
+@ffi.Native<ffi.Int32 Function(ffi.Int64, ffi.Pointer<ffi.Char>)>(
+  symbol: 'ble_connect',
+)
+external int bleConnect(int connToken, ffi.Pointer<ffi.Char> peripheralId);
+
+@ffi.Native<ffi.Void Function(ffi.Int64)>(symbol: 'ble_disconnect')
+external void bleDisconnect(int connToken);
+
+@ffi.Native<ffi.Void Function(ffi.Int64, ffi.Int64)>(
+  symbol: 'ble_discover_services',
+)
+external void bleDiscoverServices(int reqId, int connToken);
+
 @ffi.Native<
   ffi.Void Function(
     ffi.Pointer<ffi.NativeFunction<ScanCbNative>>,

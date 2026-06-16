@@ -56,6 +56,21 @@ int32_t ble_start_scan(int64_t scan_token, const char *service_uuids_csv);
 // Stops any in-progress scan.
 void ble_stop_scan(void);
 
+// Connects to the peripheral with `peripheral_id` (a CBPeripheral identifier
+// from a prior sighting). `state_cb` reports connect/disconnect on `conn_token`.
+// Returns 0 if the connect was initiated, or -1 if the peripheral is unknown
+// (scan first). `conn_token` is the caller-assigned handle for later ops.
+int32_t ble_connect(int64_t conn_token, const char *peripheral_id);
+
+// Disconnects the connection identified by `conn_token`.
+void ble_disconnect(int64_t conn_token);
+
+// Discovers services + characteristics on `conn_token`. `op_cb` fires with
+// `req_id` and a malloc'd JSON array
+//   [{uuid, characteristics:[{uuid, properties:[...]}]}]
+// (status 0), or status != 0 on error.
+void ble_discover_services(int64_t req_id, int64_t conn_token);
+
 #if defined(__cplusplus)
 }
 #endif
