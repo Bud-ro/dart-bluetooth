@@ -14,5 +14,5 @@ Initial release.
 - `BluetoothConnection`: `Stream<Uint8List>` input (closes on disconnect),
   non-blocking `add`, `write`/`flush`, state stream, `close`/`finish`.
 - Domain exception hierarchy; `FakeBluetoothClassicPlatform` for tests.
-- Known gaps: Linux RFCOMM `Profile1` fd stream pending; mobile/Apple native
-  backends pending on-device validation.
+- All five backends implemented (incl. Linux RFCOMM `Profile1` fd stream);
+  native code pending on-device validation per OS.

@@ -372,7 +372,7 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
 /// Registers a transient `org.bluez.Profile1` to obtain an RFCOMM file
 /// descriptor for SPP, then exposes it as an [RfcommTransport].
 class _LinuxRfcommProfile implements RfcommTransport {
-  _LinuxRfcommProfile._(this._socket) {
+  _LinuxRfcommProfile._(this._socket, this._bus, this._profile) {
     _sub = _socket.listen(
       _incoming.add,
       onError: _incoming.addError,
@@ -382,6 +382,11 @@ class _LinuxRfcommProfile implements RfcommTransport {
     _state.add(ConnectionState.connected);
   }
 
+  final DBusClient _bus;
+  final DBusObject _profile;
+
+  static int _profileCounter = 0;
+
   static Future<RfcommTransport> connect({
     required DBusClient bus,
     required DBusObjectPath devicePath,
@@ -389,50 +394,68 @@ class _LinuxRfcommProfile implements RfcommTransport {
     int? channel,
     Duration? timeout,
   }) async {
-    // BlueZ delivers the connected fd via a registered Profile1 object's
-    // NewConnection method. The fd is wrapped as a Socket for duplex I/O.
-    //
-    // Full RegisterProfile/NewConnection plumbing is implemented in
-    // _ProfileHandler; here we drive the Device1.ConnectProfile path which, for
-    // an already-paired device advertising SPP, triggers the same flow.
+    // BlueZ delivers the connected RFCOMM socket as a Unix fd to a registered
+    // Profile1 object's NewConnection method. We export such an object, register
+    // the profile, then trigger Device1.ConnectProfile; the fd that arrives is
+    // adopted as a dart:io Socket for duplex I/O.
     final completer = Completer<RfcommTransport>();
-    final handler = _ProfileHandler(
-      bus: bus,
-      serviceUuid: serviceUuid,
-      channel: channel,
-      onConnection: (socket) {
-        if (!completer.isCompleted) {
-          completer.complete(_LinuxRfcommProfile._(socket));
-        }
-      },
-      onError: (e) {
-        if (!completer.isCompleted) {
-          completer.completeError(
-            BluetoothConnectionException('RFCOMM connect failed', cause: e),
-          );
-        }
-      },
-    );
-    await handler.register();
+    final profilePath = DBusObjectPath(
+        '/lol/carson/bluetooth_classic/profile${_profileCounter++}');
+    late final _Profile1 profile;
+    profile = _Profile1(profilePath, (socket) {
+      if (!completer.isCompleted) {
+        completer.complete(_LinuxRfcommProfile._(socket, bus, profile));
+      }
+    });
+    await bus.registerObject(profile);
+
+    final mgr = DBusRemoteObject(bus,
+        name: 'org.bluez', path: DBusObjectPath('/org/bluez'));
+    final options = <String, DBusValue>{'Role': const DBusString('client')};
+    if (channel != null && channel > 0) {
+      options['Channel'] = DBusUint16(channel);
+    }
+    try {
+      await mgr.callMethod(
+        'org.bluez.ProfileManager1',
+        'RegisterProfile',
+        [
+          profilePath,
+          DBusString(serviceUuid.value),
+          DBusDict.stringVariant(options),
+        ],
+        replySignature: DBusSignature(''),
+      );
+    } catch (e) {
+      await bus.unregisterObject(profile);
+      throw BluetoothConnectionException('RegisterProfile failed', cause: e);
+    }
+
     final device = DBusRemoteObject(bus, name: 'org.bluez', path: devicePath);
     try {
-      await device.callMethod('org.bluez.Device1', 'ConnectProfile', [
-        DBusString(serviceUuid.value),
-      ]);
+      await device.callMethod(
+        'org.bluez.Device1',
+        'ConnectProfile',
+        [DBusString(serviceUuid.value)],
+        replySignature: DBusSignature(''),
+      );
     } catch (e) {
-      await handler.unregister();
+      await bus.unregisterObject(profile);
       throw BluetoothConnectionException('ConnectProfile failed', cause: e);
     }
-    final future = timeout != null
+
+    return timeout != null
         ? completer.future.timeout(
             timeout,
-            onTimeout: () => throw BluetoothTimeoutException(
-              'RFCOMM connect timed out',
-              timeout: timeout,
-            ),
+            onTimeout: () {
+              unawaited(bus.unregisterObject(profile));
+              throw BluetoothTimeoutException(
+                'RFCOMM connect timed out',
+                timeout: timeout,
+              );
+            },
           )
         : completer.future;
-    return future;
   }
 
   final Socket _socket;
@@ -472,6 +495,9 @@ class _LinuxRfcommProfile implements RfcommTransport {
       await _socket.close();
     } catch (_) {/* already gone */}
     _socket.destroy();
+    try {
+      await _bus.unregisterObject(_profile);
+    } catch (_) {/* already gone */}
     if (!_state.isClosed) {
       _state.add(ConnectionState.disconnected);
       await _state.close();
@@ -484,35 +510,29 @@ class _LinuxRfcommProfile implements RfcommTransport {
   }
 }
 
-/// Owns the lifecycle of a temporary Profile1 D-Bus object. The bridge from the
-/// BlueZ-delivered Unix file descriptor to a Dart [Socket] is done with
-/// [Socket.fromRawSocket]/`RawSocket` over the inherited fd.
-class _ProfileHandler {
-  _ProfileHandler({
-    required this.bus,
-    required this.serviceUuid,
-    required this.channel,
-    required this.onConnection,
-    required this.onError,
-  });
+/// A transient `org.bluez.Profile1` exported on the bus. BlueZ invokes
+/// `NewConnection(object device, fd handle, dict props)` with the connected
+/// RFCOMM socket as a Unix fd, which we adopt as a dart:io [Socket].
+class _Profile1 extends DBusObject {
+  _Profile1(super.path, this.onConnection);
 
-  final DBusClient bus;
-  final Uuid serviceUuid;
-  final int? channel;
   final void Function(Socket socket) onConnection;
-  final void Function(Object error) onError;
 
-  Future<void> register() async {
-    // Implementation note: registering a Profile1 requires exporting a local
-    // D-Bus object whose NewConnection(object, fd, props) receives the RFCOMM
-    // fd as a DBusUnixFd. That fd is then adopted via the dart:io socket APIs.
-    // This is wired in the Linux integration test harness; the desktop-primary
-    // targets are Windows and macOS.
-    throw const BluetoothUnsupportedException(
-      'Linux RFCOMM Profile1 fd adoption is pending integration on this build. '
-      'Adapter state, discovery, bonded enumeration and pairing work.',
-    );
+  @override
+  Future<DBusMethodResponse> handleMethodCall(DBusMethodCall methodCall) async {
+    if (methodCall.interface == 'org.bluez.Profile1') {
+      switch (methodCall.name) {
+        case 'NewConnection':
+          if (methodCall.values.length >= 2) {
+            final socket = methodCall.values[1].asUnixFd().toSocket();
+            onConnection(socket);
+          }
+          return DBusMethodSuccessResponse([]);
+        case 'RequestDisconnection':
+        case 'Release':
+          return DBusMethodSuccessResponse([]);
+      }
+    }
+    return DBusMethodErrorResponse.unknownMethod();
   }
-
-  Future<void> unregister() async {}
 }

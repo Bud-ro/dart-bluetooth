@@ -133,7 +133,8 @@ final bt = BluetoothClassic(platform: fake);
 
 ## Status
 
-Desktop (Windows, Linux, macOS) and the Dart layer are implemented and tested;
-the mobile/Apple native code is complete but pending on-device validation. The
-Linux RFCOMM file-descriptor stream (BlueZ `Profile1`) is the remaining gap;
-adapter state, discovery, bonded enumeration and pairing work today.
+The Dart layer is implemented and unit-tested across all platforms. Every
+backend — Windows (Winsock), Linux (BlueZ, including the `Profile1` RFCOMM
+file-descriptor stream), macOS/iOS (IOBluetooth/ExternalAccessory), and Android
+(Kotlin + JNI) — is implemented and pending validation against real hardware on
+each OS.
