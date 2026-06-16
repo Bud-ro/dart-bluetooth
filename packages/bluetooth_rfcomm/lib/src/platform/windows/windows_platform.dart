@@ -137,7 +137,9 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
     final address = device.address;
     final uuid = serviceUuid.value;
-    final int result;
+    // (socket, errorCode): separate fields so a SOCKET (an unsigned UINT_PTR)
+    // can never be misread as an error code, whatever its high bit.
+    final (int, int) connectResult;
     try {
       final connectFuture = Isolate.run(
         () => _connectSocket(address, channel, uuid),
@@ -147,15 +149,16 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
       // the returned SOCKET would be dropped without closesocket — leaking the
       // handle and leaving a half-open RFCOMM link. Close any late socket.
       unawaited(
-        connectFuture.then((sock) {
-          if (timedOut && sock >= 0) {
+        connectFuture.then((r) {
+          final (sock, err) = r;
+          if (timedOut && err == 0 && sock != 0) {
             try {
               _ws.closesocket(sock);
             } catch (_) {}
           }
         }, onError: (_) {}),
       );
-      result = await (timeout == null
+      connectResult = await (timeout == null
           ? connectFuture
           : connectFuture.timeout(
               timeout,
@@ -177,13 +180,14 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
         cause: e,
       );
     }
-    if (result < 0) {
+    final (socket, error) = connectResult;
+    if (error != 0) {
       throw BluetoothConnectionException(
         'RFCOMM connect to $address failed',
-        code: -result,
+        code: error,
       );
     }
-    return _WindowsRfcommTransport(socket: result, ws: _ws);
+    return _WindowsRfcommTransport(socket: socket, ws: _ws);
   }
 
   @override
@@ -314,17 +318,17 @@ _RawDevice _readDevice(BluetoothDeviceInfo info) {
   );
 }
 
-/// Maps a WSA error to a guaranteed-negative failure sentinel (so a spurious
-/// `WSAGetLastError()` of 0 can't be mistaken for the valid SOCKET handle 0).
-int _connectError(int err) => err == 0 ? -1 : -err;
+/// A WSA error code, or -1 when the call failed but `WSAGetLastError()` was 0.
+int _wsaError(int err) => err == 0 ? -1 : err;
 
-/// Opens and connects an RFCOMM socket. Returns the SOCKET handle on success,
-/// or a negative failure sentinel (see [_connectError]).
-int _connectSocket(String address, int? channel, String serviceUuid) {
+/// Opens and connects an RFCOMM socket. Returns `(socket, 0)` on success or
+/// `(0, errorCode)` on failure. The handle and error are separate fields so a
+/// SOCKET (an unsigned `UINT_PTR`) can never be mistaken for an error code.
+(int, int) _connectSocket(String address, int? channel, String serviceUuid) {
   final ws = WinsockBindings();
   ws.startup();
   final sock = ws.socket(afBth, sockStream, bthprotoRfcomm);
-  if (sock == invalidSocket) return _connectError(ws.wsaGetLastError());
+  if (sock == invalidSocket) return (0, _wsaError(ws.wsaGetLastError()));
 
   final addr = calloc<SockaddrBth>();
   try {
@@ -341,9 +345,9 @@ int _connectSocket(String address, int? channel, String serviceUuid) {
     if (rc == socketError) {
       final err = ws.wsaGetLastError();
       ws.closesocket(sock);
-      return _connectError(err);
+      return (0, _wsaError(err));
     }
-    return sock;
+    return (sock, 0);
   } finally {
     calloc.free(addr);
   }
