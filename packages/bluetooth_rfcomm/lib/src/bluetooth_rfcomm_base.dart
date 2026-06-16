@@ -144,11 +144,14 @@ class BluetoothRfcomm {
     return BluetoothConnection.wrap(device, transport);
   }
 
-  /// Pairs with [device]. Optional capability; may throw
-  /// [BluetoothUnsupportedException].
+  /// Pairs with [device]. Optional capability — implemented on Linux (BlueZ);
+  /// Windows/macOS/Android/iOS throw [BluetoothUnsupportedException] (pair via
+  /// the OS settings there). Most devices must be bonded before [connect].
   Future<void> pair(BluetoothDevice device) => _platform.pair(device.id);
 
-  /// Removes the bond with [device]. Optional capability.
+  /// Removes the bond with [device]. Optional capability — implemented on Linux;
+  /// other platforms throw [BluetoothUnsupportedException] (unpair via OS
+  /// settings).
   Future<void> unpair(BluetoothDevice device) => _platform.unpair(device.id);
 
   /// Releases global resources held by the backend (worker isolates, native

@@ -82,7 +82,13 @@ The Apple sources are compiled by the native-assets `hook/build.dart` for both
 - `bondedAndDiscovered()` — paired **and** currently in range
 - `discoverServices(device)` — SDP lookup (RFCOMM channels)
 - `connect(device, {channel, serviceUuid, timeout})` → `BluetoothConnection`
-- `pair()`/`unpair()` (best-effort, optional)
+- `pair()`/`unpair()` — optional; implemented on Linux, throws
+  `BluetoothUnsupportedException` elsewhere (pair via OS settings)
+
+This package is an RFCOMM **client** (it initiates outbound connections); there's
+no server/listen mode for accepting incoming connections. `connect` failures that
+are worth retrying report `BluetoothException.isTransient == true`; a
+`BluetoothConnection` is single-use, so reconnect by calling `connect` again.
 
 `BluetoothConnection`:
 
