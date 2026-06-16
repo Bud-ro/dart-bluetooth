@@ -3,16 +3,35 @@
 /// Mirrors the `classic` / `le` / `dual` distinction exposed by every platform
 /// so callers can filter discovery results. This package only operates on the
 /// BR/EDR (Classic) capability of a device; a [dual] device works fine.
-enum BluetoothDeviceType { unknown, classic, le, dual }
+enum BluetoothDeviceType {
+  /// Type could not be determined.
+  unknown,
+
+  /// Bluetooth Classic (BR/EDR) only.
+  classic,
+
+  /// Bluetooth Low Energy only.
+  le,
+
+  /// Supports both Classic and LE.
+  dual,
+}
 
 /// Pairing / bonding state of a remote device.
 ///
 /// "Bonded" means the OS has stored link keys for the device. On most platforms
 /// a Classic RFCOMM connection requires the device to be bonded first.
 enum BluetoothBondState {
+  /// Bond state could not be determined.
   unknown,
+
+  /// Not bonded.
   none,
+
+  /// Bonding is in progress.
   bonding,
+
+  /// Bonded — the OS has stored link keys.
   bonded;
 
   /// Whether the device currently has stored link keys.
@@ -51,11 +70,24 @@ enum BluetoothAdapterState {
 }
 
 /// Lifecycle state of a single [BluetoothConnection].
+///
+/// A [BluetoothConnection] only exists after [connect] resolves, so it starts at
+/// [connected]; [connecting] is part of the model but not emitted by a live
+/// connection's `stateChanges` (which in practice emits only the terminal
+/// [disconnected]).
 enum ConnectionState {
+  /// Not connected (initial, or after the link dropped / was closed).
   disconnected,
+
+  /// A connection attempt is in progress.
   connecting,
+
+  /// Connected and ready for I/O.
   connected,
+
+  /// A graceful shutdown is in progress.
   disconnecting;
 
+  /// Whether the connection is currently usable.
   bool get isConnected => this == ConnectionState.connected;
 }

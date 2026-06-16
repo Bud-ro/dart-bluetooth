@@ -9,6 +9,8 @@ apps. Read and write `Uint8List`, list paired/discovered devices, pick the
 RFCOMM channel, and get notified of connection-state changes.
 
 ```dart
+import 'dart:typed_data';
+
 import 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart';
 
 final bt = BluetoothRfcomm.instance;
@@ -75,7 +77,7 @@ The Apple sources are compiled by the native-assets `hook/build.dart` for both
 
 `BluetoothRfcomm` (use `.instance`, or construct with a `platform:` for tests):
 
-- `isSupported()`, `adapterStateNow()`, `adapterState` (stream),
+- `isSupported()`, `adapterState()`, `adapterStateChanges` (stream),
   `requestEnable()`/`requestDisable()` (where the OS permits)
 - `bondedDevices()` — paired devices
 - `startDiscovery()` → `Stream<BluetoothDiscoveryResult>`, `stopDiscovery()`
@@ -164,8 +166,7 @@ group (otherwise BlueZ returns access-denied, surfaced as
 
 ## Examples
 
-- [`example_cli/`](example_cli) — pure-Dart CLI (`dart run`): `list`, `scan`,
-  `connect`.
+- [`example/`](example) — pure-Dart CLI (`dart run`): `list`, `scan`, `connect`.
 - The Flutter demo lives with the plugin:
   [`bluetooth_rfcomm_flutter/example`](../bluetooth_rfcomm_flutter/example).
 

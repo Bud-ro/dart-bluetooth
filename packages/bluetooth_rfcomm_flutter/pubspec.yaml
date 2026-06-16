@@ -1,8 +1,8 @@
 name: bluetooth_rfcomm_flutter
 description: >-
-  Flutter plugin that provides the Android (and Apple, via native assets) native
-  builds for bluetooth_rfcomm. Add this to a Flutter app; import and use the
-  bluetooth_rfcomm API as normal.
+  Flutter plugin providing the Android (and Apple, via native assets) native
+  builds for bluetooth_rfcomm. Add it to a Flutter app and use the
+  bluetooth_rfcomm API.
 version: 0.1.0
 repository: https://github.com/Bud-ro/dart-bluetooth
 homepage: https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_rfcomm_flutter

@@ -196,6 +196,17 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
         'Programmatic unpairing on macOS is not yet wired.',
       );
 
+  @override
+  Future<void> dispose() async {
+    for (final t in _transports.values.toList()) {
+      await t.close();
+    }
+    for (final c in _discoveries.values.toList()) {
+      if (!c.isClosed) await c.close();
+    }
+    _discoveries.clear();
+  }
+
   // --- callback dispatch (static; correlate by token) ----------------------
 
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {

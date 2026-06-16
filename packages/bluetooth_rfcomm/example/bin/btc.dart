@@ -32,7 +32,7 @@ Future<void> main(List<String> argv) async {
   // BluetoothException, so it escapes and fails — exactly what CI wants to catch.
   if (argv.first == 'doctor') {
     final supported = await bt.isSupported();
-    final state = await bt.adapterStateNow();
+    final state = await bt.adapterState();
     stdout.writeln('supported : $supported');
     stdout.writeln('adapter   : ${state.name}');
     stdout.writeln('OK: native backend loaded.');
@@ -44,7 +44,7 @@ Future<void> main(List<String> argv) async {
       stderr.writeln('Bluetooth Classic is not supported on this host.');
       exit(1);
     }
-    final state = await bt.adapterStateNow();
+    final state = await bt.adapterState();
     if (!state.isOn) {
       stderr.writeln('Adapter is ${state.name}. Turn Bluetooth on and retry.');
       exit(1);

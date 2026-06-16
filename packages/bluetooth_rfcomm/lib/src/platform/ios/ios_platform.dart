@@ -126,6 +126,13 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
         'iOS handles MFi unpairing in Settings.',
       );
 
+  @override
+  Future<void> dispose() async {
+    for (final t in _transports.values.toList()) {
+      await t.close();
+    }
+  }
+
   // --- helpers -------------------------------------------------------------
 
   Future<List<BluetoothDevice>> _accessories() async {

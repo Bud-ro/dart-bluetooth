@@ -15,12 +15,12 @@ void main() {
 
   test('isSupported / adapter state pass through', () async {
     expect(await bt.isSupported(), isTrue);
-    expect(await bt.adapterStateNow(), BluetoothAdapterState.on);
+    expect(await bt.adapterState(), BluetoothAdapterState.on);
   });
 
   test('adapterState stream emits current then changes', () async {
     final events = <BluetoothAdapterState>[];
-    final sub = bt.adapterState.listen(events.add);
+    final sub = bt.adapterStateChanges.listen(events.add);
     await Future<void>.delayed(Duration.zero);
     fake.emitAdapterState(BluetoothAdapterState.turningOff);
     fake.emitAdapterState(BluetoothAdapterState.off);

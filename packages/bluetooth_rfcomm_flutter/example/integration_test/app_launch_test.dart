@@ -24,7 +24,7 @@ void main() {
     // throwing a loading error — not that Bluetooth is present.
     final bt = BluetoothRfcomm.instance;
     final supported = await bt.isSupported();
-    final state = await bt.adapterStateNow();
+    final state = await bt.adapterState();
     expect(supported, isA<bool>());
     expect(state, isA<BluetoothAdapterState>());
 

@@ -94,28 +94,28 @@ abstract class BluetoothRfcommPlatform {
   /// Stops any in-progress inquiry.
   Future<void> stopDiscovery();
 
-  /// Resolves the RFCOMM services advertised by [device] via SDP, optionally
+  /// Resolves the RFCOMM services advertised by device [id] via SDP, optionally
   /// filtered to a single [serviceUuid].
   Future<List<BluetoothService>> discoverServices(
-    DeviceId device, {
+    DeviceId id, {
     Uuid? serviceUuid,
   });
 
-  /// Opens an RFCOMM channel. If [channel] is given it is used verbatim;
-  /// otherwise the channel is resolved from SDP for [serviceUuid].
+  /// Opens an RFCOMM channel to device [id]. If [channel] is given it is used
+  /// verbatim; otherwise the channel is resolved from SDP for [serviceUuid].
   Future<RfcommTransport> openRfcomm(
-    DeviceId device, {
+    DeviceId id, {
     int? channel,
     required Uuid serviceUuid,
     Duration? timeout,
   });
 
-  /// Pairs with [device]. Optional capability — may throw
+  /// Pairs with device [id]. Optional capability — may throw
   /// [BluetoothUnsupportedException].
-  Future<void> pair(DeviceId device);
+  Future<void> pair(DeviceId id);
 
-  /// Removes the bond with [device]. Optional capability.
-  Future<void> unpair(DeviceId device);
+  /// Removes the bond with device [id]. Optional capability.
+  Future<void> unpair(DeviceId id);
 
   /// Releases any global resources held by the backend.
   Future<void> dispose() async {}

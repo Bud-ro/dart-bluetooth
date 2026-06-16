@@ -62,14 +62,14 @@ jobs:
         run: dart pub publish --dry-run
 
       - name: build CLI example (drives the native-assets build hook)
-        working-directory: ${{ env.PKG }}/example_cli
+        working-directory: ${{ env.PKG }}/example
         run: |
           dart pub get
           dart analyze
           dart build cli
 
       - name: launch smoke — run the built CLI doctor (loads native backend)
-        working-directory: ${{ env.PKG }}/example_cli
+        working-directory: ${{ env.PKG }}/example
         shell: bash
         run: |
           BIN=$(find build/cli -type f -name 'btc*' ! -name '*.dll' | head -1)

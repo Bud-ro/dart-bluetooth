@@ -199,12 +199,15 @@ class FakeRfcommTransport implements RfcommTransport {
     _incoming.add(Uint8List.fromList(bytes));
   }
 
-  /// Simulates the peer dropping the link.
+  /// Simulates the peer dropping the link. Mirrors real backends, which close
+  /// both the state and incoming streams on a peer-initiated disconnect.
   void dropPeer() {
     if (_closed) return;
+    _closed = true;
     _current = ConnectionState.disconnected;
     _state.add(ConnectionState.disconnected);
-    unawaited(_incoming.close());
+    if (!_state.isClosed) unawaited(_state.close());
+    if (!_incoming.isClosed) unawaited(_incoming.close());
   }
 
   @override

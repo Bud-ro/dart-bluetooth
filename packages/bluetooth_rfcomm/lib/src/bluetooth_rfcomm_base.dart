@@ -32,11 +32,17 @@ class BluetoothRfcomm {
   /// Whether this host can do Bluetooth Classic RFCOMM at all.
   Future<bool> isSupported() => _platform.isSupported();
 
-  /// The current adapter power/authorization state.
-  Future<BluetoothAdapterState> adapterStateNow() => _platform.adapterState();
+  /// The current adapter power/authorization state (one-shot snapshot).
+  ///
+  /// Mirrors the [BluetoothConnection] convention: [adapterState] is the
+  /// snapshot, [adapterStateChanges] is the stream.
+  Future<BluetoothAdapterState> adapterState() => _platform.adapterState();
 
   /// Adapter state changes. Broadcast; emits the current state on listen.
-  Stream<BluetoothAdapterState> get adapterState =>
+  ///
+  /// Live updates only on Linux; other platforms emit the current state once
+  /// and then close.
+  Stream<BluetoothAdapterState> get adapterStateChanges =>
       _platform.adapterStateChanges();
 
   /// Asks the OS to power the radio on. Throws
@@ -90,8 +96,11 @@ class BluetoothRfcomm {
     try {
       await Future<void>.delayed(timeout);
     } finally {
+      // Cancelling the subscription stops this inquiry via the stream's onCancel
+      // (which calls the native stop). Don't also call the public stopDiscovery()
+      // — it's global and would tear down any concurrent discovery the caller is
+      // running.
       await sub.cancel();
-      await stopDiscovery();
     }
     if (discoveryError != null && seen.isEmpty) {
       throw discoveryError is BluetoothException
@@ -119,10 +128,10 @@ class BluetoothRfcomm {
   /// relying on a device that doesn't advertise SDP will fail; pass an explicit
   /// [channel] in that case.
   ///
-  /// If [timeout] is null no deadline is applied and the attempt can take as
-  /// long as the OS allows. Note that on Android the native socket connect is
-  /// synchronous, so it blocks the calling isolate until it succeeds or the OS
-  /// gives up (~12s); [timeout] cannot interrupt that window.
+  /// The blocking native connect runs off the calling isolate on every platform,
+  /// so this never hangs the caller. If [timeout] is null no caller deadline is
+  /// applied (the attempt runs until the OS resolves it; Linux additionally caps
+  /// it with an internal safety timeout).
   ///
   /// Throws [BluetoothTimeoutException] if [timeout] elapses, and
   /// [BluetoothConnectionException] on failure. Where the platform can tell that
@@ -154,8 +163,12 @@ class BluetoothRfcomm {
   /// settings).
   Future<void> unpair(BluetoothDevice device) => _platform.unpair(device.id);
 
-  /// Releases global resources held by the backend (worker isolates, native
-  /// callbacks, D-Bus connection). Call when you're done using this instance.
-  /// The shared [instance] generally lives for the app's lifetime.
+  /// Releases resources held by the backend: closes any still-open connections
+  /// and discovery streams, and the Linux D-Bus client. Call when you're done
+  /// with this instance — don't call it while operations are still in flight.
+  ///
+  /// Process-lifetime native callback registrations (the FFI `NativeCallable`
+  /// listeners on Android/macOS/iOS) are intentionally not torn down; the shared
+  /// [instance] generally lives for the app's lifetime.
   Future<void> dispose() => _platform.dispose();
 }

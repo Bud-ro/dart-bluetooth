@@ -231,6 +231,17 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
         'Programmatic unpairing is not yet wired on Android.',
       );
 
+  @override
+  Future<void> dispose() async {
+    for (final t in _transports.values.toList()) {
+      await t.close();
+    }
+    for (final c in _discoveries.values.toList()) {
+      if (!c.isClosed) await c.close();
+    }
+    _discoveries.clear();
+  }
+
   // --- static callback dispatch --------------------------------------------
 
   static void _onFound(int token, ffi.Pointer<ffi.Char> json) {

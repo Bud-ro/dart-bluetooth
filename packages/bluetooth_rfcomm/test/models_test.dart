@@ -160,5 +160,27 @@ void main() {
       expect(e.toString(), contains('nope'));
       expect(e.toString(), contains('42'));
     });
+
+    test('isTransient classification (retryable vs fatal)', () {
+      // Transient — a reconnect loop should retry these.
+      expect(const BluetoothConnectionException('x').isTransient, isTrue);
+      expect(const BluetoothTimeoutException('x').isTransient, isTrue);
+      expect(const DeviceNotFoundException('x').isTransient, isTrue);
+      // Fatal — retrying won't help.
+      expect(const BluetoothException('x').isTransient, isFalse);
+      expect(const BluetoothUnsupportedException('x').isTransient, isFalse);
+      expect(const BluetoothPermissionException('x').isTransient, isFalse);
+      expect(const BluetoothDisabledException('x').isTransient, isFalse);
+      expect(const BluetoothWriteException('x').isTransient, isFalse);
+      expect(const BluetoothDiscoveryException('x').isTransient, isFalse);
+      expect(const ServiceNotFoundException('x').isTransient, isFalse);
+    });
+  });
+
+  group('DeviceId.isPersistent', () {
+    test('true for MAC addresses, false for opaque ids', () {
+      expect(DeviceId.address('AA:BB:CC:DD:EE:FF').isPersistent, isTrue);
+      expect(const DeviceId.opaque('tok').isPersistent, isFalse);
+    });
   });
 }

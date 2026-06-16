@@ -54,6 +54,8 @@ class BluetoothDevice {
   /// id is an opaque token). Guard with [hasAddress], or use `id.value`.
   String get address => id.address;
 
+  /// Returns a copy with the given fields replaced. [id] is identity and is
+  /// always preserved (so the copy compares equal to the original).
   BluetoothDevice copyWith({
     String? name,
     BluetoothDeviceType? type,
