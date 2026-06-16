@@ -209,6 +209,8 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
           ),
         );
       }
+    } catch (_) {
+      // Skip a malformed sighting rather than tearing down discovery.
     } finally {
       _activeLib?.free(json.cast());
     }
@@ -240,9 +242,13 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
 
   static BluetoothDevice _deviceFromJson(Map<String, dynamic> j) {
     final bonded = (j['bonded'] as bool?) ?? false;
+    final addr = j['address'] as String?;
+    final name = j['name'] as String?;
     return BluetoothDevice(
-      id: DeviceId.address(j['address'] as String),
-      name: j['name'] as String?,
+      id: (addr != null && addr.isNotEmpty)
+          ? DeviceId.address(addr)
+          : DeviceId.opaque(name ?? 'android-device'),
+      name: name,
       type: BluetoothDeviceType.classic,
       bondState: bonded ? BluetoothBondState.bonded : BluetoothBondState.none,
       rssi: (j['rssi'] as num?)?.toInt(),

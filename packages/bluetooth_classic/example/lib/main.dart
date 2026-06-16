@@ -36,34 +36,57 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _refresh() async {
     final bonded = await _bt.bondedDevices();
-    setState(() => _devices
-      ..clear()
-      ..addAll(bonded));
+    if (!mounted) return;
+    setState(
+      () => _devices
+        ..clear()
+        ..addAll(bonded),
+    );
   }
 
   Future<void> _scan() async {
     setState(() => _scanning = true);
     final seen = {for (final d in _devices) d.id};
     final sub = _bt.startDiscovery().listen((r) {
-      if (seen.add(r.device.id)) setState(() => _devices.add(r.device));
+      if (seen.add(r.device.id) && mounted) {
+        setState(() => _devices.add(r.device));
+      }
     });
     await Future<void>.delayed(const Duration(seconds: 8));
     await sub.cancel();
     await _bt.stopDiscovery();
+    if (!mounted) return;
     setState(() => _scanning = false);
   }
 
   Future<void> _connect(BluetoothDevice device) async {
     try {
-      final conn = await _bt.connect(device, timeout: const Duration(seconds: 15));
-      _rx = conn.input.listen((bytes) {
-        setState(() => _log.write(utf8.decode(bytes, allowMalformed: true)));
-      }, onDone: () => setState(() => _log.writeln('\n[disconnected]')));
+      final conn = await _bt.connect(
+        device,
+        timeout: const Duration(seconds: 15),
+      );
+      if (!mounted) {
+        await conn.close();
+        return;
+      }
+      _rx = conn.input.listen(
+        (bytes) {
+          if (mounted) {
+            setState(
+              () => _log.write(utf8.decode(bytes, allowMalformed: true)),
+            );
+          }
+        },
+        onDone: () {
+          if (mounted) setState(() => _log.writeln('\n[disconnected]'));
+        },
+      );
       setState(() => _conn = conn);
     } on BluetoothException catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.message)));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.message)));
       }
     }
   }
@@ -71,6 +94,7 @@ class _HomePageState extends State<HomePage> {
   Future<void> _disconnect() async {
     await _rx?.cancel();
     await _conn?.finish();
+    if (!mounted) return;
     setState(() => _conn = null);
   }
 
@@ -96,7 +120,10 @@ class _HomePageState extends State<HomePage> {
             onPressed: _scanning ? null : _scan,
             icon: _scanning
                 ? const SizedBox(
-                    width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
                 : const Icon(Icons.search),
           ),
         ],
@@ -106,19 +133,19 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _deviceList() => ListView(
-        children: [
-          for (final d in _devices)
-            ListTile(
-              leading: Icon(d.bondState.isBonded
-                  ? Icons.bluetooth_connected
-                  : Icons.bluetooth),
-              title: Text(d.name ?? '(unknown)'),
-              subtitle: Text('${d.id}'),
-              trailing: d.rssi != null ? Text('${d.rssi} dBm') : null,
-              onTap: () => _connect(d),
-            ),
-        ],
-      );
+    children: [
+      for (final d in _devices)
+        ListTile(
+          leading: Icon(
+            d.bondState.isBonded ? Icons.bluetooth_connected : Icons.bluetooth,
+          ),
+          title: Text(d.name ?? '(unknown)'),
+          subtitle: Text('${d.id}'),
+          trailing: d.rssi != null ? Text('${d.rssi} dBm') : null,
+          onTap: () => _connect(d),
+        ),
+    ],
+  );
 
   Widget _terminal() {
     final controller = TextEditingController();
@@ -129,27 +156,33 @@ class _HomePageState extends State<HomePage> {
             width: double.infinity,
             padding: const EdgeInsets.all(12),
             child: SingleChildScrollView(
-              child: Text(_log.toString(),
-                  style: const TextStyle(fontFamily: 'monospace')),
+              child: Text(
+                _log.toString(),
+                style: const TextStyle(fontFamily: 'monospace'),
+              ),
             ),
           ),
         ),
         Padding(
           padding: const EdgeInsets.all(8),
-          child: Row(children: [
-            Expanded(
-              child: TextField(
-                controller: controller,
-                decoration: const InputDecoration(hintText: 'send...'),
-                onSubmitted: (String t) {
-                  _send(t);
-                  controller.clear();
-                },
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: controller,
+                  decoration: const InputDecoration(hintText: 'send...'),
+                  onSubmitted: (String t) {
+                    _send(t);
+                    controller.clear();
+                  },
+                ),
               ),
-            ),
-            IconButton(
-                onPressed: _disconnect, icon: const Icon(Icons.link_off)),
-          ]),
+              IconButton(
+                onPressed: _disconnect,
+                icon: const Icon(Icons.link_off),
+              ),
+            ],
+          ),
         ),
       ],
     );

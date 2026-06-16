@@ -327,6 +327,7 @@ class _MacRfcommTransport implements RfcommTransport {
       if (!_connected.isCompleted) {
         _connected.completeError(
           const BluetoothConnectionException('RFCOMM channel failed to open'),
+          StackTrace.current,
         );
       }
       unawaited(close());

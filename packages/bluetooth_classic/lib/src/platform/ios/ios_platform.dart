@@ -141,7 +141,7 @@ class IosBluetoothClassic extends BluetoothClassicPlatform {
       return list
           .map(
             (j) => BluetoothDevice(
-              id: DeviceId.opaque(j['id'] as String),
+              id: DeviceId.opaque((j['id'] as String?) ?? 'ios-accessory'),
               name: j['name'] as String?,
               type: BluetoothDeviceType.classic,
               bondState: BluetoothBondState.bonded,
@@ -216,6 +216,7 @@ class _IosEaTransport implements RfcommTransport {
       if (!_connected.isCompleted) {
         _connected.completeError(
           const BluetoothConnectionException('EASession failed to open'),
+          StackTrace.current,
         );
       }
       unawaited(close());
