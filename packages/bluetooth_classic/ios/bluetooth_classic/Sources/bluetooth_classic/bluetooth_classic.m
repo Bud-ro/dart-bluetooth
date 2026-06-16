@@ -236,6 +236,7 @@ int64_t btc_ea_open(int64_t token, const char *accessory_id,
                     const char *protocol, btc_data_cb data,
                     btc_state_cb state) {
   __block int64_t handle = 0;
+  if (!accessory_id) return 0;
   NSUInteger wantedId = (NSUInteger)strtoull(accessory_id, NULL, 10);
   NSString *proto = (protocol && protocol[0]) ? @(protocol) : nil;
   [[BTCWorker shared] runSync:^{

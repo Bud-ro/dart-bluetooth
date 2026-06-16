@@ -24,14 +24,19 @@ class BluetoothConnection {
     _inputSub = _transport.incoming.listen(
       _inputController.add,
       onError: _inputController.addError,
-      onDone: () {
-        unawaited(_inputController.close());
-      },
+      // Peer-initiated disconnect: the transport closes its incoming stream.
+      onDone: () => unawaited(_cleanup()),
     );
     _stateSub = _transport.stateChanges.listen((s) {
       _state = s;
-      if (!_stateController.isClosed) _stateController.add(s);
-    });
+      // Funnel the terminal state through _cleanup so it's emitted exactly
+      // once (and the input/state controllers + subscriptions are released).
+      if (s == ConnectionState.disconnected) {
+        unawaited(_cleanup());
+      } else if (!_stateController.isClosed) {
+        _stateController.add(s);
+      }
+    }, onDone: () => unawaited(_cleanup()));
   }
 
   /// Internal: wrap a platform transport. Not part of the public API.
@@ -52,6 +57,7 @@ class BluetoothConnection {
   late final StreamSubscription<ConnectionState> _stateSub;
 
   ConnectionState _state = ConnectionState.connected;
+  Future<void>? _cleanupFuture;
 
   /// Inbound data. Broadcast: multiple listeners see the same bytes. Closes
   /// when the connection drops, so `await for` / `onDone` cleanly terminates.
@@ -107,7 +113,13 @@ class BluetoothConnection {
     }
   }
 
-  Future<void> _cleanup() async {
+  /// Idempotent teardown — runs once whether triggered by [close]/[finish] or a
+  /// peer-initiated disconnect. Emits a single terminal `disconnected`, cancels
+  /// both subscriptions, and closes both controllers. Memoized so every caller
+  /// awaits the *same* completion (incl. the terminal-event delivery turn).
+  Future<void> _cleanup() => _cleanupFuture ??= _doCleanup();
+
+  Future<void> _doCleanup() async {
     _state = ConnectionState.disconnected;
     await _inputSub.cancel();
     await _stateSub.cancel();
@@ -116,5 +128,8 @@ class BluetoothConnection {
       await _stateController.close();
     }
     if (!_inputController.isClosed) await _inputController.close();
+    // Let the terminal `disconnected` reach broadcast listeners before a caller
+    // awaiting close()/finish() observes the result.
+    await Future<void>.delayed(Duration.zero);
   }
 }

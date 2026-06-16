@@ -18,6 +18,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Exported to Dart via dart:ffi DynamicLibrary.open + lookupFunction.
+// `used` + default visibility keep release NDK builds (-fvisibility=hidden,
+// --gc-sections, strip) from removing these otherwise-unreferenced symbols.
+#define BTC_EXPORT __attribute__((visibility("default"), used))
+
 typedef void (*btc_found_cb)(int64_t token, const char *json);
 typedef void (*btc_inquiry_done_cb)(int64_t token, int32_t aborted);
 typedef void (*btc_data_cb)(int64_t token, const uint8_t *data, int32_t len);
@@ -156,11 +161,11 @@ static char *jstring_to_cstr(JNIEnv *env, jstring s) {
 
 // --- C ABI -------------------------------------------------------------------
 
-void btc_free(void *ptr) {
+BTC_EXPORT void btc_free(void *ptr) {
   if (ptr) free(ptr);
 }
 
-void btc_and_register(btc_found_cb found, btc_inquiry_done_cb done,
+BTC_EXPORT void btc_and_register(btc_found_cb found, btc_inquiry_done_cb done,
                       btc_data_cb data, btc_state_cb state) {
   g_found = found;
   g_done = done;
@@ -168,7 +173,7 @@ void btc_and_register(btc_found_cb found, btc_inquiry_done_cb done,
   g_state = state;
 }
 
-int32_t btc_and_init(void) {
+BTC_EXPORT int32_t btc_and_init(void) {
   JNIEnv *env = get_env();
   if (!env) return 1; // unavailable
   if (!g_class) {
@@ -198,7 +203,7 @@ int32_t btc_and_init(void) {
   return r;
 }
 
-int32_t btc_and_adapter_state(void) {
+BTC_EXPORT int32_t btc_and_adapter_state(void) {
   JNIEnv *env = get_env();
   if (!env) return 1;
   jmethodID m = static_method(env, "adapterState", "()I");
@@ -208,7 +213,7 @@ int32_t btc_and_adapter_state(void) {
   return r;
 }
 
-char *btc_and_bonded_json(void) {
+BTC_EXPORT char *btc_and_bonded_json(void) {
   JNIEnv *env = get_env();
   if (!env) return NULL;
   jmethodID m = static_method(env, "bondedJson", "()Ljava/lang/String;");
@@ -220,7 +225,7 @@ char *btc_and_bonded_json(void) {
   return out;
 }
 
-int32_t btc_and_start_discovery(int64_t token) {
+BTC_EXPORT int32_t btc_and_start_discovery(int64_t token) {
   JNIEnv *env = get_env();
   if (!env) return -1;
   jmethodID m = static_method(env, "startDiscovery", "(J)I");
@@ -231,7 +236,7 @@ int32_t btc_and_start_discovery(int64_t token) {
   return r;
 }
 
-int32_t btc_and_stop_discovery(void) {
+BTC_EXPORT int32_t btc_and_stop_discovery(void) {
   JNIEnv *env = get_env();
   if (!env) return -1;
   jmethodID m = static_method(env, "stopDiscovery", "()I");
@@ -241,7 +246,7 @@ int32_t btc_and_stop_discovery(void) {
   return r;
 }
 
-int64_t btc_and_open(int64_t token, const char *address, int32_t channel,
+BTC_EXPORT int64_t btc_and_open(int64_t token, const char *address, int32_t channel,
                      const char *uuid) {
   JNIEnv *env = get_env();
   if (!env) return 0;
@@ -258,7 +263,7 @@ int64_t btc_and_open(int64_t token, const char *address, int32_t channel,
   return (int64_t)handle;
 }
 
-int32_t btc_and_write(int64_t handle, const uint8_t *data, int32_t len) {
+BTC_EXPORT int32_t btc_and_write(int64_t handle, const uint8_t *data, int32_t len) {
   JNIEnv *env = get_env();
   if (!env) return -1;
   jmethodID m = static_method(env, "write", "(J[B)I");
@@ -275,7 +280,7 @@ int32_t btc_and_write(int64_t handle, const uint8_t *data, int32_t len) {
   return (int32_t)rc;
 }
 
-int32_t btc_and_close(int64_t handle) {
+BTC_EXPORT int32_t btc_and_close(int64_t handle) {
   JNIEnv *env = get_env();
   if (!env) return -1;
   jmethodID m = static_method(env, "close", "(J)I");

@@ -161,10 +161,13 @@ static BTCInquiry *g_inquiry = nil;
 
 @interface BTCChannel : NSObject <IOBluetoothRFCOMMChannelDelegate>
 @property(nonatomic) int64_t token;
+@property(nonatomic) int64_t handle;
 @property(nonatomic) btc_data_cb data;
 @property(nonatomic) btc_state_cb state;
 @property(nonatomic, strong) IOBluetoothRFCOMMChannel *channel;
 @end
+
+static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
 
 @implementation BTCChannel
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)rfcommChannel
@@ -187,6 +190,10 @@ static BTCInquiry *g_inquiry = nil;
 }
 - (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)rfcommChannel {
   if (self.state) self.state(self.token, BTC_CONN_DISCONNECTED);
+  // Remote-initiated close: drop the registry entry so the BTCChannel and its
+  // retained IOBluetoothRFCOMMChannel are released even if Dart never calls
+  // btc_rfcomm_close.
+  if (self.handle != 0) [g_channels() removeObjectForKey:@(self.handle)];
 }
 @end
 
@@ -236,6 +243,7 @@ char *btc_paired_devices_json(void) {
 
 int32_t btc_sdp_channel(const char *address, const char *uuid) {
   __block int32_t result = -1;
+  if (!address || !uuid) return -1;
   NSString *addr = btc_normalize_address(@(address));
   NSString *uuidStr = @(uuid);
   [[BTCWorker shared] runSync:^{
@@ -296,6 +304,7 @@ int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
                         const char *uuid, btc_data_cb data,
                         btc_state_cb state) {
   __block int64_t handle = 0;
+  if (!address || !uuid) return 0;
   NSString *addr = btc_normalize_address(@(address));
   NSString *uuidStr = @(uuid);
   [[BTCWorker shared] runSync:^{
@@ -319,6 +328,7 @@ int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
     if (rc != kIOReturnSuccess) return;
     ch.channel = rf;
     handle = g_next_handle++;
+    ch.handle = handle;
     g_channels()[@(handle)] = ch;
   }];
   return handle;

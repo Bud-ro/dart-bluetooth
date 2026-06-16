@@ -49,6 +49,24 @@ void main() {
     expect(done, isTrue);
   });
 
+  test(
+    'peer drop emits exactly one disconnected and closes both streams',
+    () async {
+      final (conn, transport) = await open();
+      final states = <ConnectionState>[];
+      var stateDone = false;
+      var inputDone = false;
+      conn.stateChanges.listen(states.add, onDone: () => stateDone = true);
+      conn.input.listen((_) {}, onDone: () => inputDone = true);
+      transport.dropPeer();
+      await Future<void>.delayed(Duration.zero);
+      expect(states, [ConnectionState.disconnected]); // exactly one
+      expect(stateDone, isTrue);
+      expect(inputDone, isTrue);
+      expect(conn.isConnected, isFalse);
+    },
+  );
+
   test('finish flushes then closes and emits disconnected', () async {
     final (conn, transport) = await open();
     final states = <ConnectionState>[];

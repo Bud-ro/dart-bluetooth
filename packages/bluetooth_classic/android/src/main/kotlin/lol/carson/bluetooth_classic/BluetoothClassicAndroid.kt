@@ -61,15 +61,20 @@ object BluetoothClassicAndroid {
         }
     }
 
+    @SuppressLint("MissingPermission")
     @JvmStatic
     fun adapterState(): Int {
-        val a = adapter ?: return 1 // unavailable
-        return when (a.state) {
-            BluetoothAdapter.STATE_OFF -> 3
-            BluetoothAdapter.STATE_TURNING_ON -> 4
-            BluetoothAdapter.STATE_ON -> 5
-            BluetoothAdapter.STATE_TURNING_OFF -> 6
-            else -> 0
+        return try {
+            val a = adapter ?: return 1 // unavailable
+            when (a.state) {
+                BluetoothAdapter.STATE_OFF -> 3
+                BluetoothAdapter.STATE_TURNING_ON -> 4
+                BluetoothAdapter.STATE_ON -> 5
+                BluetoothAdapter.STATE_TURNING_OFF -> 6
+                else -> 0
+            }
+        } catch (t: Throwable) {
+            1 // SecurityException (no BLUETOOTH_CONNECT) etc. -> unavailable
         }
     }
 
@@ -226,6 +231,13 @@ object BluetoothClassicAndroid {
                 socket.outputStream.write(data)
                 socket.outputStream.flush()
             } catch (_: Throwable) {
+                // A failed write means the link is dead. Close the socket so the
+                // read loop unblocks and reports disconnect (nativeOnState),
+                // instead of silently black-holing further writes.
+                try {
+                    socket.close()
+                } catch (_: Throwable) {
+                }
             }
         }
         return 0

@@ -118,6 +118,7 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
     DeviceId device, {
     Uuid? serviceUuid,
   }) async {
+    if (!device.isAddress) return const [];
     final u = serviceUuid ?? Uuid.spp;
     final channel = _sdpChannel(device.address, u);
     if (channel <= 0) return const [];

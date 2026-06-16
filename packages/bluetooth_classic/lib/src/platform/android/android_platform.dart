@@ -145,6 +145,11 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
     required Uuid serviceUuid,
     Duration? timeout,
   }) async {
+    if (!device.isAddress) {
+      throw const BluetoothConnectionException(
+        'Android requires a MAC-address DeviceId for RFCOMM connect',
+      );
+    }
     _activeLib = _lib;
     final token = _nextToken++;
     final transport = _AndroidTransport(token, _lib);

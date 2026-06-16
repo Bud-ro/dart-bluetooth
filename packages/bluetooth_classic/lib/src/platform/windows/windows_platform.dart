@@ -113,20 +113,37 @@ class WindowsBluetoothClassic extends BluetoothClassicPlatform {
     required Uuid serviceUuid,
     Duration? timeout,
   }) async {
+    if (!device.isAddress) {
+      throw const BluetoothConnectionException(
+        'Windows requires a MAC-address DeviceId for RFCOMM connect',
+      );
+    }
     final address = device.address;
     final uuid = serviceUuid.value;
-    final connectFuture = Isolate.run(
-      () => _connectSocket(address, channel, uuid),
-    );
-    final result = await (timeout == null
-        ? connectFuture
-        : connectFuture.timeout(
-            timeout,
-            onTimeout: () => throw BluetoothTimeoutException(
-              'RFCOMM connect to $address timed out',
-              timeout: timeout,
-            ),
-          ));
+    final int result;
+    try {
+      final connectFuture = Isolate.run(
+        () => _connectSocket(address, channel, uuid),
+      );
+      result = await (timeout == null
+          ? connectFuture
+          : connectFuture.timeout(
+              timeout,
+              onTimeout: () => throw BluetoothTimeoutException(
+                'RFCOMM connect to $address timed out',
+                timeout: timeout,
+              ),
+            ));
+    } on BluetoothException {
+      rethrow;
+    } catch (e) {
+      // Map worker-isolate errors (bad address FormatException, WSAStartup
+      // StateError, …) into the domain hierarchy.
+      throw BluetoothConnectionException(
+        'RFCOMM connect to $address failed',
+        cause: e,
+      );
+    }
     if (result < 0) {
       throw BluetoothConnectionException(
         'RFCOMM connect to $address failed',
@@ -261,13 +278,17 @@ _RawDevice _readDevice(BluetoothDeviceInfo info) {
   );
 }
 
+/// Maps a WSA error to a guaranteed-negative failure sentinel (so a spurious
+/// `WSAGetLastError()` of 0 can't be mistaken for the valid SOCKET handle 0).
+int _connectError(int err) => err == 0 ? -1 : -err;
+
 /// Opens and connects an RFCOMM socket. Returns the SOCKET handle on success,
-/// or the negated WSA error code on failure.
+/// or a negative failure sentinel (see [_connectError]).
 int _connectSocket(String address, int? channel, String serviceUuid) {
   final ws = WinsockBindings();
   ws.startup();
   final sock = ws.socket(afBth, sockStream, bthprotoRfcomm);
-  if (sock == invalidSocket) return -ws.wsaGetLastError();
+  if (sock == invalidSocket) return _connectError(ws.wsaGetLastError());
 
   final addr = calloc<SockaddrBth>();
   try {
@@ -284,7 +305,7 @@ int _connectSocket(String address, int? channel, String serviceUuid) {
     if (rc == socketError) {
       final err = ws.wsaGetLastError();
       ws.closesocket(sock);
-      return -err;
+      return _connectError(err);
     }
     return sock;
   } finally {
@@ -391,14 +412,20 @@ class _WindowsRfcommTransport implements RfcommTransport {
     readerPort.listen((msg) {
       if (msg == null) {
         _onClosedByPeer();
-      } else if (msg is TransferableTypedData) {
+      } else if (msg is TransferableTypedData &&
+          !_closed &&
+          !_incoming.isClosed) {
         _incoming.add(msg.materialize().asUint8List());
       }
     });
-    Isolate.spawn(_recvEntry, [
-      _socket,
-      readerPort.sendPort,
-    ]).then((i) => _reader = i);
+    // If close() wins the spawn race, kill the isolate as soon as it exists.
+    Isolate.spawn(_recvEntry, [_socket, readerPort.sendPort]).then((i) {
+      if (_closed) {
+        i.kill(priority: Isolate.beforeNextEvent);
+      } else {
+        _reader = i;
+      }
+    });
 
     final control = ReceivePort();
     _writerControlPort = control;
@@ -411,10 +438,13 @@ class _WindowsRfcommTransport implements RfcommTransport {
         _pendingWrites.clear();
       }
     });
-    Isolate.spawn(_writeEntry, [
-      _socket,
-      control.sendPort,
-    ]).then((i) => _writer = i);
+    Isolate.spawn(_writeEntry, [_socket, control.sendPort]).then((i) {
+      if (_closed) {
+        i.kill(priority: Isolate.beforeNextEvent);
+      } else {
+        _writer = i;
+      }
+    });
 
     _state.add(ConnectionState.connected);
   }

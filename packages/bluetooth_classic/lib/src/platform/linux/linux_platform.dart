@@ -104,7 +104,10 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
     try {
       final managed = await _managedObjects();
       final result = <BluetoothDevice>[];
+      final prefix = '${_adapterPath.value}/';
       managed.forEach((path, ifaces) {
+        // Only devices under the configured adapter (multi-adapter hosts).
+        if (!path.value.startsWith(prefix)) return;
         final props = ifaces[_deviceIface];
         if (props == null) return;
         final paired = (props['Paired'] as DBusBoolean?)?.value ?? false;
@@ -136,22 +139,27 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
             interface: _omIface,
             name: 'InterfacesAdded',
           ).listen((signal) {
-            final values = signal.values;
-            if (values.length < 2) return;
-            final ifaces = (values[1] as DBusDict).children.map(
-              (k, v) => MapEntry(
-                (k as DBusString).value,
-                (v as DBusDict).children.map(
-                  (pk, pv) => MapEntry(
-                    (pk as DBusString).value,
-                    (pv as DBusVariant).value,
+            try {
+              final values = signal.values;
+              if (values.length < 2) return;
+              final ifaces = (values[1] as DBusDict).children.map(
+                (k, v) => MapEntry(
+                  (k as DBusString).value,
+                  (v as DBusDict).children.map(
+                    (pk, pv) => MapEntry(
+                      (pk as DBusString).value,
+                      (pv as DBusVariant).value,
+                    ),
                   ),
                 ),
-              ),
-            );
-            final props = ifaces[_deviceIface];
-            if (props == null) return;
-            controller.add(_discoveryFromProps(props));
+              );
+              final props = ifaces[_deviceIface];
+              if (props == null) return;
+              controller.add(_discoveryFromProps(props));
+            } catch (_) {
+              // Skip a structurally-unexpected signal rather than erroring the
+              // discovery stream (mirrors the PropertiesChanged handler).
+            }
           });
       // Property updates (e.g. RSSI/name) on known devices.
       changedSub =
@@ -233,6 +241,11 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
     required Uuid serviceUuid,
     Duration? timeout,
   }) {
+    if (!device.isAddress) {
+      throw const BluetoothConnectionException(
+        'Linux requires a MAC-address DeviceId for RFCOMM connect',
+      );
+    }
     return _LinuxRfcommProfile.connect(
       bus: _bus,
       devicePath: _devicePath(device),
@@ -409,17 +422,22 @@ class _LinuxRfcommProfile implements RfcommTransport {
     // the profile, then trigger Device1.ConnectProfile; the fd that arrives is
     // adopted as a dart:io Socket for duplex I/O.
     final completer = Completer<RfcommTransport>();
+    // `settled` covers ALL terminal paths (success, timeout, RegisterProfile /
+    // ConnectProfile failure) — `completer.isCompleted` alone misses timeout,
+    // because `.timeout()` completes the returned future, not this completer.
+    var settled = false;
     final profilePath = DBusObjectPath(
       '/lol/carson/bluetooth_classic/profile${_profileCounter++}',
     );
     late final _Profile1 profile;
     profile = _Profile1(profilePath, (socket) {
-      if (completer.isCompleted) {
-        // Arrived after a timeout/error completed the future — don't leak the fd.
+      if (settled) {
+        // Arrived after a timeout/error — don't leak the fd or the profile.
         socket.destroy();
         unawaited(_unregisterProfile(bus, profile));
         return;
       }
+      settled = true;
       completer.complete(_LinuxRfcommProfile._(socket, bus, profile));
     });
     await bus.registerObject(profile);
@@ -445,6 +463,7 @@ class _LinuxRfcommProfile implements RfcommTransport {
         replySignature: DBusSignature(''),
       );
     } catch (e) {
+      settled = true;
       await bus.unregisterObject(profile);
       throw BluetoothConnectionException('RegisterProfile failed', cause: e);
     }
@@ -455,6 +474,7 @@ class _LinuxRfcommProfile implements RfcommTransport {
         DBusString(serviceUuid.value),
       ], replySignature: DBusSignature(''));
     } catch (e) {
+      settled = true;
       await _unregisterProfile(bus, profile);
       throw BluetoothConnectionException('ConnectProfile failed', cause: e);
     }
@@ -463,6 +483,7 @@ class _LinuxRfcommProfile implements RfcommTransport {
         ? completer.future.timeout(
             timeout,
             onTimeout: () {
+              settled = true;
               unawaited(_unregisterProfile(bus, profile));
               throw BluetoothTimeoutException(
                 'RFCOMM connect timed out',
@@ -568,10 +589,12 @@ class _Profile1 extends DBusObject {
     if (methodCall.interface == 'org.bluez.Profile1') {
       switch (methodCall.name) {
         case 'NewConnection':
-          if (methodCall.values.length >= 2) {
-            final socket = methodCall.values[1].asUnixFd().toSocket();
-            onConnection(socket);
+          if (methodCall.values.length < 2) {
+            // Reject so BlueZ tears down the connection instead of leaking its fd.
+            return DBusMethodErrorResponse.failed('missing fd');
           }
+          final socket = methodCall.values[1].asUnixFd().toSocket();
+          onConnection(socket);
           return DBusMethodSuccessResponse([]);
         case 'RequestDisconnection':
         case 'Release':

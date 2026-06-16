@@ -43,7 +43,15 @@ class BluetoothDevice {
   /// Raw Bluetooth Class-of-Device value, if the platform exposes it.
   final int? deviceClass;
 
+  /// Whether [id] is a MAC address (true on Windows/Linux/Android/macOS, false
+  /// for the opaque identifiers used on iOS / address-withheld macOS). Check this
+  /// before reading [address].
+  bool get hasAddress => id.isAddress;
+
   /// Convenience for the common MAC-address case.
+  ///
+  /// Throws [StateError] when [hasAddress] is false (e.g. an iOS accessory whose
+  /// id is an opaque token). Guard with [hasAddress], or use `id.value`.
   String get address => id.address;
 
   BluetoothDevice copyWith({
