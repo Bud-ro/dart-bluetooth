@@ -15,6 +15,7 @@ env:
   PKG: packages/bluetooth_rfcomm # pure-Dart core (publishable to pub.dev)
   PKGF: packages/bluetooth_rfcomm_flutter # Flutter plugin (native builds)
   EXAMPLE: packages/bluetooth_rfcomm_flutter/example # Flutter demo app
+  PKG_LE: packages/bluetooth_le # BLE pure-Dart core (in development)
 
 jobs:
   # Pure-Dart core: analyze + unit tests on every desktop OS, then build and
@@ -75,6 +76,39 @@ jobs:
           BIN=$(find build/cli -type f -name 'btc*' ! -name '*.dll' | head -1)
           echo "running: $BIN doctor"
           "$BIN" doctor
+
+  # BLE pure-Dart core: analyze + unit tests on every desktop OS. On macOS,
+  # `dart test` runs the native-assets build hook, which compiles + links the
+  # CoreBluetooth wrapper — so a native compile/link error fails CI here even
+  # before the BLE backends are fully wired.
+  analyze-test-le:
+    timeout-minutes: 20
+    name: dart ble (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: pub get
+        working-directory: ${{ env.PKG_LE }}
+        run: dart pub get
+      - name: format check
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: ${{ env.PKG_LE }}
+        run: dart format --output=none --set-exit-if-changed lib test
+      - name: analyze
+        working-directory: ${{ env.PKG_LE }}
+        run: dart analyze lib test
+      - name: test (macOS also compiles the CoreBluetooth wrapper via the hook)
+        working-directory: ${{ env.PKG_LE }}
+        run: dart test
 
   # Flutter plugin package: analyze the plugin + its example.
   flutter-package:
