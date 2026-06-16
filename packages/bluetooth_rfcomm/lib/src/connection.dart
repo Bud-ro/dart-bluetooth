@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:meta/meta.dart';
+
 import 'exceptions.dart';
 import 'models/bluetooth_device.dart';
 import 'models/enums.dart';
@@ -11,6 +13,11 @@ import 'platform/platform_interface.dart';
 /// Obtain one from [BluetoothRfcomm.connect]. Read with [input] and write with
 /// [add] (fire-and-forget, never blocks) or [write] (awaits the OS accepting the
 /// bytes). [input] closes cleanly when the peer disconnects.
+///
+/// A connection is **single-use**: once it drops or you [close]/[finish] it, it
+/// can't be reopened — call [BluetoothRfcomm.connect] again for a fresh one. To
+/// reconnect, re-fetch the device (the [DeviceId] may be session-scoped on iOS)
+/// and retry while [BluetoothException.isTransient] is true.
 ///
 /// ```dart
 /// final conn = await bt.connect(device, channel: 1);
@@ -40,6 +47,7 @@ class BluetoothConnection {
   }
 
   /// Internal: wrap a platform transport. Not part of the public API.
+  @internal
   static BluetoothConnection wrap(
     BluetoothDevice device,
     RfcommTransport transport,
@@ -75,8 +83,11 @@ class BluetoothConnection {
   /// Whether the connection is currently open.
   bool get isConnected => _state == ConnectionState.connected;
 
-  /// Queues [data] for transmission and returns immediately. Bytes are drained
-  /// off the calling isolate, so this never blocks even under backpressure.
+  /// Queues [data] for transmission and returns immediately — it never blocks
+  /// the caller (bytes drain on a background isolate/thread). The queue is
+  /// unbounded, so for sustained bulk writes against a slow link pace yourself
+  /// with [write]/[flush] rather than calling [add] in a tight loop. Fine for
+  /// the small, low-rate frames typical of RFCOMM serial.
   /// Empty payloads are ignored. Throws [BluetoothWriteException] if [data]
   /// exceeds the platform's 32-bit length limit, or if the connection is already
   /// closed / has dropped (check [isConnected] if you need to avoid that).

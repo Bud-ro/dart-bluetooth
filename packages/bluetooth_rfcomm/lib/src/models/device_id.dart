@@ -1,12 +1,15 @@
 import 'package:meta/meta.dart';
 
-/// A stable, platform-appropriate identifier for a remote device.
+/// A platform-appropriate identifier for a remote device.
 ///
 /// On Windows, Linux, Android and macOS this is the 48-bit Bluetooth address
-/// formatted as upper-case `AA:BB:CC:DD:EE:FF`. On iOS — and on recent macOS
-/// where the address can be withheld — it is an opaque platform identifier
-/// (e.g. an `EAAccessory.connectionID`-derived string). Treat it as an opaque
-/// token for equality and lookup; only read [address] when [isAddress] is true.
+/// formatted as upper-case `AA:BB:CC:DD:EE:FF` — stable, safe to persist. On
+/// iOS — and on recent macOS where the address can be withheld — it is an opaque
+/// platform identifier (e.g. an `EAAccessory.connectionID`-derived string) that
+/// is **session-scoped**: it changes across reconnects and app launches, so
+/// don't persist it; re-fetch from [BluetoothRfcomm.bondedDevices] each session.
+/// Use [isPersistent] to tell the two apart. Treat the value as an opaque token
+/// for equality and lookup; only read [address] when [isAddress] is true.
 @immutable
 class DeviceId {
   /// Creates an identifier that is a real Bluetooth MAC address.
@@ -25,6 +28,13 @@ class DeviceId {
 
   /// Whether this id is a real Bluetooth MAC address (see [address]).
   final bool isAddress;
+
+  /// Whether this id is safe to persist and reuse across sessions.
+  ///
+  /// True for MAC-address ids (Windows/Linux/Android/macOS); false for the
+  /// session-scoped opaque ids used on iOS (and withheld-address macOS), which
+  /// must be re-fetched each session rather than cached.
+  bool get isPersistent => isAddress;
 
   /// The underlying identifier string (MAC address or opaque token).
   String get value => _value;

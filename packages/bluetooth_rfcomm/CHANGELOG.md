@@ -21,8 +21,9 @@ Initial release.
 - Removed `connectionState(device)` — it was only implementable on Linux and
   was a silent no-op elsewhere. Use `BluetoothConnection.stateChanges` (all
   platforms) or `bondedDevices().isConnected`.
-- Hardened after a 10-axis code review: fixed a macOS write use-after-free,
+- Hardened after multi-axis code review: fixed a macOS write use-after-free,
   Android JNI exception-safety / thread-detach / receiver-export / write
   ordering, duplicate disconnect events, Linux profile/socket leaks and error
-  mapping, a Windows `flush()` hang, and added send/receive length guards. See
-  [docs/CODE_REVIEW.md](https://github.com/Bud-ro/dart-bluetooth/blob/master/docs/CODE_REVIEW.md).
+  mapping, a Windows `flush()` hang, an iOS O(n²) send path, a Windows non-ASCII
+  device-name crash, macOS/Android discovery-stream leaks, and a blocking Android
+  connect (now off the calling isolate); added send/receive length guards.

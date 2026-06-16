@@ -74,8 +74,10 @@ object BluetoothRfcommAndroid {
                 BluetoothAdapter.STATE_TURNING_OFF -> 6
                 else -> 0
             }
+        } catch (se: SecurityException) {
+            2 // missing BLUETOOTH_CONNECT -> unauthorized (not "no radio")
         } catch (t: Throwable) {
-            1 // SecurityException (no BLUETOOTH_CONNECT) etc. -> unavailable
+            1 // unavailable
         }
     }
 

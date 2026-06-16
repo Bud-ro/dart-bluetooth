@@ -32,6 +32,7 @@ class _HomePageState extends State<HomePage> {
   BluetoothConnection? _conn;
   StreamSubscription<Uint8List>? _rx;
   final _log = StringBuffer();
+  final _input = TextEditingController();
   bool _scanning = false;
 
   Future<void> _refresh() async {
@@ -78,7 +79,15 @@ class _HomePageState extends State<HomePage> {
           }
         },
         onDone: () {
-          if (mounted) setState(() => _log.writeln('\n[disconnected]'));
+          // Peer dropped: return to the device list instead of leaving a dead
+          // connection on screen.
+          unawaited(_rx?.cancel());
+          if (mounted) {
+            setState(() {
+              _log.writeln('\n[disconnected]');
+              _conn = null;
+            });
+          }
         },
       );
       setState(() => _conn = conn);
@@ -98,13 +107,17 @@ class _HomePageState extends State<HomePage> {
     setState(() => _conn = null);
   }
 
-  void _send(String text) =>
-      _conn?.add(Uint8List.fromList(utf8.encode('$text\r\n')));
+  void _send(String text) {
+    final conn = _conn;
+    if (conn == null || !conn.isConnected) return;
+    conn.add(Uint8List.fromList(utf8.encode('$text\r\n')));
+  }
 
   @override
   void dispose() {
     _rx?.cancel();
     _conn?.close();
+    _input.dispose();
     super.dispose();
   }
 
@@ -148,7 +161,6 @@ class _HomePageState extends State<HomePage> {
   );
 
   Widget _terminal() {
-    final controller = TextEditingController();
     return Column(
       children: [
         Expanded(
@@ -169,11 +181,11 @@ class _HomePageState extends State<HomePage> {
             children: [
               Expanded(
                 child: TextField(
-                  controller: controller,
+                  controller: _input,
                   decoration: const InputDecoration(hintText: 'send...'),
                   onSubmitted: (String t) {
                     _send(t);
-                    controller.clear();
+                    _input.clear();
                   },
                 ),
               ),

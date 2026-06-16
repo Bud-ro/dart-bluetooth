@@ -38,6 +38,13 @@ static btc_state_cb g_state = NULL;
 
 static const char *kClassName = "lol/carson/bluetooth_rfcomm/BluetoothRfcommAndroid";
 
+// Marshals a Java String to a malloc'd, NUL-terminated *standard* UTF-8 buffer
+// (caller frees). GetStringUTFChars returns JNI modified UTF-8 — astral chars
+// (emoji) come back as CESU-8, which Dart's utf8.decode rejects, so a single
+// emoji-named device would make the whole JSON payload fail to parse. Going
+// through String.getBytes("UTF-8") yields proper UTF-8.
+static char *jstring_to_utf8(JNIEnv *env, jstring s);
+
 // --- JVM / env acquisition ---------------------------------------------------
 
 jint JNI_OnLoad(JavaVM *vm, void *reserved) {
@@ -96,12 +103,7 @@ static JNIEnv *get_env(void) {
 
 static void nOnFound(JNIEnv *env, jclass clazz, jlong token, jstring json) {
   if (!g_found || !json) return;
-  const char *s = (*env)->GetStringUTFChars(env, json, NULL);
-  if (!s) return;
-  size_t len = strlen(s) + 1;
-  char *copy = malloc(len);
-  if (copy) memcpy(copy, s, len);
-  (*env)->ReleaseStringUTFChars(env, json, s);
+  char *copy = jstring_to_utf8(env, json); // standard UTF-8 (emoji-safe)
   if (copy) g_found((int64_t)token, copy);
 }
 
@@ -148,14 +150,43 @@ static void clear_pending(JNIEnv *env) {
   if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 }
 
-static char *jstring_to_cstr(JNIEnv *env, jstring s) {
+static char *jstring_to_utf8(JNIEnv *env, jstring s) {
   if (!s) return NULL;
-  const char *c = (*env)->GetStringUTFChars(env, s, NULL);
-  if (!c) return NULL;
-  size_t len = strlen(c) + 1;
-  char *out = malloc(len);
-  if (out) memcpy(out, c, len);
-  (*env)->ReleaseStringUTFChars(env, s, c);
+  jclass cls = (*env)->GetObjectClass(env, s);
+  if (!cls) return NULL;
+  jmethodID getBytes =
+      (*env)->GetMethodID(env, cls, "getBytes", "(Ljava/lang/String;)[B");
+  (*env)->DeleteLocalRef(env, cls);
+  if (!getBytes) {
+    clear_pending(env);
+    return NULL;
+  }
+  jstring charset = (*env)->NewStringUTF(env, "UTF-8");
+  if (!charset) {
+    clear_pending(env);
+    return NULL;
+  }
+  jbyteArray bytes =
+      (jbyteArray)(*env)->CallObjectMethod(env, s, getBytes, charset);
+  (*env)->DeleteLocalRef(env, charset);
+  if ((*env)->ExceptionCheck(env)) {
+    (*env)->ExceptionClear(env);
+    return NULL;
+  }
+  if (!bytes) return NULL;
+  jsize len = (*env)->GetArrayLength(env, bytes);
+  char *out = malloc((size_t)len + 1);
+  if (out) {
+    (*env)->GetByteArrayRegion(env, bytes, 0, len, (jbyte *)out);
+    if ((*env)->ExceptionCheck(env)) {
+      (*env)->ExceptionClear(env);
+      free(out);
+      out = NULL;
+    } else {
+      out[len] = '\0';
+    }
+  }
+  (*env)->DeleteLocalRef(env, bytes);
   return out;
 }
 
@@ -220,7 +251,7 @@ BTC_EXPORT char *btc_and_bonded_json(void) {
   if (!m) return NULL;
   jstring s = (jstring)(*env)->CallStaticObjectMethod(env, g_class, m);
   clear_pending(env);
-  char *out = jstring_to_cstr(env, s);
+  char *out = jstring_to_utf8(env, s);
   if (s) (*env)->DeleteLocalRef(env, s);
   return out;
 }

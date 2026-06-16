@@ -108,12 +108,15 @@ Future<void> _connect(BluetoothRfcomm bt, List<String> args) async {
     return;
   }
   final address = opts.rest.first;
-  final channel =
-      opts['channel'] != null ? int.parse(opts['channel'] as String) : null;
+  final channel = opts['channel'] != null
+      ? int.parse(opts['channel'] as String)
+      : null;
 
   final device = BluetoothDevice(id: DeviceId.address(address));
-  stdout.writeln('Connecting to $address'
-      '${channel != null ? ' (channel $channel)' : ' (SDP-resolved channel)'}...');
+  stdout.writeln(
+    'Connecting to $address'
+    '${channel != null ? ' (channel $channel)' : ' (SDP-resolved channel)'}...',
+  );
 
   final conn = await bt.connect(
     device,
@@ -127,7 +130,8 @@ Future<void> _connect(BluetoothRfcomm bt, List<String> args) async {
     onDone: () => stdout.writeln('\n[peer disconnected]'),
   );
 
-  await for (final line in stdin.transform(utf8.decoder).transform(const LineSplitter())) {
+  await for (final line
+      in stdin.transform(utf8.decoder).transform(const LineSplitter())) {
     conn.add(Uint8List.fromList(utf8.encode('$line\r\n')));
   }
   await rx.cancel();

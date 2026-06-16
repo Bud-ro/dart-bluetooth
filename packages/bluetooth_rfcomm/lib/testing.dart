@@ -8,4 +8,5 @@
 /// ```
 library;
 
-export 'src/testing/fake_platform.dart';
+export 'src/testing/fake_platform.dart'
+    show FakeBluetoothRfcommPlatform, FakeRfcommTransport;

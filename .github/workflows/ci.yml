@@ -92,11 +92,13 @@ jobs:
         working-directory: ${{ env.PKGF }}
         run: |
           flutter pub get
+          dart format --output=none --set-exit-if-changed .
           flutter analyze
       - name: analyze example
         working-directory: ${{ env.EXAMPLE }}
         run: |
           flutter pub get
+          dart format --output=none --set-exit-if-changed .
           flutter analyze
 
   # Flutter Android: compile (apk) + a runtime launch smoke on an emulator,

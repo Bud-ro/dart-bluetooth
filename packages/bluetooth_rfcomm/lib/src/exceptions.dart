@@ -16,6 +16,15 @@ class BluetoothException implements Exception {
   /// The underlying error/exception, when this wraps another failure.
   final Object? cause;
 
+  /// Whether retrying the operation (e.g. a reconnect loop) might succeed.
+  ///
+  /// True for transient failures — a dropped/refused connection, a timeout, a
+  /// device momentarily out of range. False for failures retrying won't fix —
+  /// missing support/permission, an unresolvable service, a failed write. The
+  /// adapter being off is recoverable but not retry-immediately, so it reports
+  /// false (wait for the adapter to come back on instead).
+  bool get isTransient => false;
+
   String get _label => runtimeType.toString();
 
   @override
@@ -50,6 +59,9 @@ class BluetoothDisabledException extends BluetoothException {
 /// Establishing or maintaining a connection failed.
 class BluetoothConnectionException extends BluetoothException {
   const BluetoothConnectionException(super.message, {super.code, super.cause});
+
+  @override
+  bool get isTransient => true;
 }
 
 /// An operation exceeded its allotted [timeout].
@@ -62,6 +74,9 @@ class BluetoothTimeoutException extends BluetoothException {
   });
 
   final Duration? timeout;
+
+  @override
+  bool get isTransient => true;
 }
 
 /// Writing to a connection failed (peer closed, buffer error, …).
@@ -77,6 +92,9 @@ class BluetoothDiscoveryException extends BluetoothException {
 /// The referenced device could not be found (not bonded, out of range, gone).
 class DeviceNotFoundException extends BluetoothException {
   const DeviceNotFoundException(super.message, {super.code, super.cause});
+
+  @override
+  bool get isTransient => true;
 }
 
 /// No RFCOMM channel was found for the requested service UUID via SDP.

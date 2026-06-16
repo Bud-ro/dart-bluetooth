@@ -44,7 +44,9 @@ void main(List<String> args) async {
       sources: [srcDir.resolve('bluetooth_rfcomm.m').toFilePath()],
       includes: [srcDir.resolve('include/').toFilePath()],
       frameworks: frameworks,
-      flags: const ['-fobjc-arc'],
+      // -Wall surfaces native warnings in the build log (goal: warning-free
+      // Apple builds). Not -Werror, to avoid failing on third-party SDK headers.
+      flags: const ['-fobjc-arc', '-Wall'],
     );
 
     await builder.run(input: input, output: output, logger: null);

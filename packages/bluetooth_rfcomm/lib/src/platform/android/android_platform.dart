@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -164,28 +165,57 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     final transport = _AndroidTransport(token, _lib);
     _transports[token] = transport;
 
-    final addrPtr = device.address.toNativeUtf8();
-    final uuidPtr = serviceUuid.value.toNativeUtf8();
-    try {
-      final handle = _lib.open(
-        token,
-        addrPtr.cast(),
-        channel ?? 0,
-        uuidPtr.cast(),
-      );
-      if (handle == 0) {
-        _transports.remove(token);
-        throw BluetoothConnectionException(
-          'RFCOMM connect to ${device.address} failed',
-        );
+    // The native BluetoothSocket.connect() blocks until the link is up, so run
+    // the open on a helper isolate to keep the caller's isolate responsive (the
+    // package's "never hang the main thread" guarantee). The token's data/state
+    // callbacks are process-global C function pointers that still deliver to this
+    // isolate's NativeCallable listeners, regardless of where open() is invoked.
+    final address = device.address;
+    final uuidValue = serviceUuid.value;
+    final ch = channel ?? 0;
+    final openFuture = Isolate.run(() {
+      final lib = AndroidBindings.open(); // lookups only; no re-register
+      final addrPtr = address.toNativeUtf8();
+      final uuidPtr = uuidValue.toNativeUtf8();
+      try {
+        return lib.open(token, addrPtr.cast(), ch, uuidPtr.cast());
+      } finally {
+        calloc.free(addrPtr);
+        calloc.free(uuidPtr);
       }
-      transport.bindHandle(handle);
-    } finally {
-      calloc.free(addrPtr);
-      calloc.free(uuidPtr);
-    }
+    });
 
-    await transport.waitConnected(timeout);
+    final int handle;
+    try {
+      handle = timeout == null
+          ? await openFuture
+          : await openFuture.timeout(timeout);
+    } on TimeoutException {
+      unawaited(transport.close());
+      // Close a socket that finishes connecting after we've given up on it.
+      unawaited(
+        openFuture
+            .then((h) {
+              if (h != 0) _lib.close(h);
+            })
+            .catchError((_) {}),
+      );
+      throw BluetoothTimeoutException(
+        'RFCOMM connect timed out',
+        timeout: timeout,
+      );
+    }
+    if (handle == 0) {
+      _transports.remove(token);
+      throw BluetoothConnectionException(
+        'RFCOMM connect to ${device.address} failed',
+      );
+    }
+    if (!transport.bindHandle(handle)) {
+      throw BluetoothConnectionException(
+        'RFCOMM connection to ${device.address} dropped during connect',
+      );
+    }
     return transport;
   }
 
@@ -272,6 +302,7 @@ abstract final class _AdapterCode {
   static const int unavailable = 1;
   static BluetoothAdapterState toEnum(int code) => switch (code) {
     1 => BluetoothAdapterState.unavailable,
+    2 => BluetoothAdapterState.unauthorized,
     3 => BluetoothAdapterState.off,
     4 => BluetoothAdapterState.turningOn,
     5 => BluetoothAdapterState.on,
@@ -292,31 +323,22 @@ class _AndroidTransport implements RfcommTransport {
   );
   final StreamController<ConnectionState> _state =
       StreamController<ConnectionState>.broadcast();
-  final Completer<void> _connected = Completer<void>();
   ConnectionState _current = ConnectionState.connecting;
   bool _closed = false;
 
-  void bindHandle(int handle) {
+  /// Binds the native handle once [openRfcomm] has it. Returns false if the link
+  /// already dropped during connect (the read thread can fire disconnect ->
+  /// close() before open() returns on the main isolate); the caller then treats
+  /// the connect as failed and we close the now-orphaned native handle.
+  bool bindHandle(int handle) {
+    if (_closed) {
+      _lib.close(handle);
+      return false;
+    }
     _handle = handle;
-    // The Kotlin connect() blocks until connected, so a non-zero handle means
-    // the socket is already up.
     _current = ConnectionState.connected;
-    if (!_connected.isCompleted) _connected.complete();
     if (!_state.isClosed) _state.add(ConnectionState.connected);
-  }
-
-  Future<void> waitConnected(Duration? timeout) {
-    if (timeout == null) return _connected.future;
-    return _connected.future.timeout(
-      timeout,
-      onTimeout: () {
-        unawaited(close());
-        throw BluetoothTimeoutException(
-          'RFCOMM connect timed out',
-          timeout: timeout,
-        );
-      },
-    );
+    return true;
   }
 
   void _deliver(Uint8List bytes) {

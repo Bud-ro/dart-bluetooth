@@ -433,6 +433,11 @@ class _LinuxRfcommProfile implements RfcommTransport {
 
   static int _profileCounter = 0;
 
+  /// Internal upper bound applied when the caller passes no `timeout`, so a peer
+  /// that never drives Profile1.NewConnection can't hang the connect forever and
+  /// leak the registered BlueZ profile.
+  static const Duration _connectSafetyTimeout = Duration(minutes: 1);
+
   static Future<RfcommTransport> connect({
     required DBusClient bus,
     required DBusObjectPath devicePath,
@@ -507,19 +512,20 @@ class _LinuxRfcommProfile implements RfcommTransport {
       throw BluetoothConnectionException('ConnectProfile failed', cause: e);
     }
 
-    return timeout != null
-        ? completer.future.timeout(
-            timeout,
-            onTimeout: () {
-              settled = true;
-              unawaited(_unregisterProfile(bus, profile));
-              throw BluetoothTimeoutException(
-                'RFCOMM connect timed out',
-                timeout: timeout,
-              );
-            },
-          )
-        : completer.future;
+    // Always bound the wait — even with no caller timeout — or a silent peer
+    // hangs the future forever and leaks the registered profile.
+    final deadline = timeout ?? _connectSafetyTimeout;
+    return completer.future.timeout(
+      deadline,
+      onTimeout: () {
+        settled = true;
+        unawaited(_unregisterProfile(bus, profile));
+        throw BluetoothTimeoutException(
+          'RFCOMM connect timed out',
+          timeout: deadline,
+        );
+      },
+    );
   }
 
   /// Unregisters both the BlueZ profile (so bluetoothd forgets it) and the
