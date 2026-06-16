@@ -199,7 +199,9 @@ object BluetoothClassicAndroid {
             socket.connect()
             val handle = nextHandle.getAndIncrement()
             sockets[handle] = socket
-            writeExecutors[handle] = Executors.newSingleThreadExecutor()
+            writeExecutors[handle] = Executors.newSingleThreadExecutor { r ->
+                Thread(r, "btc-write-$handle").apply { isDaemon = true }
+            }
             startReadLoop(token, handle, socket)
             handle
         } catch (t: Throwable) {
@@ -222,7 +224,8 @@ object BluetoothClassicAndroid {
                 nativeOnState(token, 0) // disconnected
                 close(handle)
             }
-        }, "btc-read-$handle").start()
+            // Daemon so a never-closed handle can't keep the JVM from exiting.
+        }, "btc-read-$handle").apply { isDaemon = true }.start()
     }
 
     @JvmStatic

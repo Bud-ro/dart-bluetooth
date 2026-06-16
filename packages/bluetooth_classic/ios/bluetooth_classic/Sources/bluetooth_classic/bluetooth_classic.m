@@ -141,7 +141,12 @@ static char *btc_json(id obj) {
 
 - (void)_pump {
   NSOutputStream *out = self.session.outputStream;
-  while (self.outBuffer.length > 0 && out.hasSpaceAvailable) {
+  if (out == nil) return;
+  // Do NOT gate on hasSpaceAvailable: it's edge-triggered and is consumed by the
+  // initial (empty-buffer) event, so a later enqueue would find it NO and stall
+  // forever. Always attempt a write when data is queued; a <=0 return means the
+  // stream is full/errored and re-arms the HasSpaceAvailable notification.
+  while (self.outBuffer.length > 0) {
     NSInteger written = [out write:self.outBuffer.bytes
                         maxLength:self.outBuffer.length];
     if (written <= 0) break;

@@ -224,17 +224,24 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
     try {
       final path = _devicePath(device);
       final props = await _allDeviceProps(path);
-      final uuids =
-          (props['UUIDs'] as DBusArray?)?.children
-              .map((e) => Uuid((e as DBusString).value))
-              .toList() ??
-          const <Uuid>[];
       final filter = serviceUuid;
-      return [
-        for (final u in uuids)
-          if (filter == null || u == filter)
-            BluetoothService(uuid: u, rfcommChannelId: 0),
-      ];
+      final services = <BluetoothService>[];
+      for (final e
+          in (props['UUIDs'] as DBusArray?)?.children ?? const <DBusValue>[]) {
+        if (e is! DBusString) continue;
+        // The peer controls these SDP UUID strings — skip a malformed one
+        // rather than letting it discard the whole (possibly-valid) list.
+        Uuid u;
+        try {
+          u = Uuid(e.value);
+        } catch (_) {
+          continue;
+        }
+        if (filter == null || u == filter) {
+          services.add(BluetoothService(uuid: u, rfcommChannelId: 0));
+        }
+      }
+      return services;
     } catch (e) {
       _mapDbus(e, 'discoverServices');
     }
@@ -444,7 +451,12 @@ class _LinuxRfcommProfile implements RfcommTransport {
         return;
       }
       settled = true;
-      completer.complete(_LinuxRfcommProfile._(socket, bus, profile));
+      final transport = _LinuxRfcommProfile._(socket, bus, profile);
+      // BlueZ tells us to drop the link via RequestDisconnection/Release; wire
+      // it to the transport's (idempotent) close so the Dart side actually tears
+      // down instead of staying "connected" with a leaked fd.
+      profile.onDisconnect = () => unawaited(transport.close());
+      completer.complete(transport);
     });
     await bus.registerObject(profile);
 
@@ -590,6 +602,9 @@ class _Profile1 extends DBusObject {
 
   final void Function(Socket socket) onConnection;
 
+  /// Set once the transport exists; invoked when BlueZ asks us to drop the link.
+  void Function()? onDisconnect;
+
   @override
   Future<DBusMethodResponse> handleMethodCall(DBusMethodCall methodCall) async {
     if (methodCall.interface == 'org.bluez.Profile1') {
@@ -604,6 +619,7 @@ class _Profile1 extends DBusObject {
           return DBusMethodSuccessResponse([]);
         case 'RequestDisconnection':
         case 'Release':
+          onDisconnect?.call();
           return DBusMethodSuccessResponse([]);
       }
     }

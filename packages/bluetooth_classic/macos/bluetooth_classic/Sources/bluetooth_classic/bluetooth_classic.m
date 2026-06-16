@@ -353,7 +353,13 @@ int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len) {
         size_t chunk = (size_t)len - offset;
         if (chunk > mtu) chunk = mtu;
         IOReturn rc = [ch.channel writeSync:copy + offset length:(UInt16)chunk];
-        if (rc != kIOReturnSuccess) break;
+        if (rc != kIOReturnSuccess) {
+          // A mid-stream write failure means the link is gone; surface it as a
+          // disconnect instead of silently truncating the byte stream.
+          if (ch.state) ch.state(ch.token, BTC_CONN_DISCONNECTED);
+          if (ch.handle != 0) [g_channels() removeObjectForKey:@(ch.handle)];
+          break;
+        }
         offset += chunk;
       }
     }

@@ -67,17 +67,34 @@ class WindowsBluetoothClassic extends BluetoothClassicPlatform {
 
   @override
   Future<List<BluetoothDevice>> bondedDevices() async {
-    final raw = await Isolate.run(() => _enumerateDevices(remembered: true));
-    return raw.map(_toDevice).toList();
+    try {
+      final raw = await Isolate.run(() => _enumerateDevices(remembered: true));
+      return raw.map(_toDevice).toList();
+    } on BluetoothException {
+      rethrow;
+    } catch (e) {
+      // e.g. DynamicLibrary.open failing (no Bluetooth stack) -> ArgumentError.
+      throw BluetoothDisabledException(
+        'Enumerating bonded devices failed',
+        cause: e,
+      );
+    }
   }
 
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() async* {
     // BluetoothFindFirstDevice with fIssueInquiry blocks for the inquiry window,
     // so we run it on a worker isolate and emit the results when it completes.
-    final raw = await Isolate.run(
-      () => _enumerateDevices(remembered: true, unknown: true, inquiry: true),
-    );
+    final List<_RawDevice> raw;
+    try {
+      raw = await Isolate.run(
+        () => _enumerateDevices(remembered: true, unknown: true, inquiry: true),
+      );
+    } on BluetoothException {
+      rethrow;
+    } catch (e) {
+      throw BluetoothDiscoveryException('inquiry failed', cause: e);
+    }
     final now = DateTime.now();
     for (final r in raw) {
       final device = _toDevice(r);
@@ -125,14 +142,30 @@ class WindowsBluetoothClassic extends BluetoothClassicPlatform {
       final connectFuture = Isolate.run(
         () => _connectSocket(address, channel, uuid),
       );
+      var timedOut = false;
+      // Isolate.run can't be cancelled: if connect succeeds AFTER we time out,
+      // the returned SOCKET would be dropped without closesocket — leaking the
+      // handle and leaving a half-open RFCOMM link. Close any late socket.
+      unawaited(
+        connectFuture.then((sock) {
+          if (timedOut && sock >= 0) {
+            try {
+              _ws.closesocket(sock);
+            } catch (_) {}
+          }
+        }, onError: (_) {}),
+      );
       result = await (timeout == null
           ? connectFuture
           : connectFuture.timeout(
               timeout,
-              onTimeout: () => throw BluetoothTimeoutException(
-                'RFCOMM connect to $address timed out',
-                timeout: timeout,
-              ),
+              onTimeout: () {
+                timedOut = true;
+                throw BluetoothTimeoutException(
+                  'RFCOMM connect to $address timed out',
+                  timeout: timeout,
+                );
+              },
             ));
     } on BluetoothException {
       rethrow;
