@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 import '../../exceptions.dart';
+import '../../logging.dart';
 import '../../models/bluetooth_device.dart';
 import '../../models/bluetooth_service.dart';
 import '../../models/device_id.dart';
@@ -153,6 +154,7 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
           )
           .toList();
     } catch (e) {
+      logNative.warning(() => 'malformed accessories payload: $e');
       throw BluetoothException('malformed accessories payload', cause: e);
     } finally {
       btcFree(ptr.cast());

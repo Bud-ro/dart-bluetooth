@@ -7,6 +7,7 @@ library;
 export 'src/bluetooth_rfcomm_base.dart' show BluetoothRfcomm;
 export 'src/connection.dart' show BluetoothConnection;
 export 'src/exceptions.dart';
+export 'src/logging.dart' show BluetoothRfcommLoggers;
 export 'src/models/bluetooth_device.dart' show BluetoothDevice;
 export 'src/models/bluetooth_service.dart' show BluetoothService;
 export 'src/models/device_id.dart' show DeviceId;

@@ -28,6 +28,7 @@ environment:
 dependencies:
   ffi: ^2.1.0
   dbus: ^0.7.10
+  logging: ^1.2.0
   meta: ^1.16.0
   # Used by hook/build.dart (the native-assets build hook). These run during a
   # consumer's build, so they belong in dependencies, not dev_dependencies.

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'connection.dart';
 import 'exceptions.dart';
+import 'logging.dart';
 import 'models/bluetooth_device.dart';
 import 'models/bluetooth_service.dart';
 import 'models/device_id.dart';
@@ -38,25 +39,42 @@ class BluetoothRfcomm {
   ///
   /// Mirrors the [BluetoothConnection] convention: [adapterState] is the
   /// snapshot, [adapterStateChanges] is the stream.
-  Future<BluetoothAdapterState> adapterState() => _platform.adapterState();
+  Future<BluetoothAdapterState> adapterState() async {
+    final state = await _platform.adapterState();
+    logAdapter.fine(() => 'adapter state: ${state.name}');
+    return state;
+  }
 
   /// Adapter state changes. Broadcast; emits the current state on listen.
   ///
   /// Live updates only on Linux; other platforms emit the current state once
   /// and then close.
   Stream<BluetoothAdapterState> get adapterStateChanges =>
-      _platform.adapterStateChanges();
+      _platform.adapterStateChanges().map((s) {
+        logAdapter.fine(() => 'adapter -> ${s.name}');
+        return s;
+      });
 
   /// Asks the OS to power the radio on. Throws
   /// [BluetoothUnsupportedException] where this isn't programmatically allowed
   /// (macOS, iOS).
-  Future<void> requestEnable() => _platform.setAdapterEnabled(true);
+  Future<void> requestEnable() {
+    logAdapter.fine('requestEnable');
+    return _platform.setAdapterEnabled(true);
+  }
 
   /// Asks the OS to power the radio off (where allowed).
-  Future<void> requestDisable() => _platform.setAdapterEnabled(false);
+  Future<void> requestDisable() {
+    logAdapter.fine('requestDisable');
+    return _platform.setAdapterEnabled(false);
+  }
 
   /// Paired (bonded) devices known to the OS.
-  Future<List<BluetoothDevice>> bondedDevices() => _platform.bondedDevices();
+  Future<List<BluetoothDevice>> bondedDevices() async {
+    final devices = await _platform.bondedDevices();
+    logDiscovery.finer(() => 'bondedDevices: ${devices.length}');
+    return devices;
+  }
 
   /// Starts an inquiry and streams sightings. Stop by cancelling the
   /// subscription or calling [stopDiscovery].
@@ -65,11 +83,23 @@ class BluetoothRfcomm {
   /// sightings in one batch when it finishes; it cannot be cancelled early.
   /// RSSI is reported during discovery on Linux and Android only (null
   /// elsewhere).
-  Stream<BluetoothDiscoveryResult> startDiscovery() =>
-      _platform.startDiscovery();
+  Stream<BluetoothDiscoveryResult> startDiscovery() {
+    logDiscovery.fine('discovery requested');
+    return _platform.startDiscovery().map((r) {
+      logDiscovery.finer(
+        () =>
+            'found ${r.device.id}'
+            '${r.rssi != null ? ' rssi=${r.rssi}' : ''}',
+      );
+      return r;
+    });
+  }
 
   /// Stops any in-progress inquiry.
-  Future<void> stopDiscovery() => _platform.stopDiscovery();
+  Future<void> stopDiscovery() {
+    logDiscovery.fine('discovery stopped');
+    return _platform.stopDiscovery();
+  }
 
   /// One-shot snapshot of paired devices seen in a single inquiry — i.e. bonded
   /// AND in range during the [timeout] window. For an always-on list prefer
@@ -211,24 +241,41 @@ class BluetoothRfcomm {
     Uuid? serviceUuid,
     Duration? timeout,
   }) async {
-    final transport = await _platform.openRfcomm(
-      device.id,
-      channel: channel,
-      serviceUuid: serviceUuid ?? Uuid.spp,
-      timeout: timeout,
+    final uuid = serviceUuid ?? Uuid.spp;
+    logConnection.fine(
+      () =>
+          'connecting to ${device.id} '
+          '(channel: ${channel ?? 'SDP'}, uuid: $uuid)',
     );
-    return BluetoothConnection.wrap(device, transport);
+    try {
+      final transport = await _platform.openRfcomm(
+        device.id,
+        channel: channel,
+        serviceUuid: uuid,
+        timeout: timeout,
+      );
+      return BluetoothConnection.wrap(device, transport);
+    } on BluetoothException catch (e, st) {
+      logConnection.severe(() => 'connect to ${device.id} failed: $e', e, st);
+      rethrow;
+    }
   }
 
   /// Pairs with [device]. Optional capability — implemented on Linux (BlueZ);
   /// Windows/macOS/Android/iOS throw [BluetoothUnsupportedException] (pair via
   /// the OS settings there). Most devices must be bonded before [connect].
-  Future<void> pair(BluetoothDevice device) => _platform.pair(device.id);
+  Future<void> pair(BluetoothDevice device) {
+    logConnection.fine(() => 'pair ${device.id}');
+    return _platform.pair(device.id);
+  }
 
   /// Removes the bond with [device]. Optional capability — implemented on Linux;
   /// other platforms throw [BluetoothUnsupportedException] (unpair via OS
   /// settings).
-  Future<void> unpair(BluetoothDevice device) => _platform.unpair(device.id);
+  Future<void> unpair(BluetoothDevice device) {
+    logConnection.fine(() => 'unpair ${device.id}');
+    return _platform.unpair(device.id);
+  }
 
   /// Releases resources held by the backend: closes any still-open connections
   /// and discovery streams, and the Linux D-Bus client. Call when you're done

@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 import '../../exceptions.dart';
+import '../../logging.dart';
 import '../../models/bluetooth_device.dart';
 import '../../models/bluetooth_service.dart';
 import '../../models/device_id.dart';
@@ -77,6 +78,7 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
       final list = (jsonDecode(json) as List).cast<Map<String, dynamic>>();
       return list.map(_deviceFromJson).toList();
     } catch (e) {
+      logNative.warning(() => 'malformed paired-devices payload: $e');
       throw BluetoothException('malformed paired-devices payload', cause: e);
     } finally {
       btcFree(ptr.cast());
@@ -240,9 +242,10 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
           ),
         );
       }
-    } catch (_) {
+    } catch (e) {
       // Skip a malformed sighting (e.g. a device with a withheld address or a
       // non-UTF-8 name) rather than tearing down the discovery stream.
+      logNative.fine(() => 'skipped malformed sighting: $e');
     } finally {
       btcFree(json.cast());
     }

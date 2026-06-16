@@ -16,6 +16,10 @@ Initial release.
 - `BluetoothConnection`: `Stream<Uint8List>` input (closes on disconnect),
   non-blocking `add`, `write`/`flush`, state stream, `close`/`finish`.
 - Domain exception hierarchy; `FakeBluetoothRfcommPlatform` for tests.
+- Structured logging via `package:logging` under namespaced loggers
+  (`bluetooth_rfcomm.{connection,data,discovery,adapter,native}`), with raw bytes
+  at FINEST and lifecycle at FINE. No handler is installed by default; see the
+  README "Logging" section for per-namespace level control.
 - All five backends implemented (incl. Linux RFCOMM `Profile1` fd stream);
   native code pending on-device validation per OS.
 - Removed `connectionState(device)` — it was only implementable on Linux and

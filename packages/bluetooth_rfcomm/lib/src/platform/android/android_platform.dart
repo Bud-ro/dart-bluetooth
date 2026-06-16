@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 import '../../exceptions.dart';
+import '../../logging.dart';
 import '../../models/bluetooth_device.dart';
 import '../../models/bluetooth_service.dart';
 import '../../models/device_id.dart';
@@ -95,6 +96,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
           .cast<Map<String, dynamic>>();
       return list.map(_deviceFromJson).toList();
     } catch (e) {
+      logNative.warning(() => 'malformed bonded-devices payload: $e');
       throw BluetoothException('malformed bonded-devices payload', cause: e);
     } finally {
       _lib.free(ptr.cast());
@@ -260,8 +262,9 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
           ),
         );
       }
-    } catch (_) {
+    } catch (e) {
       // Skip a malformed sighting rather than tearing down discovery.
+      logNative.fine(() => 'skipped malformed sighting: $e');
     } finally {
       _activeLib?.free(json.cast());
     }

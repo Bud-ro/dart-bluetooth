@@ -174,6 +174,64 @@ group (otherwise BlueZ returns access-denied, surfaced as
 - The Flutter demo lives with the plugin:
   [`bluetooth_rfcomm_flutter/example`](../bluetooth_rfcomm_flutter/example).
 
+## Logging
+
+The package logs through [`package:logging`](https://pub.dev/packages/logging)
+and **never prints or installs a handler itself** — output is entirely your
+choice. Nothing is emitted until you attach a listener and raise the level.
+
+Loggers (all children of `bluetooth_rfcomm`, names available as
+`BluetoothRfcommLoggers.*`):
+
+| Logger | What it covers |
+| --- | --- |
+| `bluetooth_rfcomm.connection` | connect/disconnect, state changes, write failures, pair/unpair |
+| `bluetooth_rfcomm.data` | raw bytes sent/received (with a short hex preview) |
+| `bluetooth_rfcomm.discovery` | inquiry start/stop, each sighting, bonded-device counts |
+| `bluetooth_rfcomm.adapter` | adapter power/authorization state |
+| `bluetooth_rfcomm.native` | diagnostics from the native backends (malformed payloads, dropped sightings) |
+
+Levels:
+
+| Level | Used for |
+| --- | --- |
+| `FINEST` | raw byte payloads (rx/tx) |
+| `FINER` | per-event detail (individual sightings, bonded counts) |
+| `FINE` | lifecycle: connect/disconnect/state, discovery start/stop, adapter changes |
+| `WARNING` | recoverable problems (a write failed, a malformed sighting skipped) |
+| `SEVERE` | a `connect()` that failed (with the exception attached) |
+
+### Turn it on
+
+Globally — one handler, one level:
+
+```dart
+import 'package:logging/logging.dart';
+
+Logger.root.level = Level.FINE;            // everything FINE and above
+Logger.root.onRecord.listen((r) {
+  print('${r.level.name} ${r.loggerName}: ${r.message}');
+});
+```
+
+Per subsystem — see connection events but not the noisy raw bytes:
+
+```dart
+hierarchicalLoggingEnabled = true;         // enables per-logger levels
+Logger(BluetoothRfcommLoggers.connection).level = Level.FINE;
+Logger(BluetoothRfcommLoggers.data).level = Level.OFF;      // silence rx/tx bytes
+// records still surface on Logger.root.onRecord (they propagate to ancestors)
+```
+
+Or scope a listener to just this package's subtree:
+
+```dart
+Logger(BluetoothRfcommLoggers.package).onRecord.listen(handle);
+```
+
+Raw-byte messages (`data`, FINEST) are built lazily, so leaving that logger off
+(the default) costs nothing.
+
 ## Testing without hardware
 
 `package:bluetooth_rfcomm/testing.dart` ships `FakeBluetoothRfcommPlatform`:

@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:meta/meta.dart';
 
 import 'exceptions.dart';
+import 'logging.dart';
 import 'models/bluetooth_device.dart';
 import 'models/enums.dart';
 import 'platform/platform_interface.dart';
@@ -28,14 +29,19 @@ import 'platform/platform_interface.dart';
 /// ```
 class BluetoothConnection {
   BluetoothConnection._(this.device, this._transport) {
+    logConnection.fine(() => 'opened ${device.id}');
     _inputSub = _transport.incoming.listen(
-      _inputController.add,
+      (bytes) {
+        logData.finest(() => 'rx ${device.id} ${describeBytes(bytes)}');
+        _inputController.add(bytes);
+      },
       onError: _inputController.addError,
       // Peer-initiated disconnect: the transport closes its incoming stream.
       onDone: () => unawaited(_cleanup()),
     );
     _stateSub = _transport.stateChanges.listen((s) {
       _state = s;
+      logConnection.fine(() => 'state ${device.id} -> ${s.name}');
       // Funnel the terminal state through _cleanup so it's emitted exactly
       // once (and the input/state controllers + subscriptions are released).
       if (s == ConnectionState.disconnected) {
@@ -96,7 +102,13 @@ class BluetoothConnection {
     if (data.length > 0x7fffffff) {
       throw const BluetoothWriteException('payload exceeds 2GiB limit');
     }
-    _transport.send(data);
+    logData.finest(() => 'tx ${device.id} ${describeBytes(data)}');
+    try {
+      _transport.send(data);
+    } on BluetoothWriteException catch (e) {
+      logConnection.warning(() => 'write failed ${device.id}: ${e.message}');
+      rethrow;
+    }
   }
 
   /// Waits until all previously [add]ed bytes have been handed to the OS.
@@ -112,6 +124,7 @@ class BluetoothConnection {
 
   /// Closes immediately, discarding anything not yet flushed.
   Future<void> close() async {
+    logConnection.fine(() => 'close ${device.id}');
     _state = ConnectionState.disconnecting;
     await _transport.close();
     await _cleanup();
@@ -119,6 +132,7 @@ class BluetoothConnection {
 
   /// Flushes pending writes, then closes. Prefer this for graceful shutdown.
   Future<void> finish() async {
+    logConnection.fine(() => 'finish ${device.id}');
     _state = ConnectionState.disconnecting;
     try {
       await _transport.flush();
@@ -135,6 +149,7 @@ class BluetoothConnection {
   Future<void> _cleanup() => _cleanupFuture ??= _doCleanup();
 
   Future<void> _doCleanup() async {
+    logConnection.fine(() => 'disconnected ${device.id}');
     _state = ConnectionState.disconnected;
     await _inputSub.cancel();
     await _stateSub.cancel();
