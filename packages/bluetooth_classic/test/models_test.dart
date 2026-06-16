@@ -14,13 +14,13 @@ void main() {
     test('equality by value + kind', () {
       expect(DeviceId.address('AA:BB:CC:DD:EE:FF'),
           DeviceId.address('aa:bb:cc:dd:ee:ff'));
-      expect(DeviceId.opaque('x'), DeviceId.opaque('x'));
-      expect(DeviceId.opaque('AA:BB:CC:DD:EE:FF') ==
+      expect(const DeviceId.opaque('x'), const DeviceId.opaque('x'));
+      expect(const DeviceId.opaque('AA:BB:CC:DD:EE:FF') ==
           DeviceId.address('AA:BB:CC:DD:EE:FF'), isFalse);
     });
 
     test('opaque id rejects .address', () {
-      expect(() => DeviceId.opaque('tok').address, throwsStateError);
+      expect(() => const DeviceId.opaque('tok').address, throwsStateError);
     });
   });
 
