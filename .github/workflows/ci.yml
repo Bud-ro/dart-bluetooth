@@ -227,4 +227,6 @@ jobs:
           flutter build windows --debug
       - name: launch smoke
         working-directory: ${{ env.EXAMPLE }}
-        run: flutter test integration_test -d windows
+        # Explicit file path: on Windows the directory form can report
+        # "No tests were found" (exit 1) even after running the test.
+        run: flutter test integration_test/app_launch_test.dart -d windows
