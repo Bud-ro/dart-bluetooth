@@ -12,6 +12,13 @@ dependencies:
     sdk: flutter
   # The Flutter plugin provides the native builds; it re-exports the API, and we
   # also depend on bluetooth_rfcomm directly for the explicit import.
+  bluetooth_rfcomm: ^0.1.0
+  bluetooth_rfcomm_flutter: ^0.1.0
+
+# Resolve the in-repo packages locally (stripped on publish). Overrides — not
+# bare path deps — are required so the plugin's own hosted constraint on
+# bluetooth_rfcomm doesn't conflict with the example's path source.
+dependency_overrides:
   bluetooth_rfcomm:
     path: ../../bluetooth_rfcomm
   bluetooth_rfcomm_flutter:
