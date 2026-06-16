@@ -15,10 +15,11 @@ env:
   PKG: packages/bluetooth_classic
 
 jobs:
-  # Pure-Dart: analyze + unit tests on every desktop OS. On macOS the
-  # `dart compile exe` step also drives the native-assets build hook, which
-  # compiles the IOBluetooth Objective-C wrapper — so a compile error there
-  # fails CI even though no Bluetooth hardware is present.
+  # Pure-Dart: analyze + unit tests on every desktop OS, then build and *run*
+  # the CLI's `doctor` command. `dart build cli` drives the native-assets build
+  # hook (compiling the IOBluetooth wrapper on macOS); running the built binary
+  # then loads that library and resolves its FFI symbols — so a dylib/DLL load
+  # or code-signing error fails CI even with no Bluetooth hardware.
   analyze-test:
     name: dart (${{ matrix.os }})
     strategy:
@@ -53,9 +54,19 @@ jobs:
           dart analyze
           dart build cli
 
-  # Flutter Android build: compiles the Kotlin backend + the C JNI shim (CMake).
+      - name: launch smoke — run the built CLI doctor (loads native backend)
+        working-directory: ${{ env.PKG }}/example_cli
+        shell: bash
+        run: |
+          BIN=$(find build/cli -type f -name 'btc*' ! -name '*.dll' | head -1)
+          echo "running: $BIN doctor"
+          "$BIN" doctor
+
+  # Flutter Android: compile (apk) + a runtime launch smoke on an emulator,
+  # which loads libbluetooth_classic_android.so and exercises the JNI shim
+  # (JNI_GetCreatedJavaVMs + RegisterNatives) — the riskiest loading path.
   build-android:
-    name: flutter build apk
+    name: flutter android (build + emulator launch)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,38 +78,54 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
-      - name: generate example runners + build
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: generate runners + build apk
         working-directory: ${{ env.PKG }}/example
         run: |
           flutter create --platforms=android --org lol.carson .
           flutter pub get
           flutter build apk --debug
+      - name: launch smoke on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          working-directory: ${{ env.PKG }}/example
+          script: flutter test integration_test -d emulator-5554
 
-  # Flutter Linux build (pure-Dart backend over D-Bus; validates plugin wiring).
+  # Flutter Linux: build + headless launch smoke (xvfb) — loads the D-Bus backend.
   build-linux:
-    name: flutter build linux
+    name: flutter linux (build + launch)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: linux build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libgtk-3-dev libdbus-1-dev
+          sudo apt-get install -y ninja-build libgtk-3-dev libdbus-1-dev xvfb
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
-      - name: generate example runners + build
+      - name: generate runners + build
         working-directory: ${{ env.PKG }}/example
         run: |
           flutter create --platforms=linux --org lol.carson .
           flutter pub get
           flutter build linux --debug
+      - name: launch smoke (xvfb)
+        working-directory: ${{ env.PKG }}/example
+        run: xvfb-run -a flutter test integration_test -d linux
 
-  # Flutter Apple builds: compiles the IOBluetooth (macOS) and ExternalAccessory
-  # (iOS) Objective-C via the Swift Package Manager plugins.
+  # Flutter Apple: build + launch smoke for macOS (IOBluetooth) and an iOS
+  # simulator (ExternalAccessory), both via Swift Package Manager.
   build-apple:
-    name: flutter build macos + ios
+    name: flutter apple (build + launch)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -108,12 +135,15 @@ jobs:
           channel: stable
       - name: enable Swift Package Manager
         run: flutter config --enable-swift-package-manager
-      - name: build macOS
+
+      - name: build + launch macOS
         working-directory: ${{ env.PKG }}/example
         run: |
           flutter create --platforms=macos --org lol.carson .
           flutter pub get
           flutter build macos --debug
+          flutter test integration_test -d macos
+
       - name: build iOS (no codesign)
         working-directory: ${{ env.PKG }}/example
         run: |
@@ -121,9 +151,18 @@ jobs:
           flutter pub get
           flutter build ios --debug --no-codesign
 
-  # Flutter Windows build (pure-Dart Winsock FFI backend).
+      - name: launch smoke (iOS simulator)
+        working-directory: ${{ env.PKG }}/example
+        run: |
+          UDID=$(xcrun simctl list devices available --json | python3 -c "import sys,json; d=json.load(sys.stdin); devs=[x for v in d['devices'].values() for x in v if x['name'].startswith('iPhone')]; print(devs[0]['udid'] if devs else '')")
+          echo "simulator: $UDID"
+          test -n "$UDID"
+          xcrun simctl boot "$UDID" || true
+          flutter test integration_test -d "$UDID"
+
+  # Flutter Windows: build + launch smoke — loads the Winsock FFI backend.
   build-windows:
-    name: flutter build windows
+    name: flutter windows (build + launch)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -131,9 +170,12 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
-      - name: generate example runners + build
+      - name: generate runners + build
         working-directory: ${{ env.PKG }}/example
         run: |
           flutter create --platforms=windows --org lol.carson .
           flutter pub get
           flutter build windows --debug
+      - name: launch smoke
+        working-directory: ${{ env.PKG }}/example
+        run: flutter test integration_test -d windows

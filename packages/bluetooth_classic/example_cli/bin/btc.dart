@@ -23,6 +23,19 @@ Future<void> main(List<String> argv) async {
     return;
   }
 
+  // `doctor` is a no-hardware smoke check: it loads the native backend and
+  // reports state, exiting 0 even with no adapter. A failure to load the native
+  // library (missing dylib/DLL, unresolved symbol, code-signing) is NOT a
+  // BluetoothException, so it escapes and fails — exactly what CI wants to catch.
+  if (argv.first == 'doctor') {
+    final supported = await bt.isSupported();
+    final state = await bt.adapterStateNow();
+    stdout.writeln('supported : $supported');
+    stdout.writeln('adapter   : ${state.name}');
+    stdout.writeln('OK: native backend loaded.');
+    return;
+  }
+
   try {
     if (!await bt.isSupported()) {
       stderr.writeln('Bluetooth Classic is not supported on this host.');
@@ -124,6 +137,7 @@ void _usage() {
 bluetooth_classic CLI
 
 Usage:
+  btc doctor                        Load the native backend & print state
   btc list                          List paired devices
   btc scan [--timeout 8]            Discover nearby devices
   btc connect <ADDR> [--channel N]  Open an RFCOMM serial link
