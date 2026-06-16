@@ -217,8 +217,9 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-      - name: enable native assets
-        run: flutter config --enable-native-assets
+      # No native-assets here: the Windows backend is pure FFI to system DLLs
+      # (the build hook compiles nothing for Windows). Enabling native assets
+      # made `flutter test integration_test` mis-report results on Windows.
       - name: generate runners + build
         working-directory: ${{ env.EXAMPLE }}
         run: |
