@@ -84,4 +84,37 @@ void main() {
     expect(transport.flushCount, 0);
     expect(conn.state, ConnectionState.disconnected);
   });
+
+  test('add after close throws BluetoothWriteException', () async {
+    final (conn, _) = await open();
+    await conn.close();
+    expect(
+      () => conn.add(Uint8List.fromList([1])),
+      throwsA(isA<BluetoothWriteException>()),
+    );
+  });
+
+  test('empty payload is ignored (no send)', () async {
+    final (conn, transport) = await open();
+    conn.add(Uint8List(0));
+    expect(transport.sent, isEmpty);
+  });
+
+  test('double close is idempotent (one flush-free teardown)', () async {
+    final (conn, transport) = await open();
+    final states = <ConnectionState>[];
+    conn.stateChanges.listen(states.add);
+    await conn.close();
+    await conn.close(); // must not throw, re-close, or re-emit
+    await Future<void>.delayed(Duration.zero);
+    expect(transport.flushCount, 0);
+    expect(states, [ConnectionState.disconnected]); // exactly one
+  });
+
+  test('finish after close is idempotent', () async {
+    final (conn, _) = await open();
+    await conn.close();
+    await conn.finish(); // no throw, no extra flush past the closed transport
+    expect(conn.isConnected, isFalse);
+  });
 }

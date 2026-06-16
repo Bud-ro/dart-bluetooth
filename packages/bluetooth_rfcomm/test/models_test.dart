@@ -93,6 +93,55 @@ void main() {
     });
   });
 
+  group('BluetoothService / BluetoothDiscoveryResult equality', () {
+    test('BluetoothService is a value type', () {
+      final a = BluetoothService(uuid: Uuid.spp, rfcommChannelId: 1);
+      final b = BluetoothService(uuid: Uuid.spp, rfcommChannelId: 1);
+      final c = BluetoothService(uuid: Uuid.spp, rfcommChannelId: 2);
+      expect(a, b);
+      expect(a.hashCode, b.hashCode);
+      expect(a, isNot(c));
+      expect({a, b}, hasLength(1)); // dedups in a Set
+    });
+
+    test('BluetoothDiscoveryResult is a value type', () {
+      final device = BluetoothDevice(id: DeviceId.address('AA:BB:CC:DD:EE:FF'));
+      final ts = DateTime(2026);
+      final a = BluetoothDiscoveryResult(
+        device: device,
+        rssi: -40,
+        timestamp: ts,
+      );
+      final b = BluetoothDiscoveryResult(
+        device: device,
+        rssi: -40,
+        timestamp: ts,
+      );
+      final c = BluetoothDiscoveryResult(
+        device: device,
+        rssi: -90,
+        timestamp: ts,
+      );
+      expect(a, b);
+      expect(a.hashCode, b.hashCode);
+      expect(a, isNot(c));
+    });
+  });
+
+  group('BluetoothDevice opaque id', () {
+    test('hasAddress is false and address throws for an opaque id', () {
+      const d = BluetoothDevice(id: DeviceId.opaque('tok'));
+      expect(d.hasAddress, isFalse);
+      expect(() => d.address, throwsStateError);
+    });
+
+    test('hasAddress is true for a MAC id', () {
+      final d = BluetoothDevice(id: DeviceId.address('AA:BB:CC:DD:EE:FF'));
+      expect(d.hasAddress, isTrue);
+      expect(d.address, 'AA:BB:CC:DD:EE:FF');
+    });
+  });
+
   group('enums', () {
     test('helpers', () {
       expect(BluetoothBondState.bonded.isBonded, isTrue);

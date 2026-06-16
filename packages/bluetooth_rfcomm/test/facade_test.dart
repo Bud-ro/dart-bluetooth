@@ -67,6 +67,43 @@ void main() {
     expect(fake.discoveryStopped, isTrue);
   });
 
+  test('bondedAndDiscovered short-circuits when nothing is bonded', () async {
+    final result = await bt.bondedAndDiscovered(
+      timeout: const Duration(milliseconds: 20),
+    );
+    expect(result, isEmpty);
+    // No bonded devices => discovery should never start.
+    expect(fake.discoveryStarted, isFalse);
+    expect(fake.discoveryStopped, isFalse);
+  });
+
+  test(
+    'bondedAndDiscovered rethrows discovery error when nothing seen',
+    () async {
+      fake.bonded.add(FakeBluetoothRfcommPlatform.sampleDevice());
+      fake.discoveryError = const BluetoothDiscoveryException('inquiry failed');
+      expect(
+        () => bt.bondedAndDiscovered(timeout: const Duration(milliseconds: 20)),
+        throwsA(isA<BluetoothDiscoveryException>()),
+      );
+    },
+  );
+
+  test('bondedAndDiscovered wraps a non-Bluetooth discovery error', () async {
+    fake.bonded.add(FakeBluetoothRfcommPlatform.sampleDevice());
+    fake.discoveryError = StateError('boom');
+    await expectLater(
+      () => bt.bondedAndDiscovered(timeout: const Duration(milliseconds: 20)),
+      throwsA(
+        isA<BluetoothDiscoveryException>().having(
+          (e) => e.cause,
+          'cause',
+          isA<StateError>(),
+        ),
+      ),
+    );
+  });
+
   test('connect with explicit channel', () async {
     final device = FakeBluetoothRfcommPlatform.sampleDevice();
     final conn = await bt.connect(device, channel: 3);
