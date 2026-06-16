@@ -103,16 +103,20 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
 
   @override
   Future<List<BluetoothDevice>> bondedDevices() async {
-    final managed = await _managedObjects();
-    final result = <BluetoothDevice>[];
-    managed.forEach((path, ifaces) {
-      final props = ifaces[_deviceIface];
-      if (props == null) return;
-      final paired = (props['Paired'] as DBusBoolean?)?.value ?? false;
-      if (!paired) return;
-      result.add(_deviceFromProps(props));
-    });
-    return result;
+    try {
+      final managed = await _managedObjects();
+      final result = <BluetoothDevice>[];
+      managed.forEach((path, ifaces) {
+        final props = ifaces[_deviceIface];
+        if (props == null) return;
+        final paired = (props['Paired'] as DBusBoolean?)?.value ?? false;
+        if (!paired) return;
+        result.add(_deviceFromProps(props));
+      });
+      return result;
+    } catch (e) {
+      _mapDbus(e, 'bondedDevices');
+    }
   }
 
   @override
@@ -203,19 +207,23 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
     // RFCOMM channel numbers) on Device1.UUIDs. The channel is selected by BlueZ
     // when the profile connects, so we report the advertised SPP service with a
     // sentinel channel of 0 ("let BlueZ choose"). openRfcomm honours that.
-    final path = _devicePath(device);
-    final props = await _allDeviceProps(path);
-    final uuids = (props['UUIDs'] as DBusArray?)
-            ?.children
-            .map((e) => Uuid((e as DBusString).value))
-            .toList() ??
-        const <Uuid>[];
-    final filter = serviceUuid;
-    return [
-      for (final u in uuids)
-        if (filter == null || u == filter)
-          BluetoothService(uuid: u, rfcommChannelId: 0),
-    ];
+    try {
+      final path = _devicePath(device);
+      final props = await _allDeviceProps(path);
+      final uuids = (props['UUIDs'] as DBusArray?)
+              ?.children
+              .map((e) => Uuid((e as DBusString).value))
+              .toList() ??
+          const <Uuid>[];
+      final filter = serviceUuid;
+      return [
+        for (final u in uuids)
+          if (filter == null || u == filter)
+            BluetoothService(uuid: u, rfcommChannelId: 0),
+      ];
+    } catch (e) {
+      _mapDbus(e, 'discoverServices');
+    }
   }
 
   @override
@@ -263,15 +271,23 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
 
   @override
   Future<void> pair(DeviceId device) async {
-    await _obj(_devicePath(device)).callMethod(_deviceIface, 'Pair', []);
+    try {
+      await _obj(_devicePath(device)).callMethod(_deviceIface, 'Pair', []);
+    } catch (e) {
+      _mapDbus(e, 'pair');
+    }
   }
 
   @override
   Future<void> unpair(DeviceId device) async {
-    // RemoveDevice lives on the adapter, not the device.
-    await _obj(_adapterPath).callMethod(_adapterIface, 'RemoveDevice', [
-      DBusObjectPath(_devicePath(device).value),
-    ]);
+    try {
+      // RemoveDevice lives on the adapter, not the device.
+      await _obj(_adapterPath).callMethod(_adapterIface, 'RemoveDevice', [
+        DBusObjectPath(_devicePath(device).value),
+      ]);
+    } catch (e) {
+      _mapDbus(e, 'unpair');
+    }
   }
 
   @override
@@ -280,6 +296,26 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
   }
 
   // --- Helpers -------------------------------------------------------------
+
+  /// Translates raw D-Bus failures into this package's domain exceptions so
+  /// callers never have to handle `DBus*Exception` directly. Always throws.
+  Never _mapDbus(Object e, String op) {
+    if (e is BluetoothException) throw e;
+    if (e is DBusServiceUnknownException) {
+      throw BluetoothDisabledException(
+        'BlueZ (org.bluez) is unavailable — is the bluetooth service running?',
+        cause: e,
+      );
+    }
+    if (e is DBusAccessDeniedException) {
+      throw BluetoothPermissionException('Permission denied during $op',
+          cause: e);
+    }
+    if (e is DBusMethodResponseException) {
+      throw BluetoothException('BlueZ error during $op', cause: e);
+    }
+    throw BluetoothException('D-Bus error during $op', cause: e);
+  }
 
   Future<DBusValue> _adapterProperty(String name) async {
     try {

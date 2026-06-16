@@ -19,9 +19,12 @@ Future<void> main(List<String> argv) async {
 
   if (argv.isEmpty) {
     _usage();
-    exitCode = 64;
-    return;
+    exit(64);
   }
+
+  // We call exit() explicitly throughout: some backends (notably Linux's
+  // DBusClient) hold an open socket that would otherwise keep the VM alive and
+  // hang the process after the command finishes.
 
   // `doctor` is a no-hardware smoke check: it loads the native backend and
   // reports state, exiting 0 even with no adapter. A failure to load the native
@@ -33,20 +36,18 @@ Future<void> main(List<String> argv) async {
     stdout.writeln('supported : $supported');
     stdout.writeln('adapter   : ${state.name}');
     stdout.writeln('OK: native backend loaded.');
-    return;
+    exit(0);
   }
 
   try {
     if (!await bt.isSupported()) {
       stderr.writeln('Bluetooth Classic is not supported on this host.');
-      exitCode = 1;
-      return;
+      exit(1);
     }
     final state = await bt.adapterStateNow();
     if (!state.isOn) {
       stderr.writeln('Adapter is ${state.name}. Turn Bluetooth on and retry.');
-      exitCode = 1;
-      return;
+      exit(1);
     }
 
     switch (argv.first) {
@@ -58,12 +59,13 @@ Future<void> main(List<String> argv) async {
         await _connect(bt, argv.skip(1).toList());
       default:
         _usage();
-        exitCode = 64;
+        exit(64);
     }
   } on BluetoothException catch (e) {
     stderr.writeln('Bluetooth error: $e');
-    exitCode = 1;
+    exit(1);
   }
+  exit(0);
 }
 
 Future<void> _list(BluetoothClassic bt) async {
