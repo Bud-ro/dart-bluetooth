@@ -35,5 +35,10 @@ void main() {
     } on BluetoothException {
       // Expected on a runner with no/blocked adapter.
     }
+
+    // Explicit success marker. On Windows `flutter test integration_test` can
+    // run the test but still report "No tests were found" (exit 1); CI asserts
+    // on this line instead of trusting the exit code there.
+    debugPrint('NATIVE_SMOKE_OK');
   });
 }

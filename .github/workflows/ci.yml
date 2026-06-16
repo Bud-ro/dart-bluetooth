@@ -228,6 +228,12 @@ jobs:
           flutter build windows --debug
       - name: launch smoke
         working-directory: ${{ env.EXAMPLE }}
-        # Explicit file path: on Windows the directory form can report
-        # "No tests were found" (exit 1) even after running the test.
-        run: flutter test integration_test/app_launch_test.dart -d windows
+        shell: bash
+        # On Windows `flutter test integration_test` runs the test (the app
+        # launches and loads the native backend) but can still report "No tests
+        # were found" and exit 1. Assert on the explicit success marker the test
+        # prints rather than trusting the exit code.
+        run: |
+          out=$(flutter test integration_test/app_launch_test.dart -d windows 2>&1) || true
+          echo "$out"
+          echo "$out" | grep -q "NATIVE_SMOKE_OK"
