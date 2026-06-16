@@ -86,8 +86,3 @@ class DeviceNotFoundException extends BluetoothException {
 class ServiceNotFoundException extends BluetoothException {
   const ServiceNotFoundException(super.message, {super.code, super.cause});
 }
-
-/// A connection to this device is already open.
-class AlreadyConnectedException extends BluetoothException {
-  const AlreadyConnectedException(super.message, {super.code, super.cause});
-}

@@ -25,6 +25,16 @@ class BluetoothDiscoveryResult {
   final DateTime timestamp;
 
   @override
+  bool operator ==(Object other) =>
+      other is BluetoothDiscoveryResult &&
+      other.device == device &&
+      other.rssi == rssi &&
+      other.timestamp == timestamp;
+
+  @override
+  int get hashCode => Object.hash(device, rssi, timestamp);
+
+  @override
   String toString() =>
       'BluetoothDiscoveryResult(${device.name ?? device.id}'
       '${rssi != null ? ', ${rssi}dBm' : ''})';

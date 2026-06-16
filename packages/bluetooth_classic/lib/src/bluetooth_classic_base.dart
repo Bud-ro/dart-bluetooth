@@ -52,6 +52,11 @@ class BluetoothClassic {
 
   /// Starts an inquiry and streams sightings. Stop by cancelling the
   /// subscription or calling [stopDiscovery].
+  ///
+  /// On Windows the inquiry instead runs to completion (~10s) and delivers all
+  /// sightings in one batch when it finishes; it cannot be cancelled early.
+  /// RSSI is reported during discovery on Linux and Android only (null
+  /// elsewhere).
   Stream<BluetoothDiscoveryResult> startDiscovery() =>
       _platform.startDiscovery();
 
@@ -113,6 +118,11 @@ class BluetoothClassic {
   /// default). Note macOS requires a real, non-zero channel — passing `0` or
   /// relying on a device that doesn't advertise SDP will fail; pass an explicit
   /// [channel] in that case.
+  ///
+  /// If [timeout] is null no deadline is applied and the attempt can take as
+  /// long as the OS allows. Note that on Android the native socket connect is
+  /// synchronous, so it blocks the calling isolate until it succeeds or the OS
+  /// gives up (~12s); [timeout] cannot interrupt that window.
   ///
   /// Throws [BluetoothTimeoutException] if [timeout] elapses, and
   /// [BluetoothConnectionException] on failure. Where the platform can tell that

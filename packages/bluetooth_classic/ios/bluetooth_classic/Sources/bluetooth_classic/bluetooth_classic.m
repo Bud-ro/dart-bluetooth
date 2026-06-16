@@ -146,11 +146,18 @@ static char *btc_json(id obj) {
   // initial (empty-buffer) event, so a later enqueue would find it NO and stall
   // forever. Always attempt a write when data is queued; a <=0 return means the
   // stream is full/errored and re-arms the HasSpaceAvailable notification.
-  while (self.outBuffer.length > 0) {
-    NSInteger written = [out write:self.outBuffer.bytes
-                        maxLength:self.outBuffer.length];
+  // Track how much we've drained and compact the buffer ONCE at the end.
+  // Removing the written prefix on every iteration memmoves the remaining bytes
+  // down each time — O(n^2) when a large payload drains in many small writes.
+  NSUInteger drained = 0;
+  while (drained < self.outBuffer.length) {
+    NSInteger written = [out write:(const uint8_t *)self.outBuffer.bytes + drained
+                        maxLength:self.outBuffer.length - drained];
     if (written <= 0) break;
-    [self.outBuffer replaceBytesInRange:NSMakeRange(0, written)
+    drained += (NSUInteger)written;
+  }
+  if (drained > 0) {
+    [self.outBuffer replaceBytesInRange:NSMakeRange(0, drained)
                               withBytes:NULL
                                  length:0];
   }

@@ -290,20 +290,23 @@ List<_RawDevice> _enumerateDevices({
   } finally {
     calloc.free(params);
     calloc.free(info);
+    ws.wsaCleanup(); // balance this isolate's WSAStartup
   }
 }
 
 _RawDevice _readDevice(BluetoothDeviceInfo info) {
-  // szName is a null-terminated UTF-16 array.
-  final buf = StringBuffer();
+  // szName is a null-terminated UTF-16 array. Collect the raw code units and let
+  // String.fromCharCodes assemble surrogate pairs — writeCharCode would reject a
+  // lone surrogate and mangle astral (emoji) names truncated at the 248 limit.
+  final units = <int>[];
   for (var i = 0; i < 248; i++) {
     final c = info.szName[i];
     if (c == 0) break;
-    buf.writeCharCode(c);
+    units.add(c);
   }
   return _RawDevice(
     info.address,
-    buf.toString(),
+    String.fromCharCodes(units),
     info.ulClassofDevice,
     info.fConnected != 0,
     info.fRemembered != 0,
@@ -365,6 +368,9 @@ void _recvEntry(List<Object?> args) {
     // fall through to EOF
   } finally {
     calloc.free(buf);
+    // Balance this isolate's WSAStartup so the per-process Winsock refcount
+    // doesn't grow across connect/disconnect cycles.
+    ws.wsaCleanup();
     sendPort.send(null); // signal closed
   }
 }
@@ -378,6 +384,7 @@ void _writeEntry(List<Object?> args) {
   rp.listen((msg) {
     if (msg == null) {
       rp.close();
+      ws.wsaCleanup(); // balance this isolate's WSAStartup on shutdown
       return;
     }
     final rec = msg as List<Object?>;

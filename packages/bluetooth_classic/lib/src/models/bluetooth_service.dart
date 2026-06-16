@@ -26,6 +26,16 @@ class BluetoothService {
   final String? name;
 
   @override
+  bool operator ==(Object other) =>
+      other is BluetoothService &&
+      other.uuid == uuid &&
+      other.rfcommChannelId == rfcommChannelId &&
+      other.name == name;
+
+  @override
+  int get hashCode => Object.hash(uuid, rfcommChannelId, name);
+
+  @override
   String toString() =>
       'BluetoothService(${name ?? uuid}, channel $rfcommChannelId)';
 }

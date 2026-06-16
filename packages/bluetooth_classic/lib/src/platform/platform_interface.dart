@@ -86,7 +86,9 @@ abstract class BluetoothClassicPlatform {
   Future<List<BluetoothDevice>> bondedDevices();
 
   /// Starts an inquiry and streams sightings. Cancelling the subscription (or
-  /// calling [stopDiscovery]) stops the inquiry.
+  /// calling [stopDiscovery]) stops the inquiry on every backend except Windows,
+  /// where the inquiry runs to completion (~10s) on a worker isolate and its
+  /// results are delivered in one batch; cancelling there only discards them.
   Stream<BluetoothDiscoveryResult> startDiscovery();
 
   /// Stops any in-progress inquiry.

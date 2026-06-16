@@ -126,6 +126,13 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
   @override
   Future<void> stopDiscovery() async {
     _lib.stopDiscovery();
+    // Close any discovery streams whose subscribers used stopDiscovery() rather
+    // than cancelling, so the controllers don't leak. (The ACTION_DISCOVERY_-
+    // FINISHED callback also closes them, but only if it actually fires.)
+    for (final controller in _discoveries.values.toList()) {
+      if (!controller.isClosed) unawaited(controller.close());
+    }
+    _discoveries.clear();
   }
 
   @override

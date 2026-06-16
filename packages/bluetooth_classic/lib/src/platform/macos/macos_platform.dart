@@ -113,6 +113,12 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
   @override
   Future<void> stopDiscovery() async {
     btcStopDiscovery();
+    // [inquiry stop] does not deliver deviceInquiryComplete, so close the
+    // discovery streams here or they (and their controllers) leak forever.
+    for (final controller in _discoveries.values.toList()) {
+      if (!controller.isClosed) unawaited(controller.close());
+    }
+    _discoveries.clear();
   }
 
   @override

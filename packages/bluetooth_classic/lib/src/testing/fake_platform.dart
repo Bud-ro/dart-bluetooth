@@ -31,6 +31,10 @@ class FakeBluetoothClassicPlatform extends BluetoothClassicPlatform {
   /// Sightings emitted (in order) when [startDiscovery] is listened to.
   final List<BluetoothDiscoveryResult> discoveryResults = [];
 
+  /// If set, the discovery stream emits this error (after any [discoveryResults])
+  /// so tests can exercise error-surfacing paths.
+  Object? discoveryError;
+
   /// SDP services returned by [discoverServices], keyed by device id.
   final Map<DeviceId, List<BluetoothService>> services = {};
 
@@ -104,6 +108,7 @@ class FakeBluetoothClassicPlatform extends BluetoothClassicPlatform {
         for (final r in discoveryResults) {
           controller.add(r);
         }
+        if (discoveryError != null) controller.addError(discoveryError!);
       },
       onCancel: () {
         discoveryStopped = true;

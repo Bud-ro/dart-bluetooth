@@ -23,4 +23,4 @@ Initial release.
   Android JNI exception-safety / thread-detach / receiver-export / write
   ordering, duplicate disconnect events, Linux profile/socket leaks and error
   mapping, a Windows `flush()` hang, and added send/receive length guards. See
-  `docs/CODE_REVIEW.md`.
+  [docs/CODE_REVIEW.md](https://github.com/Bud-ro/dart-bluetooth/blob/master/docs/CODE_REVIEW.md).
