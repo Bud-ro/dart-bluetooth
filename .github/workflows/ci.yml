@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.44.0"
+  PKG: packages/bluetooth_classic
+
+jobs:
+  # Pure-Dart: analyze + unit tests on every desktop OS. On macOS the
+  # `dart compile exe` step also drives the native-assets build hook, which
+  # compiles the IOBluetooth Objective-C wrapper — so a compile error there
+  # fails CI even though no Bluetooth hardware is present.
+  analyze-test:
+    name: dart (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - run: dart --version
+
+      - name: pub get
+        working-directory: ${{ env.PKG }}
+        run: dart pub get
+
+      - name: analyze (lib + test)
+        working-directory: ${{ env.PKG }}
+        run: dart analyze lib test
+
+      - name: test
+        working-directory: ${{ env.PKG }}
+        run: dart test
+
+      - name: compile CLI example (drives the native-assets build hook)
+        working-directory: ${{ env.PKG }}/example_cli
+        run: |
+          dart pub get
+          dart analyze
+          dart compile exe bin/btc.dart -o btc_built
+
+  # Flutter Android build: compiles the Kotlin backend + the C JNI shim (CMake).
+  build-android:
+    name: flutter build apk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: generate example runners + build
+        working-directory: ${{ env.PKG }}/example
+        run: |
+          flutter create --platforms=android --org lol.carson .
+          flutter pub get
+          flutter build apk --debug
+
+  # Flutter Linux build (pure-Dart backend over D-Bus; validates plugin wiring).
+  build-linux:
+    name: flutter build linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtk-3-dev libdbus-1-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: generate example runners + build
+        working-directory: ${{ env.PKG }}/example
+        run: |
+          flutter create --platforms=linux --org lol.carson .
+          flutter pub get
+          flutter build linux --debug
+
+  # Flutter Apple builds: compiles the IOBluetooth (macOS) and ExternalAccessory
+  # (iOS) Objective-C via the Swift Package Manager plugins.
+  build-apple:
+    name: flutter build macos + ios
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: enable Swift Package Manager
+        run: flutter config --enable-swift-package-manager
+      - name: build macOS
+        working-directory: ${{ env.PKG }}/example
+        run: |
+          flutter create --platforms=macos --org lol.carson .
+          flutter pub get
+          flutter build macos --debug
+      - name: build iOS (no codesign)
+        working-directory: ${{ env.PKG }}/example
+        run: |
+          flutter create --platforms=ios --org lol.carson .
+          flutter pub get
+          flutter build ios --debug --no-codesign
+
+  # Flutter Windows build (pure-Dart Winsock FFI backend).
+  build-windows:
+    name: flutter build windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: generate example runners + build
+        working-directory: ${{ env.PKG }}/example
+        run: |
+          flutter create --platforms=windows --org lol.carson .
+          flutter pub get
+          flutter build windows --debug
