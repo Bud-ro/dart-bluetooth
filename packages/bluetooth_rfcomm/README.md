@@ -242,6 +242,15 @@ final fake = FakeBluetoothRfcommPlatform()
 final bt = BluetoothRfcomm(platform: fake);
 ```
 
+### Real-backend integration tests
+
+`integration/headless_test.dart` (desktop, pure Dart) and the example's
+`integration_test/headless_behavior_test.dart` (mobile) drive the **actual** OS
+APIs with no hardware present, asserting that calls fail with domain exceptions
+rather than crashing. They run live system services, so they're not part of the
+per-push CI — run the **Integration (manual)** workflow from the Actions tab, or
+locally with `dart test integration` (desktop).
+
 ## Status
 
 The Dart layer is implemented and unit-tested across all platforms. Every

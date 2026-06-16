@@ -1,0 +1,82 @@
+name: Integration (manual)
+
+# Real-backend integration tests: they drive the ACTUAL OS Bluetooth APIs with no
+# hardware or peer present, asserting that calls fail with the package's domain
+# exceptions instead of crashing or surfacing native loading errors. They're
+# slower and exercise live system services, so they are NOT part of the per-push
+# CI — trigger them by hand from the Actions tab when you want a deeper check.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.44.0"
+  PKG: packages/bluetooth_rfcomm
+  EXAMPLE: packages/bluetooth_rfcomm_flutter/example
+
+jobs:
+  # Desktop (Windows/Winsock, Linux/BlueZ, macOS/IOBluetooth) via pure Dart — no
+  # Flutter. Exercises the real native path (FFI load, struct/ABI marshaling,
+  # error mapping) end to end. `dart test` builds the macOS code asset itself.
+  desktop:
+    timeout-minutes: 20
+    name: integration ${{ matrix.os }} (real backend)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: pub get
+        working-directory: ${{ env.PKG }}
+        run: dart pub get
+      - name: real-backend integration tests (headless)
+        working-directory: ${{ env.PKG }}
+        run: dart test integration
+
+  # Android via the Flutter example on an emulator (pure Dart can't run on a
+  # device). Loads the JNI/Kotlin backend and exercises the same assertions.
+  android:
+    timeout-minutes: 30
+    name: integration android (emulator, real backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: generate android runner + pub get
+        working-directory: ${{ env.EXAMPLE }}
+        run: |
+          flutter create --platforms=android --org lol.carson .
+          flutter pub get
+      - name: real-backend integration tests on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          working-directory: ${{ env.EXAMPLE }}
+          script: flutter test integration_test/headless_behavior_test.dart -d emulator-5554

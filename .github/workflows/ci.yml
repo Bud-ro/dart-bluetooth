@@ -140,7 +140,7 @@ jobs:
           arch: x86_64
           target: google_apis
           working-directory: ${{ env.EXAMPLE }}
-          script: flutter test integration_test -d emulator-5554
+          script: flutter test integration_test/app_launch_test.dart -d emulator-5554
 
   # Flutter Linux: build + headless launch smoke (xvfb) — loads the D-Bus backend.
   build-linux:
@@ -168,7 +168,7 @@ jobs:
           flutter build linux --debug
       - name: launch smoke (xvfb)
         working-directory: ${{ env.EXAMPLE }}
-        run: xvfb-run -a flutter test integration_test -d linux
+        run: xvfb-run -a flutter test integration_test/app_launch_test.dart -d linux
 
   # Flutter Apple: macOS gets a build + launch smoke (loads the IOBluetooth
   # dylib at runtime); iOS is build-only. Apple native code is compiled by the
@@ -194,7 +194,7 @@ jobs:
           flutter create --platforms=macos --org lol.carson .
           flutter pub get
           flutter build macos --debug
-          flutter test integration_test -d macos
+          flutter test integration_test/app_launch_test.dart -d macos
 
       # iOS: build only. Validates the ExternalAccessory native code compiles and
       # links as a code asset. A simulator *launch* smoke was intentionally
