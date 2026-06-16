@@ -7,8 +7,8 @@
 // calls are dispatched onto it. Events are forwarded to Dart through the
 // registered C callback pointers (NativeCallable.listener on the Dart side).
 //
-// Built incrementally: adapter state, scanning, and connect + service discovery
-// are wired; read/write/subscribe land next.
+// Characteristic routing keys are canonical lowercase 128-bit "service|char"
+// strings so they match the Dart side's Uuid.value exactly.
 
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <Foundation/Foundation.h>
@@ -32,6 +32,15 @@ static char *copy_data(NSData *data) {
   return out;
 }
 
+static char *copy_cstr(NSString *s) {
+  const char *u = s.UTF8String;
+  if (!u) return NULL;
+  size_t len = strlen(u) + 1;
+  char *out = malloc(len);
+  if (out) memcpy(out, u, len);
+  return out;
+}
+
 static NSString *hex_of(NSData *d) {
   const uint8_t *b = d.bytes;
   NSMutableString *s = [NSMutableString stringWithCapacity:d.length * 2];
@@ -39,6 +48,32 @@ static NSString *hex_of(NSData *d) {
     [s appendFormat:@"%02x", b[i]];
   }
   return s;
+}
+
+// Lowercase 128-bit canonical form of a CBUUID, matching Dart's Uuid.value.
+static NSString *cbuuid_canonical(CBUUID *u) {
+  const uint8_t *b = u.data.bytes;
+  NSUInteger n = u.data.length;
+  if (n == 2) {
+    return [NSString
+        stringWithFormat:@"0000%02x%02x-0000-1000-8000-00805f9b34fb", b[0],
+                         b[1]];
+  }
+  if (n == 16) {
+    NSMutableString *s = [NSMutableString stringWithCapacity:36];
+    for (int i = 0; i < 16; i++) {
+      [s appendFormat:@"%02x", b[i]];
+      if (i == 3 || i == 5 || i == 7 || i == 9) [s appendString:@"-"];
+    }
+    return s;
+  }
+  return u.UUIDString.lowercaseString;
+}
+
+static NSString *char_key(CBCharacteristic *ch) {
+  return [NSString stringWithFormat:@"%@|%@",
+                                    cbuuid_canonical(ch.service.UUID),
+                                    cbuuid_canonical(ch.UUID)];
 }
 
 static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
@@ -59,10 +94,34 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
 @property(nonatomic, strong) CBPeripheral *peripheral;
 @property(nonatomic) int64_t discoverReqId;
 @property(nonatomic) NSUInteger pendingChars;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingReads;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingWrites;
+@property(nonatomic, strong) NSMutableSet<NSString *> *subscribed;
+- (CBCharacteristic *)charForService:(NSString *)svc characteristic:(NSString *)chr;
 - (void)emitServices;
 @end
 
 @implementation BLEPeripheral
+
+- (instancetype)init {
+  if ((self = [super init])) {
+    _pendingReads = [NSMutableDictionary dictionary];
+    _pendingWrites = [NSMutableDictionary dictionary];
+    _subscribed = [NSMutableSet set];
+  }
+  return self;
+}
+
+- (CBCharacteristic *)charForService:(NSString *)svc
+                      characteristic:(NSString *)chr {
+  for (CBService *s in self.peripheral.services) {
+    if (![cbuuid_canonical(s.UUID) isEqualToString:svc]) continue;
+    for (CBCharacteristic *ch in s.characteristics) {
+      if ([cbuuid_canonical(ch.UUID) isEqualToString:chr]) return ch;
+    }
+  }
+  return nil;
+}
 
 - (void)peripheral:(CBPeripheral *)peripheral
     didDiscoverServices:(NSError *)error {
@@ -95,12 +154,14 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
     NSMutableArray *chars = [NSMutableArray array];
     for (CBCharacteristic *ch in s.characteristics) {
       [chars addObject:@{
-        @"uuid" : ch.UUID.UUIDString,
+        @"uuid" : cbuuid_canonical(ch.UUID),
         @"properties" : property_names(ch.properties),
       }];
     }
-    [services
-        addObject:@{@"uuid" : s.UUID.UUIDString, @"characteristics" : chars}];
+    [services addObject:@{
+      @"uuid" : cbuuid_canonical(s.UUID),
+      @"characteristics" : chars,
+    }];
   }
   NSData *jd = [NSJSONSerialization dataWithJSONObject:services
                                               options:0
@@ -108,6 +169,46 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   if (jd && g_op) {
     char *out = copy_data(jd);
     if (out) g_op(self.discoverReqId, 0, out, NULL, 0);
+  }
+}
+
+- (void)peripheral:(CBPeripheral *)peripheral
+    didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
+                              error:(NSError *)error {
+  (void)peripheral;
+  NSString *key = char_key(characteristic);
+  NSData *value = characteristic.value;
+  if ([self.subscribed containsObject:key]) {
+    if (g_notify && !error) {
+      char *k = copy_cstr(key);
+      uint8_t *d = (uint8_t *)copy_data(value);
+      g_notify(self.token, k, d, value ? (int32_t)value.length : 0);
+    }
+    return;
+  }
+  NSNumber *reqId = self.pendingReads[key];
+  if (reqId) {
+    [self.pendingReads removeObjectForKey:key];
+    if (g_op) {
+      if (error) {
+        g_op(reqId.longLongValue, -1, NULL, NULL, 0);
+      } else {
+        uint8_t *d = (uint8_t *)copy_data(value);
+        g_op(reqId.longLongValue, 0, NULL, d, value ? (int32_t)value.length : 0);
+      }
+    }
+  }
+}
+
+- (void)peripheral:(CBPeripheral *)peripheral
+    didWriteValueForCharacteristic:(CBCharacteristic *)characteristic
+                             error:(NSError *)error {
+  (void)peripheral;
+  NSString *key = char_key(characteristic);
+  NSNumber *reqId = self.pendingWrites[key];
+  if (reqId) {
+    [self.pendingWrites removeObjectForKey:key];
+    if (g_op) g_op(reqId.longLongValue, error ? -1 : 0, NULL, NULL, 0);
   }
 }
 
@@ -167,7 +268,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   (void)central;
   if (!g_scan) return;
   NSString *uuid = peripheral.identifier.UUIDString;
-  self.peripherals[uuid] = peripheral; // retain so we can connect later
+  self.peripherals[uuid] = peripheral;
 
   NSMutableDictionary *j = [NSMutableDictionary dictionary];
   j[@"id"] = uuid;
@@ -181,7 +282,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   if (services) {
     NSMutableArray *a = [NSMutableArray array];
     for (CBUUID *u in services) {
-      [a addObject:u.UUIDString];
+      [a addObject:cbuuid_canonical(u)];
     }
     j[@"serviceUuids"] = a;
   }
@@ -199,7 +300,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
     NSMutableDictionary *m = [NSMutableDictionary dictionary];
     [sd enumerateKeysAndObjectsUsingBlock:^(CBUUID *k, NSData *v, BOOL *stop) {
       (void)stop;
-      m[k.UUIDString] = hex_of(v);
+      m[cbuuid_canonical(k)] = hex_of(v);
     }];
     j[@"serviceData"] = m;
   }
@@ -215,7 +316,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
     didConnectPeripheral:(CBPeripheral *)peripheral {
   (void)central;
   BLEPeripheral *w = [self wrapperForPeripheral:peripheral];
-  if (w && g_state) g_state(w.token, 2 /* connected */);
+  if (w && g_state) g_state(w.token, 2);
 }
 
 - (void)centralManager:(CBCentralManager *)central
@@ -225,7 +326,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   (void)error;
   BLEPeripheral *w = [self wrapperForPeripheral:peripheral];
   if (w) {
-    if (g_state) g_state(w.token, 0 /* disconnected */);
+    if (g_state) g_state(w.token, 0);
     [self.connections removeObjectForKey:@(w.token)];
   }
 }
@@ -237,7 +338,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   (void)error;
   BLEPeripheral *w = [self wrapperForPeripheral:peripheral];
   if (w) {
-    if (g_state) g_state(w.token, 0 /* disconnected */);
+    if (g_state) g_state(w.token, 0);
     [self.connections removeObjectForKey:@(w.token)];
   }
 }
@@ -331,7 +432,7 @@ int32_t ble_connect(int64_t conn_token, const char *peripheral_id) {
       }
     }
   }
-  if (!p) return -1; // unknown peripheral -> Dart throws DeviceNotFound
+  if (!p) return -1;
 
   BLEPeripheral *w = [BLEPeripheral new];
   w.token = conn_token;
@@ -364,4 +465,87 @@ void ble_discover_services(int64_t req_id, int64_t conn_token) {
   dispatch_async(c.queue, ^{
     [w.peripheral discoverServices:nil];
   });
+}
+
+void ble_read(int64_t req_id, int64_t conn_token, const char *service,
+              const char *characteristic) {
+  BLECentral *c = [BLECentral shared];
+  BLEPeripheral *w = c.connections[@(conn_token)];
+  if (!w) {
+    if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+    return;
+  }
+  NSString *svc = @(service), *chr = @(characteristic);
+  dispatch_async(c.queue, ^{
+    CBCharacteristic *ch = [w charForService:svc characteristic:chr];
+    if (!ch) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
+    w.pendingReads[char_key(ch)] = @(req_id);
+    [w.peripheral readValueForCharacteristic:ch];
+  });
+}
+
+void ble_write(int64_t req_id, int64_t conn_token, const char *service,
+               const char *characteristic, const uint8_t *data, int32_t len,
+               int32_t without_response) {
+  BLECentral *c = [BLECentral shared];
+  BLEPeripheral *w = c.connections[@(conn_token)];
+  if (!w) {
+    if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+    return;
+  }
+  NSString *svc = @(service), *chr = @(characteristic);
+  NSData *payload = (data && len > 0)
+                        ? [NSData dataWithBytes:data length:(NSUInteger)len]
+                        : [NSData data];
+  dispatch_async(c.queue, ^{
+    CBCharacteristic *ch = [w charForService:svc characteristic:chr];
+    if (!ch) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
+    if (without_response) {
+      [w.peripheral writeValue:payload
+             forCharacteristic:ch
+                          type:CBCharacteristicWriteWithoutResponse];
+      if (g_op) g_op(req_id, 0, NULL, NULL, 0);
+    } else {
+      w.pendingWrites[char_key(ch)] = @(req_id);
+      [w.peripheral writeValue:payload
+             forCharacteristic:ch
+                          type:CBCharacteristicWriteWithResponse];
+    }
+  });
+}
+
+void ble_subscribe(int64_t conn_token, const char *service,
+                   const char *characteristic, int32_t enable) {
+  BLECentral *c = [BLECentral shared];
+  BLEPeripheral *w = c.connections[@(conn_token)];
+  if (!w) return;
+  NSString *svc = @(service), *chr = @(characteristic);
+  dispatch_async(c.queue, ^{
+    CBCharacteristic *ch = [w charForService:svc characteristic:chr];
+    if (!ch) return;
+    NSString *key = char_key(ch);
+    if (enable) {
+      [w.subscribed addObject:key];
+    } else {
+      [w.subscribed removeObject:key];
+    }
+    [w.peripheral setNotifyValue:(enable ? YES : NO) forCharacteristic:ch];
+  });
+}
+
+int32_t ble_max_write_len(int64_t conn_token, int32_t without_response) {
+  BLECentral *c = [BLECentral shared];
+  BLEPeripheral *w = c.connections[@(conn_token)];
+  if (!w) return 20;
+  CBCharacteristicWriteType type = without_response
+                                       ? CBCharacteristicWriteWithoutResponse
+                                       : CBCharacteristicWriteWithResponse;
+  NSUInteger n = [w.peripheral maximumWriteValueLengthForType:type];
+  return (int32_t)(n + 3); // report as an ATT MTU (payload + 3-byte header)
 }

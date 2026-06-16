@@ -71,6 +71,26 @@ void ble_disconnect(int64_t conn_token);
 // (status 0), or status != 0 on error.
 void ble_discover_services(int64_t req_id, int64_t conn_token);
 
+// Reads a characteristic. `op_cb` fires with `req_id` and the value in
+// data/len (status 0), or status != 0 on error.
+void ble_read(int64_t req_id, int64_t conn_token, const char *service,
+              const char *characteristic);
+
+// Writes `len` bytes to a characteristic. With `without_response`, fires `op_cb`
+// (status 0) immediately; otherwise after the acknowledged write completes.
+void ble_write(int64_t req_id, int64_t conn_token, const char *service,
+               const char *characteristic, const uint8_t *data, int32_t len,
+               int32_t without_response);
+
+// Enables/disables notifications on a characteristic. While enabled, pushed
+// values arrive via `notify_cb` with characteristic = "service|char" (canonical
+// lowercase 128-bit UUIDs).
+void ble_subscribe(int64_t conn_token, const char *service,
+                   const char *characteristic, int32_t enable);
+
+// Returns the usable ATT MTU (max write payload + 3) for the connection.
+int32_t ble_max_write_len(int64_t conn_token, int32_t without_response);
+
 #if defined(__cplusplus)
 }
 #endif

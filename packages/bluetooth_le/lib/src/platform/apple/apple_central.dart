@@ -21,8 +21,8 @@ import 'apple_bindings.dart';
 /// is identical). Calls into the C ABI in `src/native/apple/` via `dart:ffi`;
 /// native events arrive as `NativeCallable.listener` events on this isolate.
 ///
-/// Built incrementally: adapter state, scanning, connect and service discovery
-/// are wired; read/write/subscribe land next.
+/// Full GATT central: adapter state, scanning, connect, service discovery, and
+/// characteristic read/write/subscribe/MTU are all wired.
 class AppleBleCentral extends BleCentralPlatform {
   AppleBleCentral() {
     bleRegister(
@@ -189,9 +189,18 @@ class AppleBleCentral extends BleCentralPlatform {
     ffi.Pointer<ffi.Uint8> data,
     int len,
   ) {
-    // Notification routing is wired in the read/write/subscribe revision.
-    if (characteristic != ffi.nullptr) bleFree(characteristic.cast());
-    if (data != ffi.nullptr) bleFree(data.cast());
+    try {
+      final conn = _connections[connToken];
+      if (conn == null || characteristic == ffi.nullptr) return;
+      final key = characteristic.cast<Utf8>().toDartString();
+      final bytes = (data != ffi.nullptr && len > 0)
+          ? Uint8List.fromList(data.asTypedList(len))
+          : Uint8List(0);
+      conn._onNotifyNative(key, bytes);
+    } finally {
+      if (characteristic != ffi.nullptr) bleFree(characteristic.cast());
+      if (data != ffi.nullptr) bleFree(data.cast());
+    }
   }
 
   static BleScanResult _scanResultFromJson(Map<String, dynamic> j) {
@@ -242,8 +251,22 @@ class AppleGattConnection implements GattConnection {
   final StreamController<BleConnectionState> _stateController =
       StreamController<BleConnectionState>.broadcast();
   final Completer<void> _connected = Completer<void>();
+  final Map<String, StreamController<Uint8List>> _notifyControllers = {};
+  Future<void> _opChain = Future<void>.value();
   BleConnectionState _current = BleConnectionState.connecting;
   bool _closed = false;
+
+  // CoreBluetooth allows overlapping GATT ops, but serialising keeps ordering
+  // simple and matches the other backends (Android requires it).
+  Future<T> _enqueue<T>(Future<T> Function() op) {
+    final result = _opChain.then((_) => op());
+    _opChain = result.then((_) {}, onError: (_) {});
+    return result;
+  }
+
+  void _onNotifyNative(String key, Uint8List value) {
+    _notifyControllers[key]?.add(value);
+  }
 
   void _onStateNative(int code) {
     final s = code == 2
@@ -297,10 +320,27 @@ class AppleGattConnection implements GattConnection {
   }
 
   @override
-  Future<Uint8List> readCharacteristic(
-    Uuid service,
-    Uuid characteristic,
-  ) async => throw const BleUnsupportedException('GATT read is not wired yet');
+  Future<Uint8List> readCharacteristic(Uuid service, Uuid characteristic) {
+    return _enqueue(() async {
+      final reqId = AppleBleCentral._nextReqId++;
+      final completer = Completer<_OpResult>();
+      AppleBleCentral._ops[reqId] = completer;
+      logGatt.fine(() => 'read ${characteristic.value} conn $_token');
+      final sPtr = service.value.toNativeUtf8();
+      final cPtr = characteristic.value.toNativeUtf8();
+      try {
+        bleRead(reqId, _token, sPtr.cast(), cPtr.cast());
+      } finally {
+        calloc.free(sPtr);
+        calloc.free(cPtr);
+      }
+      final r = await completer.future;
+      if (r.status != 0) {
+        throw BleGattException('read failed', code: r.status);
+      }
+      return r.data ?? Uint8List(0);
+    });
+  }
 
   @override
   Future<void> writeCharacteristic(
@@ -308,16 +348,81 @@ class AppleGattConnection implements GattConnection {
     Uuid characteristic,
     Uint8List value, {
     bool withoutResponse = false,
-  }) async =>
-      throw const BleUnsupportedException('GATT write is not wired yet');
+  }) {
+    return _enqueue(() async {
+      final reqId = AppleBleCentral._nextReqId++;
+      final completer = Completer<_OpResult>();
+      AppleBleCentral._ops[reqId] = completer;
+      logData.finest(
+        () => 'write ${characteristic.value} ${describeBytes(value)}',
+      );
+      final sPtr = service.value.toNativeUtf8();
+      final cPtr = characteristic.value.toNativeUtf8();
+      // ble_write copies the bytes into an NSData synchronously, so freeing the
+      // buffer right after the call returns is safe.
+      final dPtr = value.isEmpty
+          ? ffi.nullptr
+          : calloc<ffi.Uint8>(value.length);
+      if (value.isNotEmpty) {
+        dPtr.asTypedList(value.length).setAll(0, value);
+      }
+      try {
+        bleWrite(
+          reqId,
+          _token,
+          sPtr.cast(),
+          cPtr.cast(),
+          dPtr.cast(),
+          value.length,
+          withoutResponse ? 1 : 0,
+        );
+      } finally {
+        calloc.free(sPtr);
+        calloc.free(cPtr);
+        if (value.isNotEmpty) calloc.free(dPtr);
+      }
+      final r = await completer.future;
+      if (r.status != 0) {
+        throw BleGattException('write failed', code: r.status);
+      }
+    });
+  }
 
   @override
-  Stream<Uint8List> subscribe(Uuid service, Uuid characteristic) =>
-      throw const BleUnsupportedException('GATT subscribe is not wired yet');
+  Stream<Uint8List> subscribe(Uuid service, Uuid characteristic) {
+    final key = '${service.value}|${characteristic.value}';
+    late StreamController<Uint8List> controller;
+    controller = StreamController<Uint8List>.broadcast(
+      onListen: () {
+        _notifyControllers[key] = controller;
+        _setNotify(service, characteristic, enable: true);
+        logGatt.fine(() => 'subscribe ${characteristic.value} conn $_token');
+      },
+      onCancel: () {
+        _setNotify(service, characteristic, enable: false);
+        _notifyControllers.remove(key);
+      },
+    );
+    return controller.stream;
+  }
+
+  void _setNotify(Uuid service, Uuid characteristic, {required bool enable}) {
+    final sPtr = service.value.toNativeUtf8();
+    final cPtr = characteristic.value.toNativeUtf8();
+    try {
+      bleSubscribe(_token, sPtr.cast(), cPtr.cast(), enable ? 1 : 0);
+    } finally {
+      calloc.free(sPtr);
+      calloc.free(cPtr);
+    }
+  }
 
   @override
-  Future<int> requestMtu(int mtu) async =>
-      throw const BleUnsupportedException('requestMtu is not wired yet');
+  Future<int> requestMtu(int mtu) async {
+    // CoreBluetooth negotiates the ATT MTU automatically; there's no API to
+    // request a specific value. Report the usable size instead.
+    return bleMaxWriteLen(_token, 1);
+  }
 
   @override
   Future<void> close() async {
@@ -335,6 +440,10 @@ class AppleGattConnection implements GattConnection {
         _stateController.add(BleConnectionState.disconnected);
       }
     }
+    for (final c in _notifyControllers.values) {
+      if (!c.isClosed) c.close();
+    }
+    _notifyControllers.clear();
     if (!_stateController.isClosed) _stateController.close();
   }
 

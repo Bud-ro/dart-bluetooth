@@ -58,6 +58,62 @@ external void bleDiscoverServices(int reqId, int connToken);
 
 @ffi.Native<
   ffi.Void Function(
+    ffi.Int64,
+    ffi.Int64,
+    ffi.Pointer<ffi.Char>,
+    ffi.Pointer<ffi.Char>,
+  )
+>(symbol: 'ble_read')
+external void bleRead(
+  int reqId,
+  int connToken,
+  ffi.Pointer<ffi.Char> service,
+  ffi.Pointer<ffi.Char> characteristic,
+);
+
+@ffi.Native<
+  ffi.Void Function(
+    ffi.Int64,
+    ffi.Int64,
+    ffi.Pointer<ffi.Char>,
+    ffi.Pointer<ffi.Char>,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.Int32,
+    ffi.Int32,
+  )
+>(symbol: 'ble_write')
+external void bleWrite(
+  int reqId,
+  int connToken,
+  ffi.Pointer<ffi.Char> service,
+  ffi.Pointer<ffi.Char> characteristic,
+  ffi.Pointer<ffi.Uint8> data,
+  int len,
+  int withoutResponse,
+);
+
+@ffi.Native<
+  ffi.Void Function(
+    ffi.Int64,
+    ffi.Pointer<ffi.Char>,
+    ffi.Pointer<ffi.Char>,
+    ffi.Int32,
+  )
+>(symbol: 'ble_subscribe')
+external void bleSubscribe(
+  int connToken,
+  ffi.Pointer<ffi.Char> service,
+  ffi.Pointer<ffi.Char> characteristic,
+  int enable,
+);
+
+@ffi.Native<ffi.Int32 Function(ffi.Int64, ffi.Int32)>(
+  symbol: 'ble_max_write_len',
+)
+external int bleMaxWriteLen(int connToken, int withoutResponse);
+
+@ffi.Native<
+  ffi.Void Function(
     ffi.Pointer<ffi.NativeFunction<ScanCbNative>>,
     ffi.Pointer<ffi.NativeFunction<StateCbNative>>,
     ffi.Pointer<ffi.NativeFunction<OpCbNative>>,
