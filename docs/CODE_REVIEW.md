@@ -78,3 +78,55 @@ Nothing is left deferred; each was either fixed or deliberately dropped:
   `flutter_bluetooth_serial` (`finish` = graceful flush+close, `close` =
   immediate), the reference this package's data model is based on. Documented.
 - **Raspberry Pi SPP** — documented (`bluetoothd --compat`, `bluetooth` group).
+
+## Review — Set B (second 10-axis pass, post-split)
+
+A second review pass on 10 new axes (performance, dartdoc accuracy, test
+coverage, build/packaging, cross-platform parity, resource lifecycle,
+cancellation/timeout, error diagnosability, encoding/binary-safety, API
+idiomaticity). Status of the genuinely-real findings:
+
+- **[fixed]** iOS send path O(n²) — buffer drained per chunk via front-removal;
+  now drains with an offset cursor and compacts once per pump.
+- **[fixed]** Windows device-name decode crash — `writeCharCode` per UTF-16 unit
+  rejects lone surrogates (emoji / names truncated at the 248-char cap); switched
+  to `String.fromCharCodes`.
+- **[fixed]** macOS/Android `stopDiscovery()` leaked the discovery controller
+  (macOS `[inquiry stop]` never fires the completion callback) — now closes them.
+- **[fixed]** Windows worker isolates didn't balance `WSAStartup`/`WSACleanup`.
+- **[fixed]** `BluetoothService`/`BluetoothDiscoveryResult` lacked `==`/`hashCode`.
+- **[fixed]** Dead `AlreadyConnectedException` removed.
+- **[fixed]** Docs: Android connect blocking + timeout, `ConnectionState`
+  semantics, Windows discovery batch/cancel, parity notes; CHANGELOG link.
+- **[fixed]** Test coverage: add-after-close, empty payload, double close/finish
+  idempotency, bondedAndDiscovered short-circuit + error surfacing, value-type
+  equality, opaque-id behavior (25 → 36 tests).
+
+Tracked — genuinely real but requiring real-hardware verification to change
+safely (CI has no Bluetooth peer, so a connect-path change can't be validated
+here); recorded so the next review round doesn't re-flag them as new:
+
+- **[tracked]** Android `connect()` blocks the calling isolate — the native
+  `socket.connect()` runs synchronously inside the FFI `open` call, so the Dart
+  `timeout` can't interrupt it and the isolate is blocked for Android's internal
+  connect timeout (~12s). Fix path: run `btc_and_open` on a helper isolate and
+  surface completion via the existing state callback. Needs a device to verify
+  the JNI thread-attach + callback delivery still work off-isolate.
+- **[tracked]** Native open-failure diagnosability — macOS `IOReturn`, iOS
+  `NSStream.streamError`, and Android Java exceptions (incl. `SecurityException`)
+  are collapsed to a bare `0`/null at the C-ABI boundary, so the thrown
+  `BluetoothException` lacks `code`/`cause` and a permission failure can look like
+  "no devices". Fix path: thread the native error through the callbacks/out-params
+  and map `SecurityException` → `BluetoothPermissionException`.
+- **[tracked]** Android device-name encoding — `GetStringUTFChars` returns
+  modified UTF-8, so a bonded device whose name contains a NUL or astral char
+  makes `bondedDevices()` throw `FormatException` on decode. Fix path: marshal
+  the name as standard UTF-8 (`String.getBytes("UTF-8")`) on the C side.
+
+Accepted (low impact, not worth the churn/risk):
+
+- macOS `g_inquiry` holds one completed inquiry object until the next discovery
+  (bounded to one, not a growing leak).
+- Linux `dispose()` closes the D-Bus client but not an outstanding
+  `adapterStateChanges` controller (per-listener `onCancel` already releases the
+  signal subscription; only matters if `dispose()` races a live listener).
