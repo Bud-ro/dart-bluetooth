@@ -3,8 +3,10 @@
 // all system DLLs, so this works from a pure-Dart CLI and a Flutter Windows app
 // alike.
 //
-// Struct layouts mirror the Win32 SDK with default (natural) alignment, which
-// is what Dart FFI also applies, so the field offsets match the C definitions.
+// Most struct layouts mirror the Win32 SDK with default (natural) alignment,
+// which Dart FFI also applies. The exception is SOCKADDR_BTH: ws2bth.h wraps it
+// in `#include <pshpack1.h>` (i.e. `#pragma pack(1)`), so it is byte-packed with
+// NO padding — see the @ffi.Packed(1) on SockaddrBth below.
 import 'dart:ffi' as ffi;
 
 import 'package:ffi/ffi.dart';
@@ -22,7 +24,11 @@ final int invalidSocket = -1; // all-ones when read as a pointer-sized int
 
 // --- Structs -----------------------------------------------------------------
 
-/// `SOCKADDR_BTH` from `ws2bth.h`.
+/// `SOCKADDR_BTH` from `ws2bth.h`. That header is byte-packed (`pshpack1.h`), so
+/// this MUST be `@ffi.Packed(1)`: total size 30 bytes with `btAddr` at offset 2.
+/// Without packing, Dart 8-aligns `btAddr` to offset 8 and `connect()` receives a
+/// malformed address (wrong bytes, wrong channel, wrong `namelen`) and fails.
+@ffi.Packed(1)
 final class SockaddrBth extends ffi.Struct {
   @ffi.Uint16()
   external int addressFamily;

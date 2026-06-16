@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'connection.dart';
 import 'exceptions.dart';
 import 'models/bluetooth_device.dart';
@@ -69,9 +71,9 @@ class BluetoothRfcomm {
   /// Stops any in-progress inquiry.
   Future<void> stopDiscovery() => _platform.stopDiscovery();
 
-  /// Paired devices that were also seen in a fresh inquiry — i.e. bonded AND
-  /// currently in range. Runs discovery for [timeout] (default 8s) and returns
-  /// the intersection, each carrying the latest RSSI when reported.
+  /// One-shot snapshot of paired devices seen in a single inquiry — i.e. bonded
+  /// AND in range during the [timeout] window. For an always-on list prefer
+  /// [bondedAndDiscoveredStream], which keeps scanning and accumulates sightings.
   Future<List<BluetoothDevice>> bondedAndDiscovered({
     Duration timeout = const Duration(seconds: 8),
   }) async {
@@ -111,6 +113,71 @@ class BluetoothRfcomm {
             );
     }
     return seen.values.toList(growable: false);
+  }
+
+  /// Continuously scans and emits the set of devices that are **both paired and
+  /// have been seen nearby** during this scan. The set is cumulative — once a
+  /// paired device is sighted it stays in the list (with its latest RSSI); a new
+  /// list is emitted whenever a fresh match appears or a known one's RSSI
+  /// updates. The inquiry is re-run automatically so scanning continues until the
+  /// subscription is cancelled, which stops it. The bonded set is re-read each
+  /// cycle, so devices paired mid-scan are picked up.
+  ///
+  /// This is the "list of my paired devices that are around right now (and stay
+  /// listed once seen)" stream; use [bondedAndDiscovered] for a one-shot snapshot.
+  Stream<List<BluetoothDevice>> bondedAndDiscoveredStream() {
+    late StreamController<List<BluetoothDevice>> controller;
+    StreamSubscription<BluetoothDiscoveryResult>? sub;
+    Completer<void>? cycleDone;
+    var cancelled = false;
+    final seen = <DeviceId, BluetoothDevice>{};
+
+    Future<void> loop() async {
+      while (!cancelled) {
+        final byId = {for (final d in await bondedDevices()) d.id: d};
+        if (cancelled) return;
+        final done = cycleDone = Completer<void>();
+        sub = startDiscovery().listen(
+          (r) {
+            final base = byId[r.device.id];
+            if (base != null && !controller.isClosed) {
+              seen[r.device.id] = base.copyWith(rssi: r.rssi ?? r.device.rssi);
+              controller.add(seen.values.toList(growable: false));
+            }
+          },
+          onError: (Object e) {
+            if (!controller.isClosed) controller.addError(e);
+          },
+          // Inquiry finished (macOS/Android/Windows close the stream; Linux keeps
+          // it open and streams continuously, so this simply never fires there).
+          onDone: () {
+            if (!done.isCompleted) done.complete();
+          },
+          cancelOnError: false,
+        );
+        await done.future;
+        await sub?.cancel();
+        sub = null;
+      }
+    }
+
+    controller = StreamController<List<BluetoothDevice>>.broadcast(
+      onListen: () {
+        cancelled = false;
+        unawaited(
+          loop().catchError((Object e) {
+            if (!controller.isClosed) controller.addError(e);
+          }),
+        );
+      },
+      onCancel: () async {
+        cancelled = true;
+        if (cycleDone != null && !cycleDone!.isCompleted) cycleDone!.complete();
+        await sub?.cancel();
+        await stopDiscovery();
+      },
+    );
+    return controller.stream;
   }
 
   /// Resolves the RFCOMM services [device] advertises via SDP. Pass the result's

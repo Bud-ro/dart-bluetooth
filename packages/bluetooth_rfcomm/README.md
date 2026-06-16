@@ -81,7 +81,11 @@ The Apple sources are compiled by the native-assets `hook/build.dart` for both
   `requestEnable()`/`requestDisable()` (where the OS permits)
 - `bondedDevices()` — paired devices
 - `startDiscovery()` → `Stream<BluetoothDiscoveryResult>`, `stopDiscovery()`
-- `bondedAndDiscovered()` — paired **and** currently in range
+- `bondedAndDiscovered()` — one-shot: paired **and** in range during a single
+  inquiry
+- `bondedAndDiscoveredStream()` → `Stream<List<BluetoothDevice>>` — keeps scanning
+  and emits the cumulative set of paired devices seen nearby (stays listed once
+  seen); cancel the subscription to stop
 - `discoverServices(device)` — SDP lookup (RFCOMM channels)
 - `connect(device, {channel, serviceUuid, timeout})` → `BluetoothConnection`
 - `pair()`/`unpair()` — optional; implemented on Linux, throws

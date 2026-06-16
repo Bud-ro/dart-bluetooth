@@ -104,6 +104,35 @@ void main() {
     );
   });
 
+  test('bondedAndDiscoveredStream emits accumulated paired+seen', () async {
+    final inRange = FakeBluetoothRfcommPlatform.sampleDevice(
+      address: 'AA:AA:AA:AA:AA:AA',
+      name: 'InRange',
+    );
+    final notBonded = FakeBluetoothRfcommPlatform.sampleDevice(
+      address: 'CC:CC:CC:CC:CC:CC',
+      name: 'Stranger',
+    );
+    fake.bonded.add(inRange);
+    fake.discoveryResults.addAll([
+      BluetoothDiscoveryResult(
+        device: notBonded, // not paired -> excluded
+        timestamp: DateTime(2026),
+      ),
+      BluetoothDiscoveryResult(
+        device: inRange.copyWith(rssi: -42),
+        rssi: -42,
+        timestamp: DateTime(2026),
+      ),
+    ]);
+
+    final first = await bt.bondedAndDiscoveredStream().first;
+    expect(first, hasLength(1));
+    expect(first.first.id, inRange.id);
+    expect(first.first.rssi, -42);
+    expect(fake.discoveryStopped, isTrue); // cancelled after first event
+  });
+
   test('connect with explicit channel', () async {
     final device = FakeBluetoothRfcommPlatform.sampleDevice();
     final conn = await bt.connect(device, channel: 3);
