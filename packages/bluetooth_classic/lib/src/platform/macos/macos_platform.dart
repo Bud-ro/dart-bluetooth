@@ -17,7 +17,8 @@ import 'macos_bindings.dart';
 
 /// macOS backend over IOBluetooth.
 ///
-/// Calls into the C ABI in `native/apple/bluetooth_classic.m` via `dart:ffi`.
+/// Calls into the C ABI in `macos/bluetooth_classic/Sources/bluetooth_classic/`
+/// via `dart:ffi`.
 /// The native side runs IOBluetooth on a dedicated CFRunLoop thread and forwards
 /// inbound data / state through C callbacks, which arrive here as
 /// `NativeCallable.listener` events on this isolate — so nothing blocks and no

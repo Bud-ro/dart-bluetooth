@@ -1,10 +1,12 @@
 name: bluetooth_classic
 description: >-
-  Cross-platform Bluetooth Classic (RFCOMM serial) for Dart and Flutter. One
-  package, usable from a pure-Dart CLI and from Flutter apps, with no native
-  build dependency on Flutter. Windows, macOS, Linux, Android and iOS.
+  Cross-platform Bluetooth Classic RFCOMM serial for Dart and Flutter — one
+  package for CLI and Flutter on Windows, macOS, Linux, Android and iOS.
 version: 0.1.0
-repository: https://github.com/carson/dart-bluetooth
+repository: https://github.com/Bud-ro/dart-bluetooth
+homepage: https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_classic
+issue_tracker: https://github.com/Bud-ro/dart-bluetooth/issues
+documentation: https://github.com/Bud-ro/dart-bluetooth/blob/master/packages/bluetooth_classic/README.md
 topics:
   - bluetooth
   - serial

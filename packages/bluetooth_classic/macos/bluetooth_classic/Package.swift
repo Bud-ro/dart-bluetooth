@@ -1,11 +1,11 @@
 // swift-tools-version:5.9
 // Swift Package Manager manifest for the Flutter macOS plugin.
 //
-// Compiles the same Objective-C IOBluetooth wrapper used by the native-assets
-// build hook (Sources/bluetooth_classic is a symlink to ../../native/apple/macos,
-// with the public header under include/). As an `ffiPlugin` there is no
-// platform-channel plugin class — Dart talks to the native code directly via
-// dart:ffi. Flutter's SPM integration requires a FlutterFramework dependency.
+// Sources/bluetooth_classic holds the Objective-C IOBluetooth wrapper (public
+// header under include/); the native-assets build hook compiles the very same
+// files for the pure-Dart CLI. As an `ffiPlugin` there is no platform-channel
+// plugin class — Dart talks to the native code directly via dart:ffi. Flutter's
+// SPM integration requires a FlutterFramework dependency.
 import PackageDescription
 
 let package = Package(

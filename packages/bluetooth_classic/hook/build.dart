@@ -5,9 +5,9 @@
 // (`dart run`) and a Flutter `flutter build`. The same sources are also compiled
 // by the SPM plugins for `flutter run`.
 //
-// Per target OS:
-//   macOS -> native/apple/macos/bluetooth_classic.m  (IOBluetooth)
-//   iOS   -> native/apple/ios/bluetooth_classic.m    (ExternalAccessory)
+// Per target OS (sources shared with the SPM plugins, single copy):
+//   macOS -> macos/bluetooth_classic/Sources/bluetooth_classic/  (IOBluetooth)
+//   iOS   -> ios/bluetooth_classic/Sources/bluetooth_classic/    (ExternalAccessory)
 // Windows/Linux build nothing (those backends are pure Dart).
 import 'dart:io';
 
@@ -23,14 +23,23 @@ void main(List<String> args) async {
     if (!input.config.buildCodeAssets) return;
 
     final os = input.config.code.targetOS;
-    final (String subdir, List<String> frameworks) = switch (os) {
-      OS.macOS => ('macos', const ['Foundation', 'IOBluetooth']),
-      OS.iOS => ('ios', const ['Foundation', 'ExternalAccessory']),
+    // The Apple sources live in the SPM plugin Sources dirs (single copy, no
+    // symlinks — which pub publish rejects). The build hook compiles the same
+    // files for the pure-Dart CLI / `flutter build`.
+    final (String relDir, List<String> frameworks) = switch (os) {
+      OS.macOS => (
+          'macos/bluetooth_classic/Sources/bluetooth_classic/',
+          const ['Foundation', 'IOBluetooth']
+        ),
+      OS.iOS => (
+          'ios/bluetooth_classic/Sources/bluetooth_classic/',
+          const ['Foundation', 'ExternalAccessory']
+        ),
       _ => ('', const <String>[]),
     };
-    if (subdir.isEmpty) return; // Windows/Linux: nothing to build.
+    if (relDir.isEmpty) return; // Windows/Linux: nothing to build.
 
-    final srcDir = input.packageRoot.resolve('native/apple/$subdir/');
+    final srcDir = input.packageRoot.resolve(relDir);
     final builder = CBuilder.library(
       name: _libName,
       assetName: _assetName,

@@ -1,5 +1,7 @@
 # bluetooth_classic
 
+[![CI](https://github.com/Bud-ro/dart-bluetooth/actions/workflows/ci.yml/badge.svg)](https://github.com/Bud-ro/dart-bluetooth/actions/workflows/ci.yml)
+
 Cross-platform **Bluetooth Classic (RFCOMM serial)** for Dart and Flutter.
 
 One package, one Dart API, usable from a **pure-Dart CLI** (`dart run`) and from
@@ -17,6 +19,23 @@ final conn = await bt.connect(paired.first);     // SDP-resolves the SPP channel
 conn.input.listen((bytes) => print('rx ${bytes.length} bytes'));
 conn.add(Uint8List.fromList('AT\r\n'.codeUnits)); // non-blocking send
 await conn.finish();                              // flush, then close
+```
+
+## Install
+
+This package is distributed via Git (not pub.dev) so it can stay **Flutter-free**
+for CLI use. pub.dev requires a `flutter:` SDK constraint for any package that
+declares a plugin platform block, and that constraint makes the package
+unusable from a pure-Dart `dart pub get` — defeating the core goal. A Git
+dependency has no such restriction and works for both CLI and Flutter consumers:
+
+```yaml
+dependencies:
+  bluetooth_classic:
+    git:
+      url: https://github.com/Bud-ro/dart-bluetooth.git
+      ref: v0.1.0
+      path: packages/bluetooth_classic
 ```
 
 ## Platform support

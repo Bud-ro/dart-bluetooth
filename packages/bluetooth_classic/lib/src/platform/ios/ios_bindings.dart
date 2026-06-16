@@ -1,4 +1,5 @@
-// FFI bindings to the iOS C ABI in native/apple/ios/bluetooth_classic.{h,m}.
+// FFI bindings to the iOS C ABI in
+// ios/bluetooth_classic/Sources/bluetooth_classic/bluetooth_classic.{h,m}.
 //
 // Same native-assets code asset as the other Apple bindings; only the iOS .m is
 // compiled when targeting iOS, so these `btc_ea_*` symbols resolve there.

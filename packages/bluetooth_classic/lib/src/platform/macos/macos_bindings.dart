@@ -1,4 +1,5 @@
-// FFI bindings to the macOS C ABI in native/apple/bluetooth_classic.{h,m}.
+// FFI bindings to the macOS C ABI in
+// macos/bluetooth_classic/Sources/bluetooth_classic/bluetooth_classic.{h,m}.
 //
 // Resolved via native assets: the build hook compiles the Objective-C sources
 // and registers a code asset whose id matches the @DefaultAsset below, so these
