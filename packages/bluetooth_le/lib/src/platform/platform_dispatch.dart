@@ -2,6 +2,7 @@ import 'dart:io';
 
 import '../exceptions.dart';
 import 'apple/apple_central.dart';
+import 'linux/linux_central.dart';
 import 'platform_interface.dart';
 
 /// Selects the host-appropriate backend.
@@ -11,6 +12,7 @@ import 'platform_interface.dart';
 /// `BleCentral(platform: ...)` / `BleCentralPlatform.instance = ...`.
 BleCentralPlatform createBlePlatform() {
   if (Platform.isMacOS || Platform.isIOS) return AppleBleCentral();
+  if (Platform.isLinux) return LinuxBleCentral();
   throw BleUnsupportedException(
     'No bluetooth_le backend for ${Platform.operatingSystem} yet',
   );
