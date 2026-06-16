@@ -114,9 +114,11 @@ class BluetoothClassic {
   /// relying on a device that doesn't advertise SDP will fail; pass an explicit
   /// [channel] in that case.
   ///
-  /// Throws [BluetoothConnectionException] on failure,
-  /// [ServiceNotFoundException] when no channel can be resolved, and
-  /// [BluetoothTimeoutException] if [timeout] elapses.
+  /// Throws [BluetoothTimeoutException] if [timeout] elapses, and
+  /// [BluetoothConnectionException] on failure. Where the platform can tell that
+  /// SDP resolved no channel for [serviceUuid] (e.g. macOS), that surfaces as
+  /// the more specific [ServiceNotFoundException]; on other platforms an
+  /// unresolvable service is a plain [BluetoothConnectionException].
   Future<BluetoothConnection> connect(
     BluetoothDevice device, {
     int? channel,

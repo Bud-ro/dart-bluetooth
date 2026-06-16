@@ -156,9 +156,14 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
       );
       if (handle == 0) {
         _transports.remove(token);
+        if (channel == null) {
+          // No explicit channel and SDP resolved none for this service.
+          throw ServiceNotFoundException(
+            'No RFCOMM channel for $serviceUuid on ${device.address}',
+          );
+        }
         throw BluetoothConnectionException(
-          'openRFCOMMChannel failed for ${device.address}'
-          '${channel == null ? ' (no SDP channel for $serviceUuid)' : ''}',
+          'openRFCOMMChannel failed for ${device.address}',
         );
       }
       transport.bindHandle(handle);

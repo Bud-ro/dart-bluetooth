@@ -72,18 +72,28 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
   Stream<BluetoothAdapterState> adapterStateChanges() {
     late StreamController<BluetoothAdapterState> controller;
     StreamSubscription<DBusPropertiesChangedSignal>? sub;
+    var cancelled = false;
     controller = StreamController<BluetoothAdapterState>.broadcast(
       onListen: () async {
-        controller.add(await adapterState());
-        final adapter = _obj(_adapterPath);
-        sub = adapter.propertiesChanged.listen((sig) async {
+        final initial = await adapterState();
+        if (cancelled) return; // listener went away during the await
+        controller.add(initial);
+        final created = _obj(_adapterPath).propertiesChanged.listen((
+          sig,
+        ) async {
           if (sig.propertiesInterface == _adapterIface &&
               sig.changedProperties.containsKey('Powered')) {
             controller.add(await adapterState());
           }
         });
+        if (cancelled) {
+          await created.cancel(); // cancelled while we were subscribing
+        } else {
+          sub = created;
+        }
       },
       onCancel: () async {
+        cancelled = true;
         await sub?.cancel();
       },
     );
