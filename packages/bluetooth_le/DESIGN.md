@@ -1,6 +1,6 @@
 # bluetooth_le — design (planned)
 
-A sibling to `bluetooth_classic` for Bluetooth **Low Energy** (GATT). Deferred;
+A sibling to `bluetooth_rfcomm` for Bluetooth **Low Energy** (GATT). Deferred;
 this document records the intended shape so the two packages stay coherent.
 
 ## Why a separate package
@@ -15,11 +15,11 @@ resource is adapter power state — apps should not toggle the radio from both.
 ## Why BLE matters for this project
 
 It is the **only** App-Store-shippable path to a non-MFi device on **iOS**
-(Classic SPP there requires MFi hardware — see the `bluetooth_classic` README).
+(Classic SPP there requires MFi hardware — see the `bluetooth_rfcomm` README).
 For a custom non-MFi board, expose a GATT "serial" service (e.g. the Nordic UART
 service, or `CBL2CAPChannel` for a true stream) and talk to it via this package.
 
-## Native APIs (same Flutter-free strategy as bluetooth_classic)
+## Native APIs (same Flutter-free strategy as bluetooth_rfcomm)
 
 | Platform | API | Dart binding |
 | --- | --- | --- |
@@ -45,7 +45,7 @@ peripheral.characteristic(svc, rxUuid).notifications.listen(onData); // Stream<U
 
 When BLE lands, factor `DeviceId`, `Uuid`, `BluetoothAdapterState`, and the
 exception hierarchy into a `bluetooth_common` package that both depend on, rather
-than duplicating. Until then `bluetooth_classic` owns them.
+than duplicating. Until then `bluetooth_rfcomm` owns them.
 
 ## Reference
 

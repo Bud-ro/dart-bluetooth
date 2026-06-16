@@ -1,0 +1,53 @@
+group = "lol.carson.bluetooth_rfcomm"
+version = "1.0"
+
+buildscript {
+    ext.kotlin_version = "1.9.22"
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath "com.android.tools.build:gradle:8.3.0"
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: "com.android.library"
+apply plugin: "kotlin-android"
+
+android {
+    namespace = "lol.carson.bluetooth_rfcomm"
+    compileSdk = 34
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    sourceSets {
+        main.java.srcDirs += "src/main/kotlin"
+    }
+
+    defaultConfig {
+        // 21 is the NDK floor for the CMake/JNI build (CXX1110).
+        minSdk = 21
+    }
+
+    // Builds the JNI shim into libbluetooth_rfcomm_android.so.
+    externalNativeBuild {
+        cmake {
+            path = "CMakeLists.txt"
+        }
+    }
+}

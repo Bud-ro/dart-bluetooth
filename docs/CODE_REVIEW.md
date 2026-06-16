@@ -1,6 +1,6 @@
 # Pre-release code review (10-agent, Opus 4.8)
 
-Synthesis of a 10-axis review of `bluetooth_classic`. Items marked **[fixed]**
+Synthesis of a 10-axis review of `bluetooth_rfcomm`. Items marked **[fixed]**
 are addressed in the release-hardening pass; **[tracked]** are deferred with a
 rationale.
 
@@ -31,7 +31,7 @@ rationale.
 
 - **[fixed]** Duplicate terminal `disconnected` — `_onState(disconnected)` then
   `close()` emitted it twice; guarded `close()` to emit once (all backends).
-- **[fixed]** No `BluetoothClassic.dispose()` — backend resources were
+- **[fixed]** No `BluetoothRfcomm.dispose()` — backend resources were
   unreachable; added `dispose()` forwarding to the platform.
 - **[fixed]** Linux leaked BlueZ profile registrations — now calls
   `ProfileManager1.UnregisterProfile` on close and all error paths.

@@ -1,0 +1,31 @@
+name: bluetooth_rfcomm_flutter_example
+description: Flutter demo for bluetooth_rfcomm (via bluetooth_rfcomm_flutter).
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.0
+  flutter: ">=3.44.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # The Flutter plugin provides the native builds; it re-exports the API, and we
+  # also depend on bluetooth_rfcomm directly for the explicit import.
+  bluetooth_rfcomm:
+    path: ../../bluetooth_rfcomm
+  bluetooth_rfcomm_flutter:
+    path: ../
+
+dev_dependencies:
+  flutter_lints: ^5.0.0
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+# Run `flutter create .` here once to generate the android/ios/macos/windows/
+# linux runner projects, then add the platform permission strings documented in
+# the package README (NSBluetoothAlwaysUsageDescription, etc.).

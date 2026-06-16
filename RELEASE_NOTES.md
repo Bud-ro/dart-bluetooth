@@ -1,6 +1,6 @@
-# bluetooth_classic v0.1.0
+# bluetooth_rfcomm v0.1.0
 
-First release of **bluetooth_classic** — cross-platform Bluetooth Classic
+First release of **bluetooth_rfcomm** — cross-platform Bluetooth Classic
 (RFCOMM serial) for Dart and Flutter.
 
 ## Highlights
@@ -16,7 +16,7 @@ First release of **bluetooth_classic** — cross-platform Bluetooth Classic
   pass an explicit channel (required on macOS, which rejects channel 0).
 - **Typed errors.** A domain `BluetoothException` hierarchy — callers never see
   raw platform error codes or `DBus*`/`HRESULT`/`NSError` types.
-- **Testable.** `package:bluetooth_classic/testing.dart` ships an in-memory fake
+- **Testable.** `package:bluetooth_rfcomm/testing.dart` ships an in-memory fake
   backend.
 
 ## Platform backends
@@ -64,19 +64,19 @@ pub.dev would force a `flutter:` SDK constraint that breaks pure-Dart consumptio
 
 ```yaml
 dependencies:
-  bluetooth_classic:
+  bluetooth_rfcomm:
     git:
       url: https://github.com/Bud-ro/dart-bluetooth.git
       ref: v0.1.0
-      path: packages/bluetooth_classic
+      path: packages/bluetooth_rfcomm
 ```
 
 ## Getting started
 
 ```dart
-import 'package:bluetooth_classic/bluetooth_classic.dart';
+import 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart';
 
-final bt = BluetoothClassic.instance;
+final bt = BluetoothRfcomm.instance;
 final paired = await bt.bondedDevices();
 final conn = await bt.connect(paired.first);   // SDP-resolved SPP channel
 conn.input.listen((bytes) => print('rx ${bytes.length}'));
@@ -84,5 +84,5 @@ conn.add(Uint8List.fromList('AT\r\n'.codeUnits));
 await conn.finish();
 ```
 
-See the [package README](packages/bluetooth_classic/README.md) for platform
+See the [package README](packages/bluetooth_rfcomm/README.md) for platform
 setup (macOS TCC, Android permissions, Raspberry Pi) and the full API.

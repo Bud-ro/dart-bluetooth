@@ -1,0 +1,42 @@
+name: bluetooth_rfcomm
+description: >-
+  Cross-platform Bluetooth Classic RFCOMM serial for Dart and Flutter — one
+  package for CLI and Flutter on Windows, macOS, Linux, Android and iOS.
+version: 0.1.0
+repository: https://github.com/Bud-ro/dart-bluetooth
+homepage: https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_rfcomm
+issue_tracker: https://github.com/Bud-ro/dart-bluetooth/issues
+documentation: https://github.com/Bud-ro/dart-bluetooth/blob/master/packages/bluetooth_rfcomm/README.md
+topics:
+  - bluetooth
+  - serial
+  - rfcomm
+  - ffi
+
+# Pure-Dart, Flutter-free package — publishable to pub.dev. Windows (FFI), Linux
+# (D-Bus) and macOS (IOBluetooth via the native-assets `hook/build.dart`) all
+# work from a pure-Dart CLI and from Flutter desktop. iOS — and Android, which
+# needs the JVM/Gradle and so can't be a native asset — get their native builds
+# from the companion `bluetooth_rfcomm_flutter` plugin when used in a Flutter app.
+#
+# `package:objective_c` and `package:jni` are deliberately avoided (both pull in
+# the Flutter SDK); native interop goes through a hand-written C ABI over
+# `dart:ffi` + `NativeCallable`, so `dart pub get` stays Flutter-free.
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  ffi: ^2.1.0
+  dbus: ^0.7.10
+  meta: ^1.15.0
+  # Used by hook/build.dart (the native-assets build hook). These run during a
+  # consumer's build, so they belong in dependencies, not dev_dependencies.
+  # None of them pull in the Flutter SDK, so the package stays Dart-only.
+  hooks: ^2.0.0
+  code_assets: ^1.2.0
+  native_toolchain_c: ^0.19.1
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0
+  ffigen: ^20.0.0

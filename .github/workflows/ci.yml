@@ -12,14 +12,16 @@ concurrency:
 
 env:
   FLUTTER_VERSION: "3.44.0"
-  PKG: packages/bluetooth_classic
+  PKG: packages/bluetooth_rfcomm # pure-Dart core (publishable to pub.dev)
+  PKGF: packages/bluetooth_rfcomm_flutter # Flutter plugin (native builds)
+  EXAMPLE: packages/bluetooth_rfcomm_flutter/example # Flutter demo app
 
 jobs:
-  # Pure-Dart: analyze + unit tests on every desktop OS, then build and *run*
-  # the CLI's `doctor` command. `dart build cli` drives the native-assets build
-  # hook (compiling the IOBluetooth wrapper on macOS); running the built binary
-  # then loads that library and resolves its FFI symbols — so a dylib/DLL load
-  # or code-signing error fails CI even with no Bluetooth hardware.
+  # Pure-Dart core: analyze + unit tests on every desktop OS, then build and
+  # *run* the CLI's `doctor` command. `dart build cli` drives the native-assets
+  # build hook (compiling the IOBluetooth wrapper on macOS); running the built
+  # binary then loads that library and resolves its FFI symbols — so a dylib/DLL
+  # load or code-signing error fails CI even with no Bluetooth hardware.
   analyze-test:
     timeout-minutes: 20
     name: dart (${{ matrix.os }})
@@ -54,6 +56,11 @@ jobs:
         working-directory: ${{ env.PKG }}
         run: dart test
 
+      - name: publish dry-run (pure-Dart package is pub.dev-publishable)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: ${{ env.PKG }}
+        run: dart pub publish --dry-run
+
       - name: build CLI example (drives the native-assets build hook)
         working-directory: ${{ env.PKG }}/example_cli
         run: |
@@ -69,9 +76,33 @@ jobs:
           echo "running: $BIN doctor"
           "$BIN" doctor
 
+  # Flutter plugin package: analyze the plugin + its example.
+  flutter-package:
+    timeout-minutes: 20
+    name: flutter package (analyze)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: analyze plugin
+        working-directory: ${{ env.PKGF }}
+        run: |
+          flutter pub get
+          flutter analyze
+      - name: analyze example
+        working-directory: ${{ env.EXAMPLE }}
+        run: |
+          flutter pub get
+          flutter analyze
+
   # Flutter Android: compile (apk) + a runtime launch smoke on an emulator,
-  # which loads libbluetooth_classic_android.so and exercises the JNI shim
-  # (JNI_GetCreatedJavaVMs + RegisterNatives) — the riskiest loading path.
+  # which loads libbluetooth_rfcomm_android.so and exercises the JNI shim
+  # (JNI_GetCreatedJavaVMs + RegisterNatives) — the riskiest loading path. The
+  # native .so comes from the bluetooth_rfcomm_flutter plugin's CMake build.
   build-android:
     timeout-minutes: 30
     name: flutter android (build + emulator launch)
@@ -87,13 +118,15 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
       - name: enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: generate runners + build apk
-        working-directory: ${{ env.PKG }}/example
+        working-directory: ${{ env.EXAMPLE }}
         run: |
           flutter create --platforms=android --org lol.carson .
           flutter pub get
@@ -104,7 +137,7 @@ jobs:
           api-level: 30
           arch: x86_64
           target: google_apis
-          working-directory: ${{ env.PKG }}/example
+          working-directory: ${{ env.EXAMPLE }}
           script: flutter test integration_test -d emulator-5554
 
   # Flutter Linux: build + headless launch smoke (xvfb) — loads the D-Bus backend.
@@ -123,18 +156,22 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
       - name: generate runners + build
-        working-directory: ${{ env.PKG }}/example
+        working-directory: ${{ env.EXAMPLE }}
         run: |
           flutter create --platforms=linux --org lol.carson .
           flutter pub get
           flutter build linux --debug
       - name: launch smoke (xvfb)
-        working-directory: ${{ env.PKG }}/example
+        working-directory: ${{ env.EXAMPLE }}
         run: xvfb-run -a flutter test integration_test -d linux
 
-  # Flutter Apple (Swift Package Manager): macOS gets a build + launch smoke
-  # (loads the IOBluetooth dylib at runtime); iOS is build-only (see note below).
+  # Flutter Apple: macOS gets a build + launch smoke (loads the IOBluetooth
+  # dylib at runtime); iOS is build-only. Apple native code is compiled by the
+  # bluetooth_rfcomm native-assets hook (NOT SPM) — this job is what validates
+  # that Flutter builds those code assets for Apple targets.
   build-apple:
     timeout-minutes: 30
     name: flutter apple (build + launch)
@@ -146,23 +183,23 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-      - name: enable Swift Package Manager
-        run: flutter config --enable-swift-package-manager
+      - name: enable native assets
+        run: flutter config --enable-native-assets
 
       - name: build + launch macOS
-        working-directory: ${{ env.PKG }}/example
+        working-directory: ${{ env.EXAMPLE }}
         run: |
           flutter create --platforms=macos --org lol.carson .
           flutter pub get
           flutter build macos --debug
           flutter test integration_test -d macos
 
-      # iOS: build only. This validates the ExternalAccessory native code
-      # compiles and links via SPM. A simulator *launch* smoke was intentionally
-      # dropped — it's slow/flaky on macOS runners (expensive minutes) and adds
-      # little: iOS for a non-MFi device is unusable anyway (BLE is the path).
+      # iOS: build only. Validates the ExternalAccessory native code compiles and
+      # links as a code asset. A simulator *launch* smoke was intentionally
+      # dropped — slow/flaky on macOS runners, and iOS for a non-MFi device is
+      # unusable anyway (BLE is the path).
       - name: build iOS (no codesign)
-        working-directory: ${{ env.PKG }}/example
+        working-directory: ${{ env.EXAMPLE }}
         run: |
           flutter create --platforms=ios --org lol.carson .
           flutter pub get
@@ -180,12 +217,14 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
       - name: generate runners + build
-        working-directory: ${{ env.PKG }}/example
+        working-directory: ${{ env.EXAMPLE }}
         run: |
           flutter create --platforms=windows --org lol.carson .
           flutter pub get
           flutter build windows --debug
       - name: launch smoke
-        working-directory: ${{ env.PKG }}/example
+        working-directory: ${{ env.EXAMPLE }}
         run: flutter test integration_test -d windows
