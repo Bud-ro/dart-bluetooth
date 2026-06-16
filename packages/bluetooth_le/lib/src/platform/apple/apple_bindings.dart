@@ -35,6 +35,14 @@ external void bleFree(ffi.Pointer<ffi.Void> ptr);
 @ffi.Native<ffi.Int32 Function()>(symbol: 'ble_adapter_state')
 external int bleAdapterState();
 
+@ffi.Native<ffi.Int32 Function(ffi.Int64, ffi.Pointer<ffi.Char>)>(
+  symbol: 'ble_start_scan',
+)
+external int bleStartScan(int scanToken, ffi.Pointer<ffi.Char> serviceUuidsCsv);
+
+@ffi.Native<ffi.Void Function()>(symbol: 'ble_stop_scan')
+external void bleStopScan();
+
 @ffi.Native<
   ffi.Void Function(
     ffi.Pointer<ffi.NativeFunction<ScanCbNative>>,
