@@ -93,6 +93,8 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
       final list = (jsonDecode(ptr.cast<Utf8>().toDartString()) as List)
           .cast<Map<String, dynamic>>();
       return list.map(_deviceFromJson).toList();
+    } catch (e) {
+      throw BluetoothException('malformed bonded-devices payload', cause: e);
     } finally {
       _lib.free(ptr.cast());
     }

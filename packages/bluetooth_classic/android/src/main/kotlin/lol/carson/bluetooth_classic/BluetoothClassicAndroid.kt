@@ -38,8 +38,9 @@ object BluetoothClassicAndroid {
 
     private val sockets = ConcurrentHashMap<Long, BluetoothSocket>()
     private val nextHandle = AtomicLong(1)
-    // Single-threaded so writes to a socket are never reordered/interleaved.
-    private val writeExecutor = Executors.newSingleThreadExecutor()
+    // One single-threaded executor PER socket: writes to a given socket are never
+    // reordered, and a stalled write on one socket can't block writes to others.
+    private val writeExecutors = ConcurrentHashMap<Long, java.util.concurrent.ExecutorService>()
 
     // Implemented in the C shim (registered via RegisterNatives).
     @JvmStatic external fun nativeOnFound(token: Long, json: String)
@@ -198,6 +199,7 @@ object BluetoothClassicAndroid {
             socket.connect()
             val handle = nextHandle.getAndIncrement()
             sockets[handle] = socket
+            writeExecutors[handle] = Executors.newSingleThreadExecutor()
             startReadLoop(token, handle, socket)
             handle
         } catch (t: Throwable) {
@@ -226,26 +228,33 @@ object BluetoothClassicAndroid {
     @JvmStatic
     fun write(handle: Long, data: ByteArray): Int {
         val socket = sockets[handle] ?: return -1
-        writeExecutor.execute {
-            try {
-                socket.outputStream.write(data)
-                socket.outputStream.flush()
-            } catch (_: Throwable) {
-                // A failed write means the link is dead. Close the socket so the
-                // read loop unblocks and reports disconnect (nativeOnState),
-                // instead of silently black-holing further writes.
+        val exec = writeExecutors[handle] ?: return -1
+        try {
+            exec.execute {
                 try {
-                    socket.close()
+                    socket.outputStream.write(data)
+                    socket.outputStream.flush()
                 } catch (_: Throwable) {
+                    // A failed write means the link is dead. Close the socket so
+                    // the read loop unblocks and reports disconnect, instead of
+                    // silently black-holing further writes.
+                    try {
+                        socket.close()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            return -1 // executor already shut down (closed)
         }
         return 0
     }
 
     @JvmStatic
     fun close(handle: Long): Int {
-        val socket = sockets.remove(handle) ?: return 0
+        val socket = sockets.remove(handle)
+        writeExecutors.remove(handle)?.shutdownNow()
+        if (socket == null) return 0
         try {
             socket.close()
         } catch (_: Throwable) {

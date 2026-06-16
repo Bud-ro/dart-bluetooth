@@ -76,6 +76,8 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
       final json = ptr.cast<Utf8>().toDartString();
       final list = (jsonDecode(json) as List).cast<Map<String, dynamic>>();
       return list.map(_deviceFromJson).toList();
+    } catch (e) {
+      throw BluetoothException('malformed paired-devices payload', cause: e);
     } finally {
       btcFree(ptr.cast());
     }

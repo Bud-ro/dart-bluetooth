@@ -145,6 +145,8 @@ class IosBluetoothClassic extends BluetoothClassicPlatform {
             ),
           )
           .toList();
+    } catch (e) {
+      throw BluetoothException('malformed accessories payload', cause: e);
     } finally {
       btcFree(ptr.cast());
     }

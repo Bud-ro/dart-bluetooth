@@ -69,17 +69,32 @@ class BluetoothClassic {
     final byId = {for (final d in bonded) d.id: d};
     final seen = <DeviceId, BluetoothDevice>{};
 
-    final sub = startDiscovery().listen((r) {
-      final base = byId[r.device.id];
-      if (base != null) {
-        seen[r.device.id] = base.copyWith(rssi: r.rssi ?? r.device.rssi);
-      }
-    });
+    Object? discoveryError;
+    final sub = startDiscovery().listen(
+      (r) {
+        final base = byId[r.device.id];
+        if (base != null) {
+          seen[r.device.id] = base.copyWith(rssi: r.rssi ?? r.device.rssi);
+        }
+      },
+      // Without this, a discovery error becomes an unhandled zone error and the
+      // caller silently gets partial results. Capture it and surface it below.
+      onError: (Object e) => discoveryError ??= e,
+      cancelOnError: false,
+    );
     try {
       await Future<void>.delayed(timeout);
     } finally {
       await sub.cancel();
       await stopDiscovery();
+    }
+    if (discoveryError != null && seen.isEmpty) {
+      throw discoveryError is BluetoothException
+          ? discoveryError as BluetoothException
+          : BluetoothDiscoveryException(
+              'discovery failed',
+              cause: discoveryError,
+            );
     }
     return seen.values.toList(growable: false);
   }

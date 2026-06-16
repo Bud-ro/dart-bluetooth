@@ -75,7 +75,8 @@ class BluetoothConnection {
   /// Queues [data] for transmission and returns immediately. Bytes are drained
   /// off the calling isolate, so this never blocks even under backpressure.
   /// Empty payloads are ignored. Throws [BluetoothWriteException] if [data]
-  /// exceeds the platform's 32-bit length limit.
+  /// exceeds the platform's 32-bit length limit, or if the connection is already
+  /// closed / has dropped (check [isConnected] if you need to avoid that).
   void add(Uint8List data) {
     if (data.isEmpty) return;
     if (data.length > 0x7fffffff) {

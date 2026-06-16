@@ -161,20 +161,26 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
               // discovery stream (mirrors the PropertiesChanged handler).
             }
           });
-      // Property updates (e.g. RSSI/name) on known devices.
+      // Property updates (e.g. RSSI/name) on known devices. PropertiesChanged
+      // is emitted from each device's own path, so we match a path NAMESPACE
+      // under the adapter — an object scoped to '/' would never match.
       changedSub =
-          DBusRemoteObjectSignalStream(
-            object: om,
+          DBusSignalStream(
+            _bus,
+            sender: _service,
             interface: _propsIface,
             name: 'PropertiesChanged',
+            pathNamespace: _adapterPath,
           ).listen((signal) async {
-            if (signal.values.isEmpty) return;
-            if ((signal.values[0] as DBusString).value != _deviceIface) return;
             try {
+              if (signal.values.isEmpty) return;
+              if ((signal.values[0] as DBusString).value != _deviceIface) {
+                return;
+              }
               final props = await _allDeviceProps(signal.path);
               controller.add(_discoveryFromProps(props));
             } catch (_) {
-              /* device vanished mid-update */
+              /* device vanished mid-update / malformed signal */
             }
           });
       await _obj(_adapterPath).callMethod(_adapterIface, 'StartDiscovery', []);
