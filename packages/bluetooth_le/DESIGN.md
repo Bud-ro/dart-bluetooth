@@ -1,7 +1,22 @@
-# bluetooth_le — design (planned)
+# bluetooth_le — design
 
-A sibling to `bluetooth_rfcomm` for Bluetooth **Low Energy** (GATT). Deferred;
-this document records the intended shape so the two packages stay coherent.
+A sibling to `bluetooth_rfcomm` for Bluetooth **Low Energy** (GATT). In progress
+(Phase 1). Shipped as two packages, exactly like RFCOMM:
+
+- **`bluetooth_le`** — pure-Dart core (full API + Windows/Linux/macOS backends).
+  Publishable, usable from a `dart run` CLI.
+- **`bluetooth_le_flutter`** — Flutter plugin providing the Android native build
+  (Apple uses the core's native-assets hook); re-exports the core API.
+
+## vs. `universal_ble`
+
+`universal_ble` is the capable cross-platform BLE plugin, but it is **exclusively
+a Flutter plugin** (MethodChannel on every platform; no pure-Dart/CLI path). This
+package's differentiators: (1) **pure-Dart CLI** support alongside Flutter, and
+(2) a first-class **GATT-as-serial** channel — a duplex `Stream<Uint8List>` + sink
+over an RX(notify)/TX(write) characteristic pair (defaulting to the Nordic UART
+service), mirroring RFCOMM's `BluetoothConnection`. Raw GATT (read/write/notify)
+is also exposed for general use.
 
 ## Why a separate package
 
@@ -24,7 +39,7 @@ service, or `CBL2CAPChannel` for a true stream) and talk to it via this package.
 | Platform | API | Dart binding |
 | --- | --- | --- |
 | macOS / iOS | Core Bluetooth (`CBCentralManager`, `CBPeripheral`, `CBL2CAPChannel`) | Obj-C C-ABI wrapper + `dart:ffi` + `NativeCallable`, built by the native-assets hook / SPM |
-| Windows | WinRT `Windows.Devices.Bluetooth.GenericAttributeProfile` | `dart:ffi` (WinRT projection) — heavier than Classic's Winsock; evaluate `win32`/`windows_foundation` |
+| Windows | Win32 GATT C API (`BluetoothGATT*`, `bluetoothleapis.h`) | pure-Dart `dart:ffi` — chosen over WinRT to stay CLI-friendly (no C++/WinRT build). Covers connect/read/write/notify to paired devices; unpaired-device *scanning* (advertisement watcher) is WinRT-only and a documented follow-up |
 | Linux | BlueZ GATT over D-Bus (`org.bluez.GattService1` / `GattCharacteristic1`) | pure Dart `package:dbus` |
 | Android | `BluetoothLeScanner` / `BluetoothGatt` (Kotlin) | Kotlin + C JNI shim, same pattern as Classic |
 
@@ -43,9 +58,20 @@ peripheral.characteristic(svc, rxUuid).notifications.listen(onData); // Stream<U
 
 ## Shared types
 
-When BLE lands, factor `DeviceId`, `Uuid`, `BluetoothAdapterState`, and the
-exception hierarchy into a `bluetooth_common` package that both depend on, rather
-than duplicating. Until then `bluetooth_rfcomm` owns them.
+`Uuid`, the adapter-state enum, and the exception-hierarchy *shape* are copied
+from `bluetooth_rfcomm` (not a shared dependency) so BLE stays a self-contained
+codebase. A `bluetooth_common` package can be factored out later if it earns it.
+
+## Build sequence (one backend per iteration, CI-validated)
+
+1. Pure-Dart core: models, exceptions, `Uuid`, platform interface, `BleCentral`
+   facade, the GATT-as-serial abstraction, `FakeBleCentralPlatform`, unit tests.
+2. macOS + iOS — one shared CoreBluetooth Obj-C C-ABI wrapper (native assets).
+3. Linux — BlueZ GATT over D-Bus.
+4. Android — `BluetoothGatt` via Kotlin + JNI shim.
+5. Windows — Win32 GATT FFI.
+6. CI (per-push build/launch) + manual real-backend integration workflow + the
+   multi-axis `/loop` review until clean.
 
 ## Reference
 
