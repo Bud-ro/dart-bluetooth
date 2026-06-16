@@ -22,11 +22,15 @@ class Uuid {
   /// 16-bit Bluetooth SIG base used to expand short UUIDs.
   static const String _baseSuffix = '-0000-1000-8000-00805f9b34fb';
 
+  static final RegExp _canonical128 = RegExp(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+  );
+
   static String _normalize(String raw) {
     var s = raw.trim().toLowerCase();
     if (s.startsWith('0x')) s = s.substring(2);
     if (s.contains('-')) {
-      if (s.length != 36) {
+      if (!_canonical128.hasMatch(s)) {
         throw FormatException('Invalid 128-bit UUID: $raw');
       }
       return s;

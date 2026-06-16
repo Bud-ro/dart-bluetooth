@@ -4,19 +4,28 @@ import 'package:test/test.dart';
 void main() {
   group('DeviceId', () {
     test('normalises addresses (case, dashes, bare hex)', () {
-      expect(DeviceId.address('aa:bb:cc:dd:ee:ff').address,
-          'AA:BB:CC:DD:EE:FF');
-      expect(DeviceId.address('aa-bb-cc-dd-ee-ff').address,
-          'AA:BB:CC:DD:EE:FF');
+      expect(
+        DeviceId.address('aa:bb:cc:dd:ee:ff').address,
+        'AA:BB:CC:DD:EE:FF',
+      );
+      expect(
+        DeviceId.address('aa-bb-cc-dd-ee-ff').address,
+        'AA:BB:CC:DD:EE:FF',
+      );
       expect(DeviceId.address('aabbccddeeff').address, 'AA:BB:CC:DD:EE:FF');
     });
 
     test('equality by value + kind', () {
-      expect(DeviceId.address('AA:BB:CC:DD:EE:FF'),
-          DeviceId.address('aa:bb:cc:dd:ee:ff'));
+      expect(
+        DeviceId.address('AA:BB:CC:DD:EE:FF'),
+        DeviceId.address('aa:bb:cc:dd:ee:ff'),
+      );
       expect(const DeviceId.opaque('x'), const DeviceId.opaque('x'));
-      expect(const DeviceId.opaque('AA:BB:CC:DD:EE:FF') ==
-          DeviceId.address('AA:BB:CC:DD:EE:FF'), isFalse);
+      expect(
+        const DeviceId.opaque('AA:BB:CC:DD:EE:FF') ==
+            DeviceId.address('AA:BB:CC:DD:EE:FF'),
+        isFalse,
+      );
     });
 
     test('opaque id rejects .address', () {
@@ -37,18 +46,40 @@ void main() {
 
     test('rejects malformed input', () {
       expect(() => Uuid('zzzz'), throwsFormatException); // non-hex
-      expect(() => Uuid('123456789'), throwsFormatException); // >8 hex, no dashes
-      expect(() => Uuid('0000-1000-8000'), throwsFormatException); // dashed != 36
+      expect(
+        () => Uuid('123456789'),
+        throwsFormatException,
+      ); // >8 hex, no dashes
+      expect(
+        () => Uuid('0000-1000-8000'),
+        throwsFormatException,
+      ); // dashed != 36
+      // 36 chars but non-hex / wrong structure must be rejected.
+      expect(
+        () => Uuid('zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz'),
+        throwsFormatException,
+      );
+      expect(
+        () => Uuid('00001101_0000_1000_8000_00805f9b34fb'),
+        throwsFormatException,
+      );
       expect(Uuid('123').short, 0x123); // 3 hex digits IS a valid short form
     });
   });
 
   group('BluetoothDevice', () {
     test('identity is id only', () {
-      final a = BluetoothDevice(id: DeviceId.address('AA:BB:CC:DD:EE:FF'),
-          name: 'A', rssi: -40);
-      final b = BluetoothDevice(id: DeviceId.address('AA:BB:CC:DD:EE:FF'),
-          name: 'B', rssi: -90, isConnected: true);
+      final a = BluetoothDevice(
+        id: DeviceId.address('AA:BB:CC:DD:EE:FF'),
+        name: 'A',
+        rssi: -40,
+      );
+      final b = BluetoothDevice(
+        id: DeviceId.address('AA:BB:CC:DD:EE:FF'),
+        name: 'B',
+        rssi: -90,
+        isConnected: true,
+      );
       expect(a, b);
       expect(a.hashCode, b.hashCode);
     });

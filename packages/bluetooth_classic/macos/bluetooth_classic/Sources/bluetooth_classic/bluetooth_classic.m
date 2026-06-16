@@ -97,6 +97,7 @@ static char *btc_strdup(NSString *s) {
   if (!utf8) return NULL;
   size_t len = strlen(utf8) + 1;
   char *out = malloc(len);
+  if (!out) return NULL;
   memcpy(out, utf8, len);
   return out;
 }
@@ -169,8 +170,9 @@ static BTCInquiry *g_inquiry = nil;
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)rfcommChannel
                      data:(void *)dataPointer
                    length:(size_t)dataLength {
-  if (self.data && dataLength > 0) {
+  if (self.data && dataLength > 0 && dataLength <= INT32_MAX) {
     uint8_t *copy = malloc(dataLength);
+    if (!copy) return;
     memcpy(copy, dataPointer, dataLength);
     self.data(self.token, copy, (int32_t)dataLength);
   }
@@ -239,17 +241,18 @@ int32_t btc_sdp_channel(const char *address, const char *uuid) {
   [[BTCWorker shared] runSync:^{
     IOBluetoothDevice *d = btc_device_for(addr);
     if (!d) return;
-    IOBluetoothSDPUUID *sdpUuid =
-        [IOBluetoothSDPUUID uuidWithBytes:NULL length:0]; // replaced below
-    // Build a 128-bit SDP UUID from the canonical string.
+    // Build a 128-bit SDP UUID from the canonical string. Guard the length so a
+    // malformed/short UUID can't throw NSRangeException on the worker thread.
     NSString *hex = [uuidStr stringByReplacingOccurrencesOfString:@"-"
                                                        withString:@""];
+    if (hex.length != 32) return;
     uint8_t bytes[16];
     for (int i = 0; i < 16; i++) {
       NSString *b = [hex substringWithRange:NSMakeRange(i * 2, 2)];
       bytes[i] = (uint8_t)strtol([b UTF8String], NULL, 16);
     }
-    sdpUuid = [IOBluetoothSDPUUID uuidWithBytes:bytes length:16];
+    IOBluetoothSDPUUID *sdpUuid = [IOBluetoothSDPUUID uuidWithBytes:bytes
+                                                            length:16];
     IOBluetoothSDPServiceRecord *record = [d getServiceRecordForUUID:sdpUuid];
     if (!record) return;
     BluetoothRFCOMMChannelID channelID = 0;
@@ -323,13 +326,26 @@ int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
 
 int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len) {
   if (len <= 0) return 0;
-  // Copy now; the caller's buffer may be freed before the async runs.
-  uint8_t *copy = malloc(len);
-  memcpy(copy, data, len);
+  // Copy now; the caller's buffer may be freed before the async block runs.
+  uint8_t *copy = malloc((size_t)len);
+  if (!copy) return -1;
+  memcpy(copy, data, (size_t)len);
   [[BTCWorker shared] runAsync:^{
     BTCChannel *ch = g_channels()[@(handle)];
     if (ch && ch.channel) {
-      [ch.channel writeAsync:copy length:(UInt16)len refcon:NULL];
+      // writeSync blocks on the worker thread (never the caller) until the data
+      // is sent, so freeing afterwards is safe — unlike writeAsync, which does
+      // not copy and would otherwise transmit from freed memory. Chunk by MTU.
+      BluetoothRFCOMMMTU mtu = [ch.channel getMTU];
+      if (mtu == 0) mtu = 0xFFFF;
+      size_t offset = 0;
+      while (offset < (size_t)len) {
+        size_t chunk = (size_t)len - offset;
+        if (chunk > mtu) chunk = mtu;
+        IOReturn rc = [ch.channel writeSync:copy + offset length:(UInt16)chunk];
+        if (rc != kIOReturnSuccess) break;
+        offset += chunk;
+      }
     }
     free(copy);
   }];

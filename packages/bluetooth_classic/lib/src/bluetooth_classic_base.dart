@@ -22,7 +22,7 @@ import 'platform/platform_interface.dart';
 class BluetoothClassic {
   /// Creates a facade over [platform], or the auto-selected host backend.
   BluetoothClassic({BluetoothClassicPlatform? platform})
-      : _platform = platform ?? BluetoothClassicPlatform.instance;
+    : _platform = platform ?? BluetoothClassicPlatform.instance;
 
   /// Shared instance backed by the host's default platform.
   static final BluetoothClassic instance = BluetoothClassic();
@@ -89,8 +89,7 @@ class BluetoothClassic {
   Future<List<BluetoothService>> discoverServices(
     BluetoothDevice device, {
     Uuid? serviceUuid,
-  }) =>
-      _platform.discoverServices(device.id, serviceUuid: serviceUuid);
+  }) => _platform.discoverServices(device.id, serviceUuid: serviceUuid);
 
   /// Opens an RFCOMM serial connection to [device].
   ///
@@ -129,4 +128,9 @@ class BluetoothClassic {
 
   /// Removes the bond with [device]. Optional capability.
   Future<void> unpair(BluetoothDevice device) => _platform.unpair(device.id);
+
+  /// Releases global resources held by the backend (worker isolates, native
+  /// callbacks, D-Bus connection). Call when you're done using this instance.
+  /// The shared [instance] generally lives for the app's lifetime.
+  Future<void> dispose() => _platform.dispose();
 }

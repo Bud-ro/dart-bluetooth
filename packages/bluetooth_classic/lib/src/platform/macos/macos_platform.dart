@@ -29,10 +29,14 @@ import 'macos_bindings.dart';
 class MacosBluetoothClassic extends BluetoothClassicPlatform {
   MacosBluetoothClassic();
 
+  /// Upper bound on a single inbound chunk; guards `asTypedList` against a
+  /// corrupted length from native code (RFCOMM frames are far smaller).
+  static const int _maxInboundChunk = 1 << 20;
+
   static int _nextToken = 1;
   static final Map<int, _MacRfcommTransport> _transports = {};
   static final Map<int, StreamController<BluetoothDiscoveryResult>>
-      _discoveries = {};
+  _discoveries = {};
 
   // One shared listener per callback kind, kept alive for the process.
   static final ffi.NativeCallable<DataCbNative> _dataCb =
@@ -127,6 +131,11 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
     required Uuid serviceUuid,
     Duration? timeout,
   }) async {
+    if (!device.isAddress) {
+      throw const BluetoothConnectionException(
+        'macOS requires a MAC-address DeviceId for RFCOMM connect',
+      );
+    }
     final token = _nextToken++;
     final transport = _MacRfcommTransport(token);
     _transports[token] = transport;
@@ -182,7 +191,7 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {
     final transport = _transports[token];
     try {
-      if (transport != null && len > 0) {
+      if (transport != null && len > 0 && len <= _maxInboundChunk) {
         transport._deliver(Uint8List.fromList(data.asTypedList(len)));
       }
     } finally {
@@ -198,15 +207,21 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
     final controller = _discoveries[token];
     try {
       if (controller != null && !controller.isClosed) {
-        final map = (jsonDecode(json.cast<Utf8>().toDartString())
-            as Map<String, dynamic>);
+        final map =
+            (jsonDecode(json.cast<Utf8>().toDartString())
+                as Map<String, dynamic>);
         final device = _deviceFromJson(map);
-        controller.add(BluetoothDiscoveryResult(
-          device: device,
-          rssi: device.rssi,
-          timestamp: DateTime.now(),
-        ));
+        controller.add(
+          BluetoothDiscoveryResult(
+            device: device,
+            rssi: device.rssi,
+            timestamp: DateTime.now(),
+          ),
+        );
       }
+    } catch (_) {
+      // Skip a malformed sighting (e.g. a device with a withheld address or a
+      // non-UTF-8 name) rather than tearing down the discovery stream.
     } finally {
       btcFree(json.cast());
     }
@@ -231,17 +246,22 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
   }
 
   static ConnectionState _connStateFromCode(int code) => switch (code) {
-        2 => ConnectionState.connected,
-        1 => ConnectionState.connecting,
-        3 => ConnectionState.disconnecting,
-        _ => ConnectionState.disconnected,
-      };
+    2 => ConnectionState.connected,
+    1 => ConnectionState.connecting,
+    3 => ConnectionState.disconnecting,
+    _ => ConnectionState.disconnected,
+  };
 
   static BluetoothDevice _deviceFromJson(Map<String, dynamic> j) {
     final connected = j['connected'] as bool? ?? false;
+    final addr = j['address'] as String?;
+    final name = j['name'] as String?;
     return BluetoothDevice(
-      id: DeviceId.address(j['address'] as String),
-      name: j['name'] as String?,
+      // Recent macOS can withhold the address; fall back to an opaque id.
+      id: (addr != null && addr.isNotEmpty)
+          ? DeviceId.address(addr)
+          : DeviceId.opaque(name ?? 'macos-device'),
+      name: name,
       type: BluetoothDeviceType.classic,
       bondState: BluetoothBondState.bonded,
       isConnected: connected,
@@ -253,12 +273,12 @@ class MacosBluetoothClassic extends BluetoothClassicPlatform {
 abstract final class _AdapterStateCode {
   static const int unavailable = 1;
   static BluetoothAdapterState toEnum(int code) => switch (code) {
-        1 => BluetoothAdapterState.unavailable,
-        2 => BluetoothAdapterState.unauthorized,
-        3 => BluetoothAdapterState.off,
-        5 => BluetoothAdapterState.on,
-        _ => BluetoothAdapterState.unknown,
-      };
+    1 => BluetoothAdapterState.unavailable,
+    2 => BluetoothAdapterState.unauthorized,
+    3 => BluetoothAdapterState.off,
+    5 => BluetoothAdapterState.on,
+    _ => BluetoothAdapterState.unknown,
+  };
 }
 
 /// RFCOMM transport backed by a native IOBluetoothRFCOMMChannel handle.
@@ -268,8 +288,9 @@ class _MacRfcommTransport implements RfcommTransport {
   final int _token;
   int _handle = 0;
 
-  final StreamController<Uint8List> _incoming =
-      StreamController<Uint8List>(sync: false);
+  final StreamController<Uint8List> _incoming = StreamController<Uint8List>(
+    sync: false,
+  );
   final StreamController<ConnectionState> _state =
       StreamController<ConnectionState>.broadcast();
   final Completer<void> _connected = Completer<void>();
@@ -346,6 +367,7 @@ class _MacRfcommTransport implements RfcommTransport {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
     if (_handle != 0) {
       btcRfcommClose(_handle);
@@ -353,7 +375,7 @@ class _MacRfcommTransport implements RfcommTransport {
     }
     MacosBluetoothClassic._transports.remove(_token);
     if (!_state.isClosed) {
-      _state.add(ConnectionState.disconnected);
+      if (!alreadyDisconnected) _state.add(ConnectionState.disconnected);
       await _state.close();
     }
     if (!_incoming.isClosed) await _incoming.close();

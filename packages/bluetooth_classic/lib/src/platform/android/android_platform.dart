@@ -28,6 +28,9 @@ import 'android_bindings.dart';
 /// (`BLUETOOTH_CONNECT`/`BLUETOOTH_SCAN` on API 31+, location on older).
 class AndroidBluetoothClassic extends BluetoothClassicPlatform {
   AndroidBluetoothClassic() : _lib = AndroidBindings.open() {
+    // Set before any native callback can fire so the static free-routing in
+    // _onData/_onFound never sees a null binding.
+    _activeLib = _lib;
     _lib.register(
       _foundCb.nativeFunction,
       _doneCb.nativeFunction,
@@ -39,10 +42,11 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
 
   final AndroidBindings _lib;
 
+  static const int _maxInboundChunk = 1 << 20;
   static int _nextToken = 1;
   static final Map<int, _AndroidTransport> _transports = {};
   static final Map<int, StreamController<BluetoothDiscoveryResult>>
-      _discoveries = {};
+  _discoveries = {};
   // Late-bound so the static callbacks can reach the active backend's bindings.
   static AndroidBindings? _activeLib;
 
@@ -149,7 +153,12 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
     final addrPtr = device.address.toNativeUtf8();
     final uuidPtr = serviceUuid.value.toNativeUtf8();
     try {
-      final handle = _lib.open(token, addrPtr.cast(), channel ?? 0, uuidPtr.cast());
+      final handle = _lib.open(
+        token,
+        addrPtr.cast(),
+        channel ?? 0,
+        uuidPtr.cast(),
+      );
       if (handle == 0) {
         _transports.remove(token);
         throw BluetoothConnectionException(
@@ -171,7 +180,8 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
       const Stream<ConnectionState>.empty();
 
   @override
-  Future<void> pair(DeviceId device) async => throw const BluetoothUnsupportedException(
+  Future<void> pair(DeviceId device) async =>
+      throw const BluetoothUnsupportedException(
         'Programmatic pairing is not yet wired on Android; bond via system UI.',
       );
 
@@ -187,14 +197,17 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
     final controller = _discoveries[token];
     try {
       if (controller != null && !controller.isClosed) {
-        final map = jsonDecode(json.cast<Utf8>().toDartString())
-            as Map<String, dynamic>;
+        final map =
+            jsonDecode(json.cast<Utf8>().toDartString())
+                as Map<String, dynamic>;
         final device = _deviceFromJson(map);
-        controller.add(BluetoothDiscoveryResult(
-          device: device,
-          rssi: device.rssi,
-          timestamp: DateTime.now(),
-        ));
+        controller.add(
+          BluetoothDiscoveryResult(
+            device: device,
+            rssi: device.rssi,
+            timestamp: DateTime.now(),
+          ),
+        );
       }
     } finally {
       _activeLib?.free(json.cast());
@@ -211,7 +224,7 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {
     final t = _transports[token];
     try {
-      if (t != null && len > 0) {
+      if (t != null && len > 0 && len <= _maxInboundChunk) {
         t._deliver(Uint8List.fromList(data.asTypedList(len)));
       }
     } finally {
@@ -242,13 +255,13 @@ class AndroidBluetoothClassic extends BluetoothClassicPlatform {
 abstract final class _AdapterCode {
   static const int unavailable = 1;
   static BluetoothAdapterState toEnum(int code) => switch (code) {
-        1 => BluetoothAdapterState.unavailable,
-        3 => BluetoothAdapterState.off,
-        4 => BluetoothAdapterState.turningOn,
-        5 => BluetoothAdapterState.on,
-        6 => BluetoothAdapterState.turningOff,
-        _ => BluetoothAdapterState.unknown,
-      };
+    1 => BluetoothAdapterState.unavailable,
+    3 => BluetoothAdapterState.off,
+    4 => BluetoothAdapterState.turningOn,
+    5 => BluetoothAdapterState.on,
+    6 => BluetoothAdapterState.turningOff,
+    _ => BluetoothAdapterState.unknown,
+  };
 }
 
 class _AndroidTransport implements RfcommTransport {
@@ -258,8 +271,9 @@ class _AndroidTransport implements RfcommTransport {
   final AndroidBindings _lib;
   int _handle = 0;
 
-  final StreamController<Uint8List> _incoming =
-      StreamController<Uint8List>(sync: false);
+  final StreamController<Uint8List> _incoming = StreamController<Uint8List>(
+    sync: false,
+  );
   final StreamController<ConnectionState> _state =
       StreamController<ConnectionState>.broadcast();
   final Completer<void> _connected = Completer<void>();
@@ -281,8 +295,10 @@ class _AndroidTransport implements RfcommTransport {
       timeout,
       onTimeout: () {
         unawaited(close());
-        throw BluetoothTimeoutException('RFCOMM connect timed out',
-            timeout: timeout);
+        throw BluetoothTimeoutException(
+          'RFCOMM connect timed out',
+          timeout: timeout,
+        );
       },
     );
   }
@@ -328,6 +344,7 @@ class _AndroidTransport implements RfcommTransport {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
     if (_handle != 0) {
       _lib.close(_handle);
@@ -335,7 +352,7 @@ class _AndroidTransport implements RfcommTransport {
     }
     AndroidBluetoothClassic._transports.remove(_token);
     if (!_state.isClosed) {
-      _state.add(ConnectionState.disconnected);
+      if (!alreadyDisconnected) _state.add(ConnectionState.disconnected);
       await _state.close();
     }
     if (!_incoming.isClosed) await _incoming.close();

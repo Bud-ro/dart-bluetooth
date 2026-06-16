@@ -106,10 +106,13 @@ const int wsaDataSize = 512;
 
 // --- Function typedefs -------------------------------------------------------
 
-typedef _WSAStartupC = ffi.Int32 Function(
-    ffi.Uint16 wVersionRequested, ffi.Pointer<ffi.Uint8> lpWSAData);
-typedef WSAStartupDart = int Function(
-    int wVersionRequested, ffi.Pointer<ffi.Uint8> lpWSAData);
+typedef _WSAStartupC =
+    ffi.Int32 Function(
+      ffi.Uint16 wVersionRequested,
+      ffi.Pointer<ffi.Uint8> lpWSAData,
+    );
+typedef WSAStartupDart =
+    int Function(int wVersionRequested, ffi.Pointer<ffi.Uint8> lpWSAData);
 
 typedef _WSACleanupC = ffi.Int32 Function();
 typedef WSACleanupDart = int Function();
@@ -117,24 +120,38 @@ typedef WSACleanupDart = int Function();
 typedef _WSAGetLastErrorC = ffi.Int32 Function();
 typedef WSAGetLastErrorDart = int Function();
 
-typedef _SocketC = ffi.IntPtr Function(
-    ffi.Int32 af, ffi.Int32 type, ffi.Int32 protocol);
+typedef _SocketC =
+    ffi.IntPtr Function(ffi.Int32 af, ffi.Int32 type, ffi.Int32 protocol);
 typedef SocketDart = int Function(int af, int type, int protocol);
 
-typedef _ConnectC = ffi.Int32 Function(
-    ffi.IntPtr s, ffi.Pointer<SockaddrBth> name, ffi.Int32 namelen);
-typedef ConnectDart = int Function(
-    int s, ffi.Pointer<SockaddrBth> name, int namelen);
+typedef _ConnectC =
+    ffi.Int32 Function(
+      ffi.IntPtr s,
+      ffi.Pointer<SockaddrBth> name,
+      ffi.Int32 namelen,
+    );
+typedef ConnectDart =
+    int Function(int s, ffi.Pointer<SockaddrBth> name, int namelen);
 
-typedef _SendC = ffi.Int32 Function(
-    ffi.IntPtr s, ffi.Pointer<ffi.Uint8> buf, ffi.Int32 len, ffi.Int32 flags);
-typedef SendDart = int Function(
-    int s, ffi.Pointer<ffi.Uint8> buf, int len, int flags);
+typedef _SendC =
+    ffi.Int32 Function(
+      ffi.IntPtr s,
+      ffi.Pointer<ffi.Uint8> buf,
+      ffi.Int32 len,
+      ffi.Int32 flags,
+    );
+typedef SendDart =
+    int Function(int s, ffi.Pointer<ffi.Uint8> buf, int len, int flags);
 
-typedef _RecvC = ffi.Int32 Function(
-    ffi.IntPtr s, ffi.Pointer<ffi.Uint8> buf, ffi.Int32 len, ffi.Int32 flags);
-typedef RecvDart = int Function(
-    int s, ffi.Pointer<ffi.Uint8> buf, int len, int flags);
+typedef _RecvC =
+    ffi.Int32 Function(
+      ffi.IntPtr s,
+      ffi.Pointer<ffi.Uint8> buf,
+      ffi.Int32 len,
+      ffi.Int32 flags,
+    );
+typedef RecvDart =
+    int Function(int s, ffi.Pointer<ffi.Uint8> buf, int len, int flags);
 
 typedef _CloseSocketC = ffi.Int32 Function(ffi.IntPtr s);
 typedef CloseSocketDart = int Function(int s);
@@ -142,25 +159,32 @@ typedef CloseSocketDart = int Function(int s);
 typedef _ShutdownC = ffi.Int32 Function(ffi.IntPtr s, ffi.Int32 how);
 typedef ShutdownDart = int Function(int s, int how);
 
-typedef _FindFirstDeviceC = ffi.IntPtr Function(
-    ffi.Pointer<BluetoothDeviceSearchParams> params,
-    ffi.Pointer<BluetoothDeviceInfo> info);
-typedef FindFirstDeviceDart = int Function(
-    ffi.Pointer<BluetoothDeviceSearchParams> params,
-    ffi.Pointer<BluetoothDeviceInfo> info);
+typedef _FindFirstDeviceC =
+    ffi.IntPtr Function(
+      ffi.Pointer<BluetoothDeviceSearchParams> params,
+      ffi.Pointer<BluetoothDeviceInfo> info,
+    );
+typedef FindFirstDeviceDart =
+    int Function(
+      ffi.Pointer<BluetoothDeviceSearchParams> params,
+      ffi.Pointer<BluetoothDeviceInfo> info,
+    );
 
-typedef _FindNextDeviceC = ffi.Int32 Function(
-    ffi.IntPtr find, ffi.Pointer<BluetoothDeviceInfo> info);
-typedef FindNextDeviceDart = int Function(
-    int find, ffi.Pointer<BluetoothDeviceInfo> info);
+typedef _FindNextDeviceC =
+    ffi.Int32 Function(ffi.IntPtr find, ffi.Pointer<BluetoothDeviceInfo> info);
+typedef FindNextDeviceDart =
+    int Function(int find, ffi.Pointer<BluetoothDeviceInfo> info);
 
 typedef _FindDeviceCloseC = ffi.Int32 Function(ffi.IntPtr find);
 typedef FindDeviceCloseDart = int Function(int find);
 
-typedef _FindFirstRadioC = ffi.IntPtr Function(
-    ffi.Pointer<ffi.Void> params, ffi.Pointer<ffi.IntPtr> radio);
-typedef FindFirstRadioDart = int Function(
-    ffi.Pointer<ffi.Void> params, ffi.Pointer<ffi.IntPtr> radio);
+typedef _FindFirstRadioC =
+    ffi.IntPtr Function(
+      ffi.Pointer<ffi.Void> params,
+      ffi.Pointer<ffi.IntPtr> radio,
+    );
+typedef FindFirstRadioDart =
+    int Function(ffi.Pointer<ffi.Void> params, ffi.Pointer<ffi.IntPtr> radio);
 
 typedef _FindRadioCloseC = ffi.Int32 Function(ffi.IntPtr find);
 typedef FindRadioCloseDart = int Function(int find);
@@ -172,36 +196,48 @@ typedef CloseHandleDart = int Function(int h);
 /// handles are not shareable across isolates, but SOCKET handles are).
 class WinsockBindings {
   WinsockBindings()
-      : _ws2 = ffi.DynamicLibrary.open('ws2_32.dll'),
-        _bth = ffi.DynamicLibrary.open('bthprops.cpl'),
-        _k32 = ffi.DynamicLibrary.open('kernel32.dll') {
-    wsaStartup = _ws2.lookupFunction<_WSAStartupC, WSAStartupDart>('WSAStartup');
-    wsaCleanup = _ws2.lookupFunction<_WSACleanupC, WSACleanupDart>('WSACleanup');
+    : _ws2 = ffi.DynamicLibrary.open('ws2_32.dll'),
+      _bth = ffi.DynamicLibrary.open('bthprops.cpl'),
+      _k32 = ffi.DynamicLibrary.open('kernel32.dll') {
+    wsaStartup = _ws2.lookupFunction<_WSAStartupC, WSAStartupDart>(
+      'WSAStartup',
+    );
+    wsaCleanup = _ws2.lookupFunction<_WSACleanupC, WSACleanupDart>(
+      'WSACleanup',
+    );
     wsaGetLastError = _ws2
         .lookupFunction<_WSAGetLastErrorC, WSAGetLastErrorDart>(
-            'WSAGetLastError');
+          'WSAGetLastError',
+        );
     socket = _ws2.lookupFunction<_SocketC, SocketDart>('socket');
     connect = _ws2.lookupFunction<_ConnectC, ConnectDart>('connect');
     send = _ws2.lookupFunction<_SendC, SendDart>('send');
     recv = _ws2.lookupFunction<_RecvC, RecvDart>('recv');
-    closesocket =
-        _ws2.lookupFunction<_CloseSocketC, CloseSocketDart>('closesocket');
+    closesocket = _ws2.lookupFunction<_CloseSocketC, CloseSocketDart>(
+      'closesocket',
+    );
     shutdown = _ws2.lookupFunction<_ShutdownC, ShutdownDart>('shutdown');
 
-    findFirstDevice = _bth.lookupFunction<_FindFirstDeviceC,
-        FindFirstDeviceDart>('BluetoothFindFirstDevice');
-    findNextDevice = _bth
-        .lookupFunction<_FindNextDeviceC, FindNextDeviceDart>(
-            'BluetoothFindNextDevice');
-    findDeviceClose = _bth.lookupFunction<_FindDeviceCloseC,
-        FindDeviceCloseDart>('BluetoothFindDeviceClose');
-    findFirstRadio = _bth
-        .lookupFunction<_FindFirstRadioC, FindFirstRadioDart>(
-            'BluetoothFindFirstRadio');
+    findFirstDevice = _bth
+        .lookupFunction<_FindFirstDeviceC, FindFirstDeviceDart>(
+          'BluetoothFindFirstDevice',
+        );
+    findNextDevice = _bth.lookupFunction<_FindNextDeviceC, FindNextDeviceDart>(
+      'BluetoothFindNextDevice',
+    );
+    findDeviceClose = _bth
+        .lookupFunction<_FindDeviceCloseC, FindDeviceCloseDart>(
+          'BluetoothFindDeviceClose',
+        );
+    findFirstRadio = _bth.lookupFunction<_FindFirstRadioC, FindFirstRadioDart>(
+      'BluetoothFindFirstRadio',
+    );
     findRadioClose = _bth.lookupFunction<_FindRadioCloseC, FindRadioCloseDart>(
-        'BluetoothFindRadioClose');
-    closeHandle =
-        _k32.lookupFunction<_CloseHandleC, CloseHandleDart>('CloseHandle');
+      'BluetoothFindRadioClose',
+    );
+    closeHandle = _k32.lookupFunction<_CloseHandleC, CloseHandleDart>(
+      'CloseHandle',
+    );
   }
 
   final ffi.DynamicLibrary _ws2;
@@ -269,6 +305,9 @@ void writeServiceClassGuid(SockaddrBth addr, String uuid128) {
   addr.svcData2 = int.parse(hex.substring(8, 12), radix: 16);
   addr.svcData3 = int.parse(hex.substring(12, 16), radix: 16);
   for (var i = 0; i < 8; i++) {
-    addr.svcData4[i] = int.parse(hex.substring(16 + i * 2, 18 + i * 2), radix: 16);
+    addr.svcData4[i] = int.parse(
+      hex.substring(16 + i * 2, 18 + i * 2),
+      radix: 16,
+    );
   }
 }

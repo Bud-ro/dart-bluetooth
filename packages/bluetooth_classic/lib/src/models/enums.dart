@@ -3,12 +3,7 @@
 /// Mirrors the `classic` / `le` / `dual` distinction exposed by every platform
 /// so callers can filter discovery results. This package only operates on the
 /// BR/EDR (Classic) capability of a device; a [dual] device works fine.
-enum BluetoothDeviceType {
-  unknown,
-  classic,
-  le,
-  dual,
-}
+enum BluetoothDeviceType { unknown, classic, le, dual }
 
 /// Pairing / bonding state of a remote device.
 ///

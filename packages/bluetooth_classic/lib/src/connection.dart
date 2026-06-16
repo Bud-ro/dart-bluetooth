@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'exceptions.dart';
 import 'models/bluetooth_device.dart';
 import 'models/enums.dart';
 import 'platform/platform_interface.dart';
@@ -37,8 +38,7 @@ class BluetoothConnection {
   static BluetoothConnection wrap(
     BluetoothDevice device,
     RfcommTransport transport,
-  ) =>
-      BluetoothConnection._(device, transport);
+  ) => BluetoothConnection._(device, transport);
 
   /// The device this connection talks to.
   final BluetoothDevice device;
@@ -68,15 +68,25 @@ class BluetoothConnection {
 
   /// Queues [data] for transmission and returns immediately. Bytes are drained
   /// off the calling isolate, so this never blocks even under backpressure.
-  void add(Uint8List data) => _transport.send(data);
+  /// Empty payloads are ignored. Throws [BluetoothWriteException] if [data]
+  /// exceeds the platform's 32-bit length limit.
+  void add(Uint8List data) {
+    if (data.isEmpty) return;
+    if (data.length > 0x7fffffff) {
+      throw const BluetoothWriteException('payload exceeds 2GiB limit');
+    }
+    _transport.send(data);
+  }
 
   /// Waits until all previously [add]ed bytes have been handed to the OS.
+  /// Note: on macOS, iOS and Android this is best-effort — writes are handed to
+  /// the OS synchronously at [add] time, but there is no OS-level drain ack.
   Future<void> flush() => _transport.flush();
 
   /// Convenience: [add] then [flush].
   Future<void> write(Uint8List data) {
-    _transport.send(data);
-    return _transport.flush();
+    add(data);
+    return flush();
   }
 
   /// Closes immediately, discarding anything not yet flushed.

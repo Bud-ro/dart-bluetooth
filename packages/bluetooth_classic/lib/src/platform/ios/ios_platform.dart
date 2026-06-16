@@ -28,6 +28,7 @@ import 'ios_bindings.dart';
 class IosBluetoothClassic extends BluetoothClassicPlatform {
   IosBluetoothClassic();
 
+  static const int _maxInboundChunk = 1 << 20;
   static int _nextToken = 1;
   static final Map<int, _IosEaTransport> _transports = {};
 
@@ -72,8 +73,7 @@ class IosBluetoothClassic extends BluetoothClassicPlatform {
   Future<List<BluetoothService>> discoverServices(
     DeviceId device, {
     Uuid? serviceUuid,
-  }) async =>
-      const []; // EA exposes protocol strings, not RFCOMM/SDP UUIDs.
+  }) async => const []; // EA exposes protocol strings, not RFCOMM/SDP UUIDs.
 
   @override
   Future<RfcommTransport> openRfcomm(
@@ -139,13 +139,15 @@ class IosBluetoothClassic extends BluetoothClassicPlatform {
       final list = (jsonDecode(ptr.cast<Utf8>().toDartString()) as List)
           .cast<Map<String, dynamic>>();
       return list
-          .map((j) => BluetoothDevice(
-                id: DeviceId.opaque(j['id'] as String),
-                name: j['name'] as String?,
-                type: BluetoothDeviceType.classic,
-                bondState: BluetoothBondState.bonded,
-                isConnected: true,
-              ))
+          .map(
+            (j) => BluetoothDevice(
+              id: DeviceId.opaque(j['id'] as String),
+              name: j['name'] as String?,
+              type: BluetoothDeviceType.classic,
+              bondState: BluetoothBondState.bonded,
+              isConnected: true,
+            ),
+          )
           .toList();
     } finally {
       btcFree(ptr.cast());
@@ -155,7 +157,7 @@ class IosBluetoothClassic extends BluetoothClassicPlatform {
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {
     final t = _transports[token];
     try {
-      if (t != null && len > 0) {
+      if (t != null && len > 0 && len <= _maxInboundChunk) {
         t._deliver(Uint8List.fromList(data.asTypedList(len)));
       }
     } finally {
@@ -175,8 +177,9 @@ class _IosEaTransport implements RfcommTransport {
 
   final int _token;
   int _handle = 0;
-  final StreamController<Uint8List> _incoming =
-      StreamController<Uint8List>(sync: false);
+  final StreamController<Uint8List> _incoming = StreamController<Uint8List>(
+    sync: false,
+  );
   final StreamController<ConnectionState> _state =
       StreamController<ConnectionState>.broadcast();
   final Completer<void> _connected = Completer<void>();
@@ -191,8 +194,10 @@ class _IosEaTransport implements RfcommTransport {
       timeout,
       onTimeout: () {
         unawaited(close());
-        throw BluetoothTimeoutException('EASession open timed out',
-            timeout: timeout);
+        throw BluetoothTimeoutException(
+          'EASession open timed out',
+          timeout: timeout,
+        );
       },
     );
   }
@@ -248,6 +253,7 @@ class _IosEaTransport implements RfcommTransport {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
     if (_handle != 0) {
       btcEaClose(_handle);
@@ -255,7 +261,7 @@ class _IosEaTransport implements RfcommTransport {
     }
     IosBluetoothClassic._transports.remove(_token);
     if (!_state.isClosed) {
-      _state.add(ConnectionState.disconnected);
+      if (!alreadyDisconnected) _state.add(ConnectionState.disconnected);
       await _state.close();
     }
     if (!_incoming.isClosed) await _incoming.close();

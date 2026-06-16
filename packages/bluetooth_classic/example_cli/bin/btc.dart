@@ -1,8 +1,8 @@
 // Pure-Dart CLI for bluetooth_classic — runs with `dart run`, no Flutter.
 //
-//   dart run bluetooth_classic_cli_example list
-//   dart run bluetooth_classic_cli_example scan [--timeout 8]
-//   dart run bluetooth_classic_cli_example connect <ADDRESS> [--channel N]
+//   dart run :btc list
+//   dart run :btc scan [--timeout 8]
+//   dart run :btc connect <ADDRESS> [--channel N]
 //
 // `connect` opens an RFCOMM serial link, prints everything received, and sends
 // anything you type (line by line) to the device.

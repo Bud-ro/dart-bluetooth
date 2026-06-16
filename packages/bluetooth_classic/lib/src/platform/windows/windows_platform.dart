@@ -41,7 +41,9 @@ class WindowsBluetoothClassic extends BluetoothClassicPlatform {
   Future<BluetoothAdapterState> adapterState() async {
     try {
       final present = await Isolate.run(_hasRadio);
-      return present ? BluetoothAdapterState.on : BluetoothAdapterState.unavailable;
+      return present
+          ? BluetoothAdapterState.on
+          : BluetoothAdapterState.unavailable;
     } catch (_) {
       return BluetoothAdapterState.unavailable;
     }
@@ -139,10 +141,12 @@ class WindowsBluetoothClassic extends BluetoothClassicPlatform {
       const Stream<ConnectionState>.empty();
 
   @override
-  Future<void> pair(DeviceId device) async => throw const BluetoothUnsupportedException(
-        'Programmatic pairing on Windows (BluetoothAuthenticateDeviceEx) is not '
-        'yet wired; pair from Windows Settings.',
-      );
+  Future<void> pair(
+    DeviceId device,
+  ) async => throw const BluetoothUnsupportedException(
+    'Programmatic pairing on Windows (BluetoothAuthenticateDeviceEx) is not '
+    'yet wired; pair from Windows Settings.',
+  );
 
   @override
   Future<void> unpair(DeviceId device) async =>
@@ -153,14 +157,15 @@ class WindowsBluetoothClassic extends BluetoothClassicPlatform {
   // --- main-isolate helpers ------------------------------------------------
 
   BluetoothDevice _toDevice(_RawDevice r) => BluetoothDevice(
-        id: DeviceId.address(formatBthAddr(r.addr)),
-        name: r.name.isEmpty ? null : r.name,
-        type: BluetoothDeviceType.classic,
-        bondState:
-            r.authenticated ? BluetoothBondState.bonded : BluetoothBondState.none,
-        isConnected: r.connected,
-        deviceClass: r.classOfDevice,
-      );
+    id: DeviceId.address(formatBthAddr(r.addr)),
+    name: r.name.isEmpty ? null : r.name,
+    type: BluetoothDeviceType.classic,
+    bondState: r.authenticated
+        ? BluetoothBondState.bonded
+        : BluetoothBondState.none,
+    isConnected: r.connected,
+    deviceClass: r.classOfDevice,
+  );
 }
 
 // --- isolate entrypoints (top-level, run in worker isolates) -----------------
@@ -186,8 +191,14 @@ bool _hasRadio() {
 
 /// Plain, sendable device record produced inside worker isolates.
 class _RawDevice {
-  _RawDevice(this.addr, this.name, this.classOfDevice, this.connected,
-      this.remembered, this.authenticated);
+  _RawDevice(
+    this.addr,
+    this.name,
+    this.classOfDevice,
+    this.connected,
+    this.remembered,
+    this.authenticated,
+  );
   final int addr;
   final String name;
   final int classOfDevice;
@@ -213,7 +224,9 @@ List<_RawDevice> _enumerateDevices({
       ..fReturnUnknown = unknown ? 1 : 0
       ..fReturnConnected = 1
       ..fIssueInquiry = inquiry ? 1 : 0
-      ..cTimeoutMultiplier = inquiry ? 8 : 0 // ~10.24s when inquiring
+      ..cTimeoutMultiplier = inquiry
+          ? 8
+          : 0 // ~10.24s when inquiring
       ..hRadio = 0;
     info.ref.dwSize = ffi.sizeOf<BluetoothDeviceInfo>();
 
@@ -352,16 +365,17 @@ void _sendAll(WinsockBindings ws, int socket, Uint8List bytes) {
 /// the calling isolate never blocks.
 class _WindowsRfcommTransport implements RfcommTransport {
   _WindowsRfcommTransport({required int socket, required WinsockBindings ws})
-      : _socket = socket,
-        _ws = ws {
+    : _socket = socket,
+      _ws = ws {
     _start();
   }
 
   final int _socket;
   final WinsockBindings _ws;
 
-  final StreamController<Uint8List> _incoming =
-      StreamController<Uint8List>(sync: false);
+  final StreamController<Uint8List> _incoming = StreamController<Uint8List>(
+    sync: false,
+  );
   final StreamController<ConnectionState> _state =
       StreamController<ConnectionState>.broadcast();
   ConnectionState _current = ConnectionState.connected;
@@ -373,6 +387,7 @@ class _WindowsRfcommTransport implements RfcommTransport {
   ReceivePort? _writerControlPort;
   SendPort? _writerSend;
   final List<List<Object?>> _pendingWrites = [];
+  final Completer<void> _done = Completer<void>();
 
   void _start() {
     final readerPort = ReceivePort();
@@ -384,8 +399,10 @@ class _WindowsRfcommTransport implements RfcommTransport {
         _incoming.add(msg.materialize().asUint8List());
       }
     });
-    Isolate.spawn(_recvEntry, [_socket, readerPort.sendPort])
-        .then((i) => _reader = i);
+    Isolate.spawn(_recvEntry, [
+      _socket,
+      readerPort.sendPort,
+    ]).then((i) => _reader = i);
 
     final control = ReceivePort();
     _writerControlPort = control;
@@ -398,8 +415,10 @@ class _WindowsRfcommTransport implements RfcommTransport {
         _pendingWrites.clear();
       }
     });
-    Isolate.spawn(_writeEntry, [_socket, control.sendPort])
-        .then((i) => _writer = i);
+    Isolate.spawn(_writeEntry, [
+      _socket,
+      control.sendPort,
+    ]).then((i) => _writer = i);
 
     _state.add(ConnectionState.connected);
   }
@@ -416,7 +435,10 @@ class _WindowsRfcommTransport implements RfcommTransport {
   @override
   void send(Uint8List data) {
     if (_closed) throw const BluetoothWriteException('transport closed');
-    final msg = <Object?>[TransferableTypedData.fromList([data]), null];
+    final msg = <Object?>[
+      TransferableTypedData.fromList([data]),
+      null,
+    ];
     final w = _writerSend;
     if (w != null) {
       w.send(msg);
@@ -436,8 +458,13 @@ class _WindowsRfcommTransport implements RfcommTransport {
     } else {
       _pendingWrites.add(msg);
     }
-    await ack.first;
-    ack.close();
+    // Race the writer's ack against close(): if the peer drops and the writer
+    // isolate is killed, the ack never arrives — don't hang forever.
+    try {
+      await Future.any([ack.first, _done.future]);
+    } finally {
+      ack.close();
+    }
   }
 
   void _onClosedByPeer() {
@@ -449,19 +476,24 @@ class _WindowsRfcommTransport implements RfcommTransport {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
+    // Release any flush() waiting on a writer ack that will never arrive.
+    if (!_done.isCompleted) _done.complete();
     // Unblock recv and break the connection.
     try {
       _ws.shutdown(_socket, 2); // SD_BOTH
       _ws.closesocket(_socket);
-    } catch (_) {/* already gone */}
+    } catch (_) {
+      /* already gone */
+    }
     _writerSend?.send(null);
     _writerControlPort?.close();
     _readerPort?.close();
     _writer?.kill(priority: Isolate.beforeNextEvent);
     _reader?.kill(priority: Isolate.beforeNextEvent);
     if (!_state.isClosed) {
-      _state.add(ConnectionState.disconnected);
+      if (!alreadyDisconnected) _state.add(ConnectionState.disconnected);
       await _state.close();
     }
     if (!_incoming.isClosed) await _incoming.close();

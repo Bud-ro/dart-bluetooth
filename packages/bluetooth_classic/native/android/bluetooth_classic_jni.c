@@ -13,6 +13,7 @@
 
 #include <dlfcn.h>
 #include <jni.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,12 +57,30 @@ static int ensure_vm(void) {
   return 0;
 }
 
+// TLS key whose destructor detaches a thread we attached, so a native thread
+// (e.g. the Dart mutator) that calls in here doesn't leak a permanent JVM
+// attachment across engine/isolate teardown.
+static pthread_key_t g_detach_key;
+static pthread_once_t g_detach_once = PTHREAD_ONCE_INIT;
+
+static void detach_current_thread(void *arg) {
+  (void)arg;
+  if (g_vm) (*g_vm)->DetachCurrentThread(g_vm);
+}
+
+static void make_detach_key(void) {
+  pthread_key_create(&g_detach_key, detach_current_thread);
+}
+
 static JNIEnv *get_env(void) {
   if (ensure_vm() != 0) return NULL;
   JNIEnv *env = NULL;
   jint r = (*g_vm)->GetEnv(g_vm, (void **)&env, JNI_VERSION_1_6);
   if (r == JNI_EDETACHED) {
     if ((*g_vm)->AttachCurrentThread(g_vm, &env, NULL) != JNI_OK) return NULL;
+    // Arrange to detach when this thread exits.
+    pthread_once(&g_detach_once, make_detach_key);
+    pthread_setspecific(g_detach_key, (void *)1);
   } else if (r != JNI_OK) {
     return NULL;
   }
@@ -76,9 +95,9 @@ static void nOnFound(JNIEnv *env, jclass clazz, jlong token, jstring json) {
   if (!s) return;
   size_t len = strlen(s) + 1;
   char *copy = malloc(len);
-  memcpy(copy, s, len);
+  if (copy) memcpy(copy, s, len);
   (*env)->ReleaseStringUTFChars(env, json, s);
-  g_found((int64_t)token, copy);
+  if (copy) g_found((int64_t)token, copy);
 }
 
 static void nOnInquiryDone(JNIEnv *env, jclass clazz, jlong token,
@@ -91,7 +110,13 @@ static void nOnData(JNIEnv *env, jclass clazz, jlong token, jbyteArray arr) {
   jsize len = (*env)->GetArrayLength(env, arr);
   if (len <= 0) return;
   uint8_t *copy = malloc((size_t)len);
+  if (!copy) return;
   (*env)->GetByteArrayRegion(env, arr, 0, len, (jbyte *)copy);
+  if ((*env)->ExceptionCheck(env)) {
+    (*env)->ExceptionClear(env);
+    free(copy);
+    return;
+  }
   g_data((int64_t)token, copy, (int32_t)len);
 }
 
@@ -103,7 +128,19 @@ static void nOnState(JNIEnv *env, jclass clazz, jlong token, jint state) {
 
 static jmethodID static_method(JNIEnv *env, const char *name, const char *sig) {
   if (!g_class) return NULL;
-  return (*env)->GetStaticMethodID(env, g_class, name, sig);
+  jmethodID m = (*env)->GetStaticMethodID(env, g_class, name, sig);
+  if (!m && (*env)->ExceptionCheck(env)) {
+    // Clear the pending NoSuchMethodError so the next JNI call doesn't abort.
+    (*env)->ExceptionClear(env);
+  }
+  return m;
+}
+
+// Clears any pending JNI exception left by a CallStatic* (e.g. an unexpected
+// throw); the Kotlin methods catch their own errors, but this is belt-and-braces
+// so a stray pending exception can never abort the VM on the next JNI call.
+static void clear_pending(JNIEnv *env) {
+  if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 }
 
 static char *jstring_to_cstr(JNIEnv *env, jstring s) {
@@ -112,7 +149,7 @@ static char *jstring_to_cstr(JNIEnv *env, jstring s) {
   if (!c) return NULL;
   size_t len = strlen(c) + 1;
   char *out = malloc(len);
-  memcpy(out, c, len);
+  if (out) memcpy(out, c, len);
   (*env)->ReleaseStringUTFChars(env, s, c);
   return out;
 }
@@ -156,7 +193,9 @@ int32_t btc_and_init(void) {
   }
   jmethodID m = static_method(env, "initialize", "()I");
   if (!m) return 1;
-  return (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
+  int32_t r = (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
+  clear_pending(env);
+  return r;
 }
 
 int32_t btc_and_adapter_state(void) {
@@ -164,7 +203,9 @@ int32_t btc_and_adapter_state(void) {
   if (!env) return 1;
   jmethodID m = static_method(env, "adapterState", "()I");
   if (!m) return 1;
-  return (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
+  int32_t r = (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
+  clear_pending(env);
+  return r;
 }
 
 char *btc_and_bonded_json(void) {
@@ -173,6 +214,7 @@ char *btc_and_bonded_json(void) {
   jmethodID m = static_method(env, "bondedJson", "()Ljava/lang/String;");
   if (!m) return NULL;
   jstring s = (jstring)(*env)->CallStaticObjectMethod(env, g_class, m);
+  clear_pending(env);
   char *out = jstring_to_cstr(env, s);
   if (s) (*env)->DeleteLocalRef(env, s);
   return out;
@@ -183,7 +225,10 @@ int32_t btc_and_start_discovery(int64_t token) {
   if (!env) return -1;
   jmethodID m = static_method(env, "startDiscovery", "(J)I");
   if (!m) return -1;
-  return (int32_t)(*env)->CallStaticIntMethod(env, g_class, m, (jlong)token);
+  int32_t r =
+      (int32_t)(*env)->CallStaticIntMethod(env, g_class, m, (jlong)token);
+  clear_pending(env);
+  return r;
 }
 
 int32_t btc_and_stop_discovery(void) {
@@ -191,7 +236,9 @@ int32_t btc_and_stop_discovery(void) {
   if (!env) return -1;
   jmethodID m = static_method(env, "stopDiscovery", "()I");
   if (!m) return -1;
-  return (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
+  int32_t r = (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
+  clear_pending(env);
+  return r;
 }
 
 int64_t btc_and_open(int64_t token, const char *address, int32_t channel,
@@ -205,6 +252,7 @@ int64_t btc_and_open(int64_t token, const char *address, int32_t channel,
   jstring juuid = (*env)->NewStringUTF(env, uuid);
   jlong handle = (*env)->CallStaticLongMethod(env, g_class, m, (jlong)token,
                                               jaddr, (jint)channel, juuid);
+  clear_pending(env);
   (*env)->DeleteLocalRef(env, jaddr);
   (*env)->DeleteLocalRef(env, juuid);
   return (int64_t)handle;
@@ -216,8 +264,13 @@ int32_t btc_and_write(int64_t handle, const uint8_t *data, int32_t len) {
   jmethodID m = static_method(env, "write", "(J[B)I");
   if (!m) return -1;
   jbyteArray arr = (*env)->NewByteArray(env, len);
+  if (!arr) {
+    clear_pending(env);
+    return -1;
+  }
   (*env)->SetByteArrayRegion(env, arr, 0, len, (const jbyte *)data);
   jint rc = (*env)->CallStaticIntMethod(env, g_class, m, (jlong)handle, arr);
+  clear_pending(env);
   (*env)->DeleteLocalRef(env, arr);
   return (int32_t)rc;
 }
@@ -227,5 +280,7 @@ int32_t btc_and_close(int64_t handle) {
   if (!env) return -1;
   jmethodID m = static_method(env, "close", "(J)I");
   if (!m) return -1;
-  return (int32_t)(*env)->CallStaticIntMethod(env, g_class, m, (jlong)handle);
+  int32_t r = (int32_t)(*env)->CallStaticIntMethod(env, g_class, m, (jlong)handle);
+  clear_pending(env);
+  return r;
 }

@@ -22,8 +22,8 @@ import '../platform_interface.dart';
 /// the file descriptor BlueZ hands back on `NewConnection`.
 class LinuxBluetoothClassic extends BluetoothClassicPlatform {
   LinuxBluetoothClassic({DBusClient? bus, String adapter = 'hci0'})
-      : _bus = bus ?? DBusClient.system(),
-        _adapterName = adapter;
+    : _bus = bus ?? DBusClient.system(),
+      _adapterName = adapter;
 
   final DBusClient _bus;
   final String _adapterName;
@@ -92,11 +92,9 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
 
   @override
   Future<void> setAdapterEnabled(bool enabled) async {
-    await _obj(_adapterPath).setProperty(
-      _adapterIface,
-      'Powered',
-      DBusBoolean(enabled),
-    );
+    await _obj(
+      _adapterPath,
+    ).setProperty(_adapterIface, 'Powered', DBusBoolean(enabled));
   }
 
   // --- Devices -------------------------------------------------------------
@@ -132,43 +130,45 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
         path: DBusObjectPath('/'),
       );
       // New devices appearing.
-      addedSub = DBusRemoteObjectSignalStream(
-        object: om,
-        interface: _omIface,
-        name: 'InterfacesAdded',
-      ).listen((signal) {
-        final values = signal.values;
-        if (values.length < 2) return;
-        final ifaces = (values[1] as DBusDict).children.map(
+      addedSub =
+          DBusRemoteObjectSignalStream(
+            object: om,
+            interface: _omIface,
+            name: 'InterfacesAdded',
+          ).listen((signal) {
+            final values = signal.values;
+            if (values.length < 2) return;
+            final ifaces = (values[1] as DBusDict).children.map(
               (k, v) => MapEntry(
                 (k as DBusString).value,
                 (v as DBusDict).children.map(
-                      (pk, pv) => MapEntry(
-                        (pk as DBusString).value,
-                        (pv as DBusVariant).value,
-                      ),
-                    ),
+                  (pk, pv) => MapEntry(
+                    (pk as DBusString).value,
+                    (pv as DBusVariant).value,
+                  ),
+                ),
               ),
             );
-        final props = ifaces[_deviceIface];
-        if (props == null) return;
-        controller.add(_discoveryFromProps(props));
-      });
+            final props = ifaces[_deviceIface];
+            if (props == null) return;
+            controller.add(_discoveryFromProps(props));
+          });
       // Property updates (e.g. RSSI/name) on known devices.
-      changedSub = DBusRemoteObjectSignalStream(
-        object: om,
-        interface: _propsIface,
-        name: 'PropertiesChanged',
-      ).listen((signal) async {
-        if (signal.values.isEmpty) return;
-        if ((signal.values[0] as DBusString).value != _deviceIface) return;
-        try {
-          final props = await _allDeviceProps(signal.path);
-          controller.add(_discoveryFromProps(props));
-        } catch (_) {
-          /* device vanished mid-update */
-        }
-      });
+      changedSub =
+          DBusRemoteObjectSignalStream(
+            object: om,
+            interface: _propsIface,
+            name: 'PropertiesChanged',
+          ).listen((signal) async {
+            if (signal.values.isEmpty) return;
+            if ((signal.values[0] as DBusString).value != _deviceIface) return;
+            try {
+              final props = await _allDeviceProps(signal.path);
+              controller.add(_discoveryFromProps(props));
+            } catch (_) {
+              /* device vanished mid-update */
+            }
+          });
       await _obj(_adapterPath).callMethod(_adapterIface, 'StartDiscovery', []);
     }
 
@@ -210,8 +210,8 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
     try {
       final path = _devicePath(device);
       final props = await _allDeviceProps(path);
-      final uuids = (props['UUIDs'] as DBusArray?)
-              ?.children
+      final uuids =
+          (props['UUIDs'] as DBusArray?)?.children
               .map((e) => Uuid((e as DBusString).value))
               .toList() ??
           const <Uuid>[];
@@ -251,16 +251,22 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
       onListen: () async {
         try {
           final p = await obj.getProperty(_deviceIface, 'Connected');
-          controller.add((p as DBusBoolean).value
-              ? ConnectionState.connected
-              : ConnectionState.disconnected);
-        } catch (_) {/* ignore */}
+          controller.add(
+            (p as DBusBoolean).value
+                ? ConnectionState.connected
+                : ConnectionState.disconnected,
+          );
+        } catch (_) {
+          /* ignore */
+        }
         sub = obj.propertiesChanged.listen((sig) {
           final c = sig.changedProperties['Connected'];
           if (c is DBusBoolean) {
-            controller.add(c.value
-                ? ConnectionState.connected
-                : ConnectionState.disconnected);
+            controller.add(
+              c.value
+                  ? ConnectionState.connected
+                  : ConnectionState.disconnected,
+            );
           }
         });
       },
@@ -308,8 +314,16 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
       );
     }
     if (e is DBusAccessDeniedException) {
-      throw BluetoothPermissionException('Permission denied during $op',
-          cause: e);
+      throw BluetoothPermissionException(
+        'Permission denied during $op',
+        cause: e,
+      );
+    }
+    if (e is DBusUnknownObjectException) {
+      throw DeviceNotFoundException(
+        'Unknown device/object during $op',
+        cause: e,
+      );
     }
     if (e is DBusMethodResponseException) {
       throw BluetoothException('BlueZ error during $op', cause: e);
@@ -331,22 +345,16 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
   }
 
   Future<Map<String, DBusValue>> _allDeviceProps(DBusObjectPath path) async {
-    final result = await _obj(path).callMethod(
-      _propsIface,
-      'GetAll',
-      [const DBusString(_deviceIface)],
-      replySignature: DBusSignature('a{sv}'),
-    );
+    final result = await _obj(path).callMethod(_propsIface, 'GetAll', [
+      const DBusString(_deviceIface),
+    ], replySignature: DBusSignature('a{sv}'));
     return (result.returnValues.first as DBusDict).children.map(
-          (k, v) => MapEntry(
-            (k as DBusString).value,
-            (v as DBusVariant).value,
-          ),
-        );
+      (k, v) => MapEntry((k as DBusString).value, (v as DBusVariant).value),
+    );
   }
 
   Future<Map<DBusObjectPath, Map<String, Map<String, DBusValue>>>>
-      _managedObjects() async {
+  _managedObjects() async {
     final om = DBusRemoteObject(
       _bus,
       name: _service,
@@ -361,23 +369,23 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
     final dict = reply.returnValues.first as DBusDict;
     return dict.children.map((path, ifaces) {
       final ifaceMap = (ifaces as DBusDict).children.map(
-            (iface, props) => MapEntry(
-              (iface as DBusString).value,
-              (props as DBusDict).children.map(
-                    (pk, pv) => MapEntry(
-                      (pk as DBusString).value,
-                      (pv as DBusVariant).value,
-                    ),
-                  ),
-            ),
-          );
+        (iface, props) => MapEntry(
+          (iface as DBusString).value,
+          (props as DBusDict).children.map(
+            (pk, pv) =>
+                MapEntry((pk as DBusString).value, (pv as DBusVariant).value),
+          ),
+        ),
+      );
       return MapEntry(path as DBusObjectPath, ifaceMap);
     });
   }
 
   BluetoothDevice _deviceFromProps(Map<String, DBusValue> props) {
-    final address = (props['Address'] as DBusString?)?.value ?? '00:00:00:00:00:00';
-    final name = (props['Name'] as DBusString?)?.value ??
+    final address =
+        (props['Address'] as DBusString?)?.value ?? '00:00:00:00:00:00';
+    final name =
+        (props['Name'] as DBusString?)?.value ??
         (props['Alias'] as DBusString?)?.value;
     final paired = (props['Paired'] as DBusBoolean?)?.value ?? false;
     final connected = (props['Connected'] as DBusBoolean?)?.value ?? false;
@@ -387,8 +395,7 @@ class LinuxBluetoothClassic extends BluetoothClassicPlatform {
       id: DeviceId.address(address),
       name: name,
       type: BluetoothDeviceType.classic,
-      bondState:
-          paired ? BluetoothBondState.bonded : BluetoothBondState.none,
+      bondState: paired ? BluetoothBondState.bonded : BluetoothBondState.none,
       rssi: rssi,
       isConnected: connected,
       deviceClass: cls,
@@ -436,17 +443,25 @@ class _LinuxRfcommProfile implements RfcommTransport {
     // adopted as a dart:io Socket for duplex I/O.
     final completer = Completer<RfcommTransport>();
     final profilePath = DBusObjectPath(
-        '/lol/carson/bluetooth_classic/profile${_profileCounter++}');
+      '/lol/carson/bluetooth_classic/profile${_profileCounter++}',
+    );
     late final _Profile1 profile;
     profile = _Profile1(profilePath, (socket) {
-      if (!completer.isCompleted) {
-        completer.complete(_LinuxRfcommProfile._(socket, bus, profile));
+      if (completer.isCompleted) {
+        // Arrived after a timeout/error completed the future — don't leak the fd.
+        socket.destroy();
+        unawaited(_unregisterProfile(bus, profile));
+        return;
       }
+      completer.complete(_LinuxRfcommProfile._(socket, bus, profile));
     });
     await bus.registerObject(profile);
 
-    final mgr = DBusRemoteObject(bus,
-        name: 'org.bluez', path: DBusObjectPath('/org/bluez'));
+    final mgr = DBusRemoteObject(
+      bus,
+      name: 'org.bluez',
+      path: DBusObjectPath('/org/bluez'),
+    );
     final options = <String, DBusValue>{'Role': const DBusString('client')};
     if (channel != null && channel > 0) {
       options['Channel'] = DBusUint16(channel);
@@ -469,14 +484,11 @@ class _LinuxRfcommProfile implements RfcommTransport {
 
     final device = DBusRemoteObject(bus, name: 'org.bluez', path: devicePath);
     try {
-      await device.callMethod(
-        'org.bluez.Device1',
-        'ConnectProfile',
-        [DBusString(serviceUuid.value)],
-        replySignature: DBusSignature(''),
-      );
+      await device.callMethod('org.bluez.Device1', 'ConnectProfile', [
+        DBusString(serviceUuid.value),
+      ], replySignature: DBusSignature(''));
     } catch (e) {
-      await bus.unregisterObject(profile);
+      await _unregisterProfile(bus, profile);
       throw BluetoothConnectionException('ConnectProfile failed', cause: e);
     }
 
@@ -484,7 +496,7 @@ class _LinuxRfcommProfile implements RfcommTransport {
         ? completer.future.timeout(
             timeout,
             onTimeout: () {
-              unawaited(bus.unregisterObject(profile));
+              unawaited(_unregisterProfile(bus, profile));
               throw BluetoothTimeoutException(
                 'RFCOMM connect timed out',
                 timeout: timeout,
@@ -494,10 +506,39 @@ class _LinuxRfcommProfile implements RfcommTransport {
         : completer.future;
   }
 
+  /// Unregisters both the BlueZ profile (so bluetoothd forgets it) and the
+  /// local D-Bus object. Best-effort; safe to call more than once.
+  static Future<void> _unregisterProfile(
+    DBusClient bus,
+    DBusObject profile,
+  ) async {
+    try {
+      final mgr = DBusRemoteObject(
+        bus,
+        name: 'org.bluez',
+        path: DBusObjectPath('/org/bluez'),
+      );
+      await mgr.callMethod(
+        'org.bluez.ProfileManager1',
+        'UnregisterProfile',
+        [profile.path],
+        replySignature: DBusSignature(''),
+      );
+    } catch (_) {
+      /* already gone */
+    }
+    try {
+      await bus.unregisterObject(profile);
+    } catch (_) {
+      /* already gone */
+    }
+  }
+
   final Socket _socket;
   late final StreamSubscription<Uint8List> _sub;
-  final StreamController<Uint8List> _incoming =
-      StreamController<Uint8List>(sync: false);
+  final StreamController<Uint8List> _incoming = StreamController<Uint8List>(
+    sync: false,
+  );
   final StreamController<ConnectionState> _state =
       StreamController<ConnectionState>.broadcast();
   ConnectionState _current = ConnectionState.connected;
@@ -514,7 +555,7 @@ class _LinuxRfcommProfile implements RfcommTransport {
 
   @override
   void send(Uint8List data) {
-    if (_closed) return;
+    if (_closed) throw const BluetoothWriteException('transport closed');
     _socket.add(data);
   }
 
@@ -525,17 +566,18 @@ class _LinuxRfcommProfile implements RfcommTransport {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
     await _sub.cancel();
     try {
       await _socket.close();
-    } catch (_) {/* already gone */}
+    } catch (_) {
+      /* already gone */
+    }
     _socket.destroy();
-    try {
-      await _bus.unregisterObject(_profile);
-    } catch (_) {/* already gone */}
+    await _unregisterProfile(_bus, _profile);
     if (!_state.isClosed) {
-      _state.add(ConnectionState.disconnected);
+      if (!alreadyDisconnected) _state.add(ConnectionState.disconnected);
       await _state.close();
     }
     if (!_incoming.isClosed) await _incoming.close();

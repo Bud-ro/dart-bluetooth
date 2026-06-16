@@ -9,6 +9,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
@@ -37,7 +38,8 @@ object BluetoothClassicAndroid {
 
     private val sockets = ConcurrentHashMap<Long, BluetoothSocket>()
     private val nextHandle = AtomicLong(1)
-    private val writeExecutor = Executors.newCachedThreadPool()
+    // Single-threaded so writes to a socket are never reordered/interleaved.
+    private val writeExecutor = Executors.newSingleThreadExecutor()
 
     // Implemented in the C shim (registered via RegisterNatives).
     @JvmStatic external fun nativeOnFound(token: Long, json: String)
@@ -71,57 +73,91 @@ object BluetoothClassicAndroid {
         }
     }
 
+    // Returns "[]" on any failure (incl. SecurityException when BLUETOOTH_CONNECT
+    // is not granted) so a JNI-pending exception can never abort the VM.
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun bondedJson(): String {
-        val a = adapter ?: return "[]"
-        val arr = JSONArray()
-        for (d in a.bondedDevices.orEmpty()) {
-            arr.put(deviceJson(d, bonded = true))
+        return try {
+            val a = adapter ?: return "[]"
+            val arr = JSONArray()
+            for (d in a.bondedDevices.orEmpty()) {
+                arr.put(deviceJson(d, bonded = true))
+            }
+            arr.toString()
+        } catch (t: Throwable) {
+            "[]"
         }
-        return arr.toString()
     }
 
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun startDiscovery(token: Long): Int {
-        val a = adapter ?: return -1
-        val ctx = context ?: return -1
-        stopDiscovery()
-        discoveryToken = token
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(c: Context, intent: Intent) {
-                when (intent.action) {
-                    BluetoothDevice.ACTION_FOUND -> {
-                        val device: BluetoothDevice? =
-                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                        val rssi = intent.getShortExtra(
-                            BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE
-                        )
-                        if (device != null) {
-                            val json = deviceJson(
-                                device,
-                                bonded = device.bondState ==
-                                    BluetoothDevice.BOND_BONDED,
-                                rssi = if (rssi.toInt() == Short.MIN_VALUE.toInt())
-                                    null else rssi.toInt(),
+        return try {
+            val a = adapter ?: return -1
+            val ctx = context ?: return -1
+            stopDiscovery()
+            discoveryToken = token
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(c: Context, intent: Intent) {
+                    when (intent.action) {
+                        BluetoothDevice.ACTION_FOUND -> {
+                            val device = deviceExtra(intent)
+                            val rssi = intent.getShortExtra(
+                                BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE
                             )
-                            nativeOnFound(token, json.toString())
+                            if (device != null) {
+                                val json = deviceJson(
+                                    device,
+                                    bonded = device.bondState ==
+                                        BluetoothDevice.BOND_BONDED,
+                                    rssi = if (rssi.toInt() == Short.MIN_VALUE.toInt())
+                                        null else rssi.toInt(),
+                                )
+                                nativeOnFound(token, json.toString())
+                            }
                         }
-                    }
-                    BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
-                        nativeOnInquiryDone(token, 0)
+                        BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                            stopDiscovery() // unregister before signalling done
+                            nativeOnInquiryDone(token, 0)
+                        }
                     }
                 }
             }
+            val filter = IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            }
+            registerReceiverCompat(ctx, receiver, filter)
+            discoveryReceiver = receiver
+            if (a.startDiscovery()) 0 else -1
+        } catch (t: Throwable) {
+            -1
         }
-        val filter = IntentFilter().apply {
-            addAction(BluetoothDevice.ACTION_FOUND)
-            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun deviceExtra(intent: Intent): BluetoothDevice? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(
+                BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java
+            )
+        } else {
+            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
         }
-        ctx.registerReceiver(receiver, filter)
-        discoveryReceiver = receiver
-        return if (a.startDiscovery()) 0 else -1
+    }
+
+    private fun registerReceiverCompat(
+        ctx: Context,
+        receiver: BroadcastReceiver,
+        filter: IntentFilter,
+    ) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ctx.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            ctx.registerReceiver(receiver, filter)
+        }
     }
 
     @SuppressLint("MissingPermission")

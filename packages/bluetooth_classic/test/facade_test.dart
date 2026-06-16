@@ -42,18 +42,25 @@ void main() {
 
   test('bondedAndDiscovered returns intersection with latest rssi', () async {
     final inRange = FakeBluetoothClassicPlatform.sampleDevice(
-        address: 'AA:AA:AA:AA:AA:AA', name: 'InRange');
+      address: 'AA:AA:AA:AA:AA:AA',
+      name: 'InRange',
+    );
     final outOfRange = FakeBluetoothClassicPlatform.sampleDevice(
-        address: 'BB:BB:BB:BB:BB:BB', name: 'OutOfRange');
+      address: 'BB:BB:BB:BB:BB:BB',
+      name: 'OutOfRange',
+    );
     fake.bonded.addAll([inRange, outOfRange]);
-    fake.discoveryResults.add(BluetoothDiscoveryResult(
-      device: inRange.copyWith(rssi: -42),
-      rssi: -42,
-      timestamp: DateTime(2026),
-    ));
+    fake.discoveryResults.add(
+      BluetoothDiscoveryResult(
+        device: inRange.copyWith(rssi: -42),
+        rssi: -42,
+        timestamp: DateTime(2026),
+      ),
+    );
 
-    final result =
-        await bt.bondedAndDiscovered(timeout: const Duration(milliseconds: 20));
+    final result = await bt.bondedAndDiscovered(
+      timeout: const Duration(milliseconds: 20),
+    );
     expect(result, hasLength(1));
     expect(result.first.id, inRange.id);
     expect(result.first.rssi, -42);
@@ -69,8 +76,7 @@ void main() {
   });
 
   test('connect surfaces backend errors', () async {
-    fake.connectError =
-        const BluetoothConnectionException('refused');
+    fake.connectError = const BluetoothConnectionException('refused');
     final device = FakeBluetoothClassicPlatform.sampleDevice();
     expect(
       () => bt.connect(device),

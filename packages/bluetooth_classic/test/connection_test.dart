@@ -16,8 +16,7 @@ void main() {
   tearDown(() => fake.dispose());
 
   Future<(BluetoothConnection, FakeRfcommTransport)> open() async {
-    final conn =
-        await bt.connect(FakeBluetoothClassicPlatform.sampleDevice());
+    final conn = await bt.connect(FakeBluetoothClassicPlatform.sampleDevice());
     return (conn, fake.transports.single);
   }
 

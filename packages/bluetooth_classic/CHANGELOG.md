@@ -16,3 +16,8 @@ Initial release.
 - Domain exception hierarchy; `FakeBluetoothClassicPlatform` for tests.
 - All five backends implemented (incl. Linux RFCOMM `Profile1` fd stream);
   native code pending on-device validation per OS.
+- Hardened after a 10-axis code review: fixed a macOS write use-after-free,
+  Android JNI exception-safety / thread-detach / receiver-export / write
+  ordering, duplicate disconnect events, Linux profile/socket leaks and error
+  mapping, a Windows `flush()` hang, and added send/receive length guards. See
+  `docs/CODE_REVIEW.md`.

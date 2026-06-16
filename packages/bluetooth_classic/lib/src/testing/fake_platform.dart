@@ -54,13 +54,12 @@ class FakeBluetoothClassicPlatform extends BluetoothClassicPlatform {
   static BluetoothDevice sampleDevice({
     String address = 'AA:BB:CC:DD:EE:FF',
     String name = 'Test Device',
-  }) =>
-      BluetoothDevice(
-        id: DeviceId.address(address),
-        name: name,
-        type: BluetoothDeviceType.classic,
-        bondState: BluetoothBondState.bonded,
-      );
+  }) => BluetoothDevice(
+    id: DeviceId.address(address),
+    name: name,
+    type: BluetoothDeviceType.classic,
+    bondState: BluetoothBondState.bonded,
+  );
 
   void emitAdapterState(BluetoothAdapterState state) {
     _adapterState = state;
@@ -199,8 +198,9 @@ class FakeRfcommTransport implements RfcommTransport {
   /// Number of times [flush] was awaited.
   int flushCount = 0;
 
-  final StreamController<Uint8List> _incoming =
-      StreamController<Uint8List>.broadcast();
+  // Single-subscription, matching the RfcommTransport contract and every real
+  // backend (the facade re-broadcasts via BluetoothConnection.input).
+  final StreamController<Uint8List> _incoming = StreamController<Uint8List>();
   final StreamController<ConnectionState> _state =
       StreamController<ConnectionState>.broadcast();
   ConnectionState _current = ConnectionState.connected;

@@ -66,8 +66,7 @@ class BluetoothDevice {
   }
 
   @override
-  bool operator ==(Object other) =>
-      other is BluetoothDevice && other.id == id;
+  bool operator ==(Object other) => other is BluetoothDevice && other.id == id;
 
   @override
   int get hashCode => id.hashCode;

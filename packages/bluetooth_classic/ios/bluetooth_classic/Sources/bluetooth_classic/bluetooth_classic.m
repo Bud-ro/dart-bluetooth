@@ -87,6 +87,7 @@ static char *btc_strdup(NSString *s) {
   if (!utf8) return NULL;
   size_t len = strlen(utf8) + 1;
   char *out = malloc(len);
+  if (!out) return NULL;
   memcpy(out, utf8, len);
   return out;
 }
@@ -172,9 +173,11 @@ static char *btc_json(id obj) {
         uint8_t buf[4096];
         NSInteger n = [(NSInputStream *)stream read:buf maxLength:sizeof(buf)];
         if (n > 0 && self.data) {
-          uint8_t *copy = malloc(n);
-          memcpy(copy, buf, n);
-          self.data(self.token, copy, (int32_t)n);
+          uint8_t *copy = malloc((size_t)n);
+          if (copy) {
+            memcpy(copy, buf, (size_t)n);
+            self.data(self.token, copy, (int32_t)n);
+          }
         }
       }
       break;

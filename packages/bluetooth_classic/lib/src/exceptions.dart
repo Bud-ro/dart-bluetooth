@@ -54,7 +54,12 @@ class BluetoothConnectionException extends BluetoothException {
 
 /// An operation exceeded its allotted [timeout].
 class BluetoothTimeoutException extends BluetoothException {
-  const BluetoothTimeoutException(super.message, {this.timeout, super.code, super.cause});
+  const BluetoothTimeoutException(
+    super.message, {
+    this.timeout,
+    super.code,
+    super.cause,
+  });
 
   final Duration? timeout;
 }
