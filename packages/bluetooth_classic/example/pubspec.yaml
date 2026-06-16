@@ -1,0 +1,23 @@
+name: bluetooth_classic_example
+description: Flutter demo for bluetooth_classic.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.0
+  flutter: ">=3.44.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  bluetooth_classic:
+    path: ../
+
+dev_dependencies:
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+# Run `flutter create .` here once to generate the android/ios/macos/windows/
+# linux runner projects, then add the platform permission strings documented in
+# the package README (NSBluetoothAlwaysUsageDescription, etc.).
