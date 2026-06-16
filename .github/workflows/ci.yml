@@ -46,12 +46,12 @@ jobs:
         working-directory: ${{ env.PKG }}
         run: dart test
 
-      - name: compile CLI example (drives the native-assets build hook)
+      - name: build CLI example (drives the native-assets build hook)
         working-directory: ${{ env.PKG }}/example_cli
         run: |
           dart pub get
           dart analyze
-          dart compile exe bin/btc.dart -o btc_built
+          dart build cli
 
   # Flutter Android build: compiles the Kotlin backend + the C JNI shim (CMake).
   build-android:

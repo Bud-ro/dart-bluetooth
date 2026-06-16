@@ -2,9 +2,10 @@
 // Swift Package Manager manifest for the Flutter iOS plugin.
 //
 // Compiles the same ExternalAccessory backend used by the native-assets build
-// hook (Sources/bluetooth_classic is a symlink to ../../native/apple/ios). As an
-// `ffiPlugin` there is no platform-channel plugin class — Dart talks to the
-// native code directly via dart:ffi.
+// hook (Sources/bluetooth_classic is a symlink to ../../native/apple/ios, with
+// the public header under include/). As an `ffiPlugin` there is no
+// platform-channel plugin class — Dart talks to the native code directly via
+// dart:ffi. Flutter's SPM integration requires a FlutterFramework dependency.
 //
 // The host app must declare its accessory protocol strings in
 // UISupportedExternalAccessoryProtocols (Info.plist) for any MFi accessory to be
@@ -19,11 +20,14 @@ let package = Package(
     products: [
         .library(name: "bluetooth-classic", targets: ["bluetooth_classic"])
     ],
+    dependencies: [
+        .package(name: "FlutterFramework", path: "../FlutterFramework")
+    ],
     targets: [
         .target(
             name: "bluetooth_classic",
-            cSettings: [
-                .headerSearchPath(".")
+            dependencies: [
+                .product(name: "FlutterFramework", package: "FlutterFramework")
             ],
             linkerSettings: [
                 .linkedFramework("Foundation"),

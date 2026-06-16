@@ -40,7 +40,8 @@ android {
     }
 
     defaultConfig {
-        minSdk = 19
+        // 21 is the NDK floor for the CMake/JNI build (CXX1110).
+        minSdk = 21
     }
 
     // Builds the JNI shim into libbluetooth_classic_android.so.

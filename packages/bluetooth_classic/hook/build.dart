@@ -36,7 +36,7 @@ void main(List<String> args) async {
       assetName: _assetName,
       language: Language.objectiveC,
       sources: [srcDir.resolve('bluetooth_classic.m').toFilePath()],
-      includes: [srcDir.toFilePath()],
+      includes: [srcDir.resolve('include/').toFilePath()],
       frameworks: frameworks,
       flags: const ['-fobjc-arc'],
     );
