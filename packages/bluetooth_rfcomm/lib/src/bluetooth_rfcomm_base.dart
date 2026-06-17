@@ -368,6 +368,7 @@ class BluetoothRfcomm {
     if (_nearbyCycleDone != null && !_nearbyCycleDone!.isCompleted) {
       _nearbyCycleDone!.complete();
     }
+    final sw = Stopwatch()..start();
     try {
       final transport = await _platform.openRfcomm(
         device.id,
@@ -375,9 +376,17 @@ class BluetoothRfcomm {
         serviceUuid: uuid,
         timeout: timeout,
       );
+      logConnection.fine(
+        () => 'connected to ${device.id} in ${sw.elapsedMilliseconds}ms',
+      );
       return BluetoothConnection.wrap(device, transport);
     } on BluetoothException catch (e, st) {
-      logConnection.severe(() => 'connect to ${device.id} failed: $e', e, st);
+      logConnection.severe(
+        () =>
+            'connect to ${device.id} failed after ${sw.elapsedMilliseconds}ms: $e',
+        e,
+        st,
+      );
       rethrow;
     } finally {
       _activeConnects--;

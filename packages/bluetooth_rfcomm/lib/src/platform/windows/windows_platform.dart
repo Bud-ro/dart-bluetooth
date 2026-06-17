@@ -36,15 +36,21 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<bool> isSupported() async {
+    final sw = Stopwatch()..start();
     try {
       return await Isolate.run(_hasRadio);
     } catch (_) {
       return false;
+    } finally {
+      logAdapter.fine(
+        () => 'isSupported: radio check took ${sw.elapsedMilliseconds}ms',
+      );
     }
   }
 
   @override
   Future<BluetoothAdapterState> adapterState() async {
+    final sw = Stopwatch()..start();
     try {
       final present = await Isolate.run(_hasRadio);
       return present
@@ -52,6 +58,10 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
           : BluetoothAdapterState.unavailable;
     } catch (_) {
       return BluetoothAdapterState.unavailable;
+    } finally {
+      logAdapter.fine(
+        () => 'adapterState: radio check took ${sw.elapsedMilliseconds}ms',
+      );
     }
   }
 
@@ -79,9 +89,13 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
       // isolate — spawning a worker just to read it cost more than the read.
       // BluetoothFindFirstDevice is no longer used: it blocks on a per-device
       // remote-name request, which was the whole reason listing felt slow.
+      final sw = Stopwatch()..start();
       final raw = _enumeratePairedFromRegistry();
+      sw.stop();
       logDiscovery.fine(
-        () => 'bondedDevices: ${raw.length} paired device(s) from registry',
+        () =>
+            'bondedDevices: ${raw.length} paired device(s) from registry in '
+            '${sw.elapsedMilliseconds}ms',
       );
       return raw.map(_toDevice).toList();
     } on BluetoothException {
@@ -106,9 +120,13 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     // and never touches the radio. Re-introduce a real inquiry here only if
     // non-paired discovery is actually needed (and budget for the radio cost).
     final now = DateTime.now();
+    final sw = Stopwatch()..start();
     final raw = _enumeratePairedFromRegistry();
+    sw.stop();
     logDiscovery.fine(
-      () => 'discovery (paired-list shim): ${raw.length} device(s), no inquiry',
+      () =>
+          'discovery (paired-list shim): ${raw.length} device(s) in '
+          '${sw.elapsedMilliseconds}ms, no inquiry',
     );
     for (final r in raw) {
       final device = _toDevice(r);
@@ -154,6 +172,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     // (socket, errorCode): separate fields so a SOCKET (an unsigned UINT_PTR)
     // can never be misread as an error code, whatever its high bit.
     final (int, int) connectResult;
+    final connectSw = Stopwatch()..start();
     try {
       // Spawn the connect via a STATIC helper, never an inline closure here.
       // The `.then(...)` callback below references `_ws`, so it captures `this`;
@@ -191,6 +210,12 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
                 );
               },
             ));
+      connectSw.stop();
+      logConnection.fine(
+        () =>
+            'openRfcomm: native connect to $address '
+            '(channel ${channel ?? 'SDP'}) took ${connectSw.elapsedMilliseconds}ms',
+      );
     } on BluetoothException {
       rethrow;
     } catch (e) {
@@ -292,21 +317,30 @@ const String _pairedDevicesKey =
     r'SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices';
 
 /// Lists paired devices by reading the registry directly — no radio I/O, so it
-/// returns instantly even when a paired device is powered off or out of range
-/// (unlike BluetoothFindFirstDevice, which can block on a remote-name request
-/// per device). Returns an empty list on any failure so the caller can fall back
-/// to the FindFirstDevice path. classOfDevice/connected aren't in this registry
-/// view, so they default (a paired device is authenticated/remembered by
-/// definition; live connection state comes from the connection's own stream).
+/// returns instantly even when a paired device is powered off or out of range.
+/// classOfDevice/connected aren't in this registry view, so they default (a
+/// paired device is authenticated/remembered by definition; live connection
+/// state comes from the connection's own stream).
+///
+/// Heavily instrumented (FINER, [BluetoothRfcommLoggers.discovery]) so the time
+/// spent opening the library, opening the key, enumerating, and reading each
+/// device name is visible — to catch any operation that unexpectedly stalls.
 List<_RawDevice> _enumeratePairedFromRegistry() {
+  final total = Stopwatch()..start();
   final reg = RegistryBindings();
+  final dllOpenUs = total.elapsedMicroseconds;
   final out = <_RawDevice>[];
   final subPath = _pairedDevicesKey.toNativeUtf16();
   final hDevices = calloc<ffi.IntPtr>();
   // Subkey names are 12 hex chars; 64 WCHARs is ample headroom.
   final nameBuf = calloc<ffi.Uint16>(64);
   final nameLen = calloc<ffi.Uint32>();
+  var scanned = 0;
+  var nameReadUs = 0;
+  var slowestNameUs = 0;
+  String? slowestName;
   try {
+    final openStart = total.elapsedMicroseconds;
     if (reg.regOpenKeyEx(
           hkeyLocalMachine,
           subPath.cast(),
@@ -315,8 +349,14 @@ List<_RawDevice> _enumeratePairedFromRegistry() {
           hDevices,
         ) !=
         0) {
+      logDiscovery.finer(
+        () =>
+            'registry: RegOpenKeyEx(Devices) failed after '
+            '${total.elapsedMicroseconds}us',
+      );
       return out;
     }
+    final openUs = total.elapsedMicroseconds - openStart;
     final devicesKey = hDevices.value;
     try {
       for (var i = 0; ; i++) {
@@ -332,10 +372,18 @@ List<_RawDevice> _enumeratePairedFromRegistry() {
           ffi.nullptr,
         );
         if (rc != 0) break; // ERROR_NO_MORE_ITEMS or any error -> done
+        scanned++;
         final mac = _utf16ToString(nameBuf, nameLen.value);
         final addr = _parseRegistryMac(mac);
         if (addr == null) continue; // not a MAC subkey -> skip
+        final nameStart = total.elapsedMicroseconds;
         final name = _readRegistryName(reg, devicesKey, nameBuf);
+        final thisNameUs = total.elapsedMicroseconds - nameStart;
+        nameReadUs += thisNameUs;
+        if (thisNameUs > slowestNameUs) {
+          slowestNameUs = thisNameUs;
+          slowestName = name ?? mac;
+        }
         out.add(
           _RawDevice(
             addr,
@@ -347,11 +395,24 @@ List<_RawDevice> _enumeratePairedFromRegistry() {
           ),
         );
       }
+      logDiscovery.finer(
+        () =>
+            'registry: ${out.length} device(s) from $scanned subkey(s) — '
+            'dllOpen ${dllOpenUs}us, keyOpen ${openUs}us, '
+            'nameReads ${nameReadUs}us '
+            '(slowest "${slowestName ?? '-'}" ${slowestNameUs}us), '
+            'total ${total.elapsedMicroseconds}us',
+      );
     } finally {
       reg.regCloseKey(devicesKey);
     }
-  } catch (_) {
-    return out; // any FFI mishap -> empty so the caller falls back
+  } catch (e) {
+    logDiscovery.warning(
+      () =>
+          'registry enumeration failed after '
+          '${total.elapsedMicroseconds}us: $e',
+    );
+    return out;
   } finally {
     calloc.free(subPath);
     calloc.free(hDevices);
