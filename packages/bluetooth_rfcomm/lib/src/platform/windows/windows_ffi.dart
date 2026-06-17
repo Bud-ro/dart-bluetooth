@@ -18,6 +18,11 @@ const int sockStream = 1; // SOCK_STREAM
 const int bthprotoRfcomm = 3; // BTHPROTO_RFCOMM
 const int socketError = -1; // SOCKET_ERROR
 const int wsaeWouldBlock = 10035;
+const int wsaeTimedOut = 10060; // WSAETIMEDOUT (a recv() SO_RCVTIMEO expiry)
+
+// setsockopt(SOL_SOCKET, SO_RCVTIMEO) — bounds how long recv() blocks (DWORD ms).
+const int solSocket = 0xffff; // SOL_SOCKET
+const int soRcvTimeo = 0x1006; // SO_RCVTIMEO
 
 /// `INVALID_SOCKET` is `(SOCKET)(~0)`; SOCKET is `UINT_PTR` (64-bit on x64).
 final int invalidSocket = -1; // all-ones when read as a pointer-sized int
@@ -165,6 +170,23 @@ typedef CloseSocketDart = int Function(int s);
 typedef _ShutdownC = ffi.Int32 Function(ffi.IntPtr s, ffi.Int32 how);
 typedef ShutdownDart = int Function(int s, int how);
 
+typedef _SetSockOptC =
+    ffi.Int32 Function(
+      ffi.IntPtr s,
+      ffi.Int32 level,
+      ffi.Int32 optname,
+      ffi.Pointer<ffi.Uint8> optval,
+      ffi.Int32 optlen,
+    );
+typedef SetSockOptDart =
+    int Function(
+      int s,
+      int level,
+      int optname,
+      ffi.Pointer<ffi.Uint8> optval,
+      int optlen,
+    );
+
 typedef _FindFirstDeviceC =
     ffi.IntPtr Function(
       ffi.Pointer<BluetoothDeviceSearchParams> params,
@@ -223,6 +245,9 @@ class WinsockBindings {
       'closesocket',
     );
     shutdown = _ws2.lookupFunction<_ShutdownC, ShutdownDart>('shutdown');
+    setsockopt = _ws2.lookupFunction<_SetSockOptC, SetSockOptDart>(
+      'setsockopt',
+    );
 
     findFirstDevice = _bth
         .lookupFunction<_FindFirstDeviceC, FindFirstDeviceDart>(
@@ -259,6 +284,7 @@ class WinsockBindings {
   late final RecvDart recv;
   late final CloseSocketDart closesocket;
   late final ShutdownDart shutdown;
+  late final SetSockOptDart setsockopt;
   late final FindFirstDeviceDart findFirstDevice;
   late final FindNextDeviceDart findNextDevice;
   late final FindDeviceCloseDart findDeviceClose;

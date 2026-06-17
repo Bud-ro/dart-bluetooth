@@ -137,25 +137,6 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
     final address = device.address;
     final uuid = serviceUuid.value;
-    // Initialise Winsock once, on the main isolate, for the whole process —
-    // BEFORE any worker isolate touches a socket. WSAStartup keeps a
-    // process-global reference count, so the connect/recv/send workers must NOT
-    // run their own WSAStartup/WSACleanup: that churn could transiently drop the
-    // count to zero, which uninitialises Winsock for the entire process. Once
-    // that happened, the main isolate's cached bindings never re-initialised, so
-    // closesocket() during close() silently failed — leaking the socket, leaving
-    // the device's RFCOMM channel busy, and blocking every later connection
-    // until the app restarted.
-    final WinsockBindings ws;
-    try {
-      ws =
-          _ws; // first use triggers WSAStartup; cached for the process lifetime
-    } catch (e) {
-      throw BluetoothConnectionException(
-        'Winsock initialisation failed',
-        cause: e,
-      );
-    }
     // (socket, errorCode): separate fields so a SOCKET (an unsigned UINT_PTR)
     // can never be misread as an error code, whatever its high bit.
     final (int, int) connectResult;
@@ -172,7 +153,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
           final (sock, err) = r;
           if (timedOut && err == 0 && sock != 0) {
             try {
-              ws.closesocket(sock);
+              _ws.closesocket(sock);
             } catch (_) {}
           }
         }, onError: (_) {}),
@@ -206,7 +187,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
         code: error,
       );
     }
-    return _WindowsRfcommTransport(socket: socket, ws: ws);
+    return _WindowsRfcommTransport(socket: socket, ws: _ws);
   }
 
   @override
@@ -346,11 +327,13 @@ int _wsaError(int err) => err == 0 ? -1 : err;
 /// `(0, errorCode)` on failure. The handle and error are separate fields so a
 /// SOCKET (an unsigned `UINT_PTR`) can never be mistaken for an error code.
 (int, int) _connectSocket(String address, int? channel, String serviceUuid) {
-  // No WSAStartup here: the main isolate has already initialised Winsock for the
-  // whole process (see openRfcomm), and a SOCKET is a process-global handle that
-  // stays valid after this worker exits. This isolate only needs the DLL's FFI
-  // function pointers.
+  // Each isolate that calls Winsock functions must run its own WSAStartup (the
+  // initialisation does not carry across Dart isolates). No matching WSACleanup
+  // here: it would tear down this isolate's Winsock and could invalidate the
+  // SOCKET we're about to hand back; the socket itself is a process-global handle
+  // that the reader/writer/main isolates go on to use.
   final ws = WinsockBindings();
+  ws.startup();
   final sock = ws.socket(afBth, sockStream, bthprotoRfcomm);
   if (sock == invalidSocket) return (0, _wsaError(ws.wsaGetLastError()));
 
@@ -383,21 +366,39 @@ const int _sendChunkFlags = 0;
 void _recvEntry(List<Object?> args) {
   final socket = args[0] as int;
   final sendPort = args[1] as SendPort;
-  // No WSAStartup/WSACleanup: Winsock is initialised process-wide by the main
-  // isolate and stays up for the process lifetime.
-  final ws = WinsockBindings();
+  // This isolate calls recv(), so it needs its own WSAStartup (Winsock init does
+  // not carry across Dart isolates); balanced by the wsaCleanup in finally.
+  final ws = WinsockBindings()..startup();
+  // Bound how long each recv() blocks (SO_RCVTIMEO). close() on another isolate
+  // can't reliably cancel a recv already blocked inside this RFCOMM provider, and
+  // Isolate.kill can't interrupt a blocking FFI call — so without this the reader
+  // could stay stuck forever after close(), holding the socket open and blocking
+  // the next connection. With a timeout, recv() returns periodically; once the
+  // socket has been closed it returns an error (not a timeout) and we exit.
+  final timeout = calloc<ffi.Uint8>(4);
+  timeout.cast<ffi.Uint32>().value = 500; // milliseconds
+  ws.setsockopt(socket, solSocket, soRcvTimeo, timeout, 4);
+  calloc.free(timeout);
   final buf = calloc<ffi.Uint8>(_recvBufSize);
   try {
     while (true) {
       final n = ws.recv(socket, buf, _recvBufSize, 0);
-      if (n <= 0) break;
-      final bytes = Uint8List.fromList(buf.asTypedList(n));
-      sendPort.send(TransferableTypedData.fromList([bytes]));
+      if (n > 0) {
+        final bytes = Uint8List.fromList(buf.asTypedList(n));
+        sendPort.send(TransferableTypedData.fromList([bytes]));
+        continue;
+      }
+      if (n == 0) break; // peer closed the connection (clean EOF)
+      // n < 0 (SOCKET_ERROR): a recv timeout just means "no data yet" — keep
+      // waiting. Any other error (socket closed by close(), reset, …) is EOF.
+      if (ws.wsaGetLastError() == wsaeTimedOut) continue;
+      break;
     }
   } catch (_) {
     // fall through to EOF
   } finally {
     calloc.free(buf);
+    ws.wsaCleanup(); // balance this isolate's WSAStartup
     sendPort.send(null); // signal closed
   }
 }
@@ -405,14 +406,15 @@ void _recvEntry(List<Object?> args) {
 void _writeEntry(List<Object?> args) {
   final socket = args[0] as int;
   final mainPort = args[1] as SendPort;
-  // No WSAStartup/WSACleanup: Winsock is initialised process-wide by the main
-  // isolate and stays up for the process lifetime.
-  final ws = WinsockBindings();
+  // This isolate calls send(), so it needs its own WSAStartup (Winsock init does
+  // not carry across Dart isolates); balanced by the wsaCleanup on shutdown.
+  final ws = WinsockBindings()..startup();
   final rp = ReceivePort();
   mainPort.send(rp.sendPort);
   rp.listen((msg) {
     if (msg == null) {
       rp.close();
+      ws.wsaCleanup(); // balance this isolate's WSAStartup on shutdown
       return;
     }
     final rec = msg as List<Object?>;
