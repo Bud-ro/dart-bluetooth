@@ -71,12 +71,24 @@ void main() {
     expect(serial.chunkSize, 97);
   });
 
-  test('write after close throws', () async {
+  test('write after close returns an errored future (no sync throw)', () async {
     final (_, _, serial) = await openSerial();
     await serial.close();
-    expect(
-      () => serial.write(Uint8List.fromList([1])),
+    // Returns an errored future rather than throwing synchronously...
+    await expectLater(
+      serial.write(Uint8List.fromList([1])),
       throwsA(isA<BleGattException>()),
     );
+    // ...so add() stays truly fire-and-forget on a closed serial.
+    expect(() => serial.add(Uint8List.fromList([1])), returnsNormally);
+  });
+
+  test('negotiateMtu clamps chunkSize back down for a small MTU', () async {
+    final (_, _, serial) = await openSerial();
+    await serial.negotiateMtu(100);
+    expect(serial.chunkSize, 97);
+    // The fake clamps MTU to >=23, so a tiny request yields 23 -> chunkSize 20.
+    await serial.negotiateMtu(10);
+    expect(serial.chunkSize, 20);
   });
 }

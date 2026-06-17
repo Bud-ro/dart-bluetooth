@@ -59,8 +59,10 @@ class BleSerial {
       .subscribe(service, notifyCharacteristic)
       .asBroadcastStream();
 
-  /// Requests a larger MTU and updates [chunkSize] accordingly (ATT header is 3
-  /// bytes). Returns the negotiated MTU.
+  /// Updates [chunkSize] from the connection's usable ATT MTU (header is 3
+  /// bytes) and returns that MTU. Most platforms negotiate the MTU automatically
+  /// and ignore the requested [mtu]; only Android honours an explicit request,
+  /// and Windows is fixed at the ATT default (so chunkSize stays 20 there).
   Future<int> negotiateMtu([int mtu = 247]) async {
     final negotiated = await _conn.requestMtu(mtu);
     // Always (re)set chunkSize so a later small MTU can't leave a stale large

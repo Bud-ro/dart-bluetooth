@@ -341,7 +341,15 @@ BLE_EXPORT void ble_and_write(int64_t req_id, int64_t conn_token,
   jstring jsvc = (*env)->NewStringUTF(env, service);
   jstring jchr = (*env)->NewStringUTF(env, characteristic);
   jbyteArray arr = (*env)->NewByteArray(env, len);
-  if (arr && len > 0) {
+  if (!arr) {
+    // OOM: don't pass null to Kotlin's non-null ByteArray param (would NPE and
+    // leave the Dart op hung). Leave it to be torn down / time out.
+    clear_pending(env);
+    (*env)->DeleteLocalRef(env, jsvc);
+    (*env)->DeleteLocalRef(env, jchr);
+    return;
+  }
+  if (len > 0) {
     (*env)->SetByteArrayRegion(env, arr, 0, len, (const jbyte *)data);
   }
   (*env)->CallStaticVoidMethod(env, g_class, m, (jlong)req_id,

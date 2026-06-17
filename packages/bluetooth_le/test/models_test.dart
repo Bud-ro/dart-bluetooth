@@ -35,8 +35,38 @@ void main() {
         'AA:BB:CC:DD:EE:FF',
       );
       expect(DeviceId.address('aabbccddeeff').address, 'AA:BB:CC:DD:EE:FF');
+      expect(
+        DeviceId.address('AA-BB-CC-DD-EE-FF').address,
+        'AA:BB:CC:DD:EE:FF',
+      );
+      expect(
+        DeviceId.address('  aa:bb:cc:dd:ee:ff  ').address,
+        'AA:BB:CC:DD:EE:FF',
+      );
       expect(const DeviceId.opaque('x').isAddress, isFalse);
       expect(() => const DeviceId.opaque('x').address, throwsStateError);
+    });
+
+    test('rejects malformed addresses', () {
+      expect(() => DeviceId.address('not-an-address'), throwsFormatException);
+      expect(() => DeviceId.address('aabbccddee'), throwsFormatException);
+      expect(
+        () => DeviceId.address('gg:bb:cc:dd:ee:ff'),
+        throwsFormatException,
+      );
+      expect(() => DeviceId.address('aa:bb:cc:dd:ee'), throwsFormatException);
+      expect(() => DeviceId.address(''), throwsFormatException);
+    });
+
+    test('equality distinguishes address vs opaque with the same value', () {
+      expect(
+        DeviceId.address('AA:BB:CC:DD:EE:FF'),
+        equals(DeviceId.address('aa:bb:cc:dd:ee:ff')),
+      );
+      expect(
+        const DeviceId.opaque('AA:BB:CC:DD:EE:FF'),
+        isNot(equals(DeviceId.address('AA:BB:CC:DD:EE:FF'))),
+      );
     });
   });
 

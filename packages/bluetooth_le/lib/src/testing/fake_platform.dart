@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../exceptions.dart';
 import '../models/ble_device.dart';
 import '../models/ble_service.dart';
 import '../models/device_id.dart';
@@ -168,7 +169,7 @@ class FakeGattConnection implements GattConnection {
     Uint8List value, {
     bool withoutResponse = false,
   }) async {
-    if (_closed) throw const BleGattClosed();
+    if (_closed) throw const BleGattException('GATT connection is closed');
     writes.add((
       characteristic: characteristic,
       value: Uint8List.fromList(value),
@@ -204,11 +205,4 @@ class FakeGattConnection implements GattConnection {
       if (!c.isClosed) await c.close();
     }
   }
-}
-
-/// Thrown by the fake when writing after close (mirrors a closed real transport).
-class BleGattClosed implements Exception {
-  const BleGattClosed();
-  @override
-  String toString() => 'GATT connection is closed';
 }

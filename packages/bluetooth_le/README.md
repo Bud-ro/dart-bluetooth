@@ -7,9 +7,10 @@ Cross-platform **Bluetooth Low Energy (GATT)** for Dart and Flutter — with a
 **Flutter** apps. A CLI-capable alternative to `universal_ble`, focused on using
 a GATT characteristic pair like a serial port.
 
-> Status: **in development.** Phase 1 (the pure-Dart core + serial abstraction +
-> test fake) is done; native backends are landing one per iteration. See
-> [`DESIGN.md`](DESIGN.md).
+> Status: **in development.** The pure-Dart core, the serial abstraction, the
+> test fake, and all four native backends (macOS/iOS, Linux, Android, Windows)
+> are implemented; the native paths are pending broader on-device validation.
+> See [`DESIGN.md`](DESIGN.md).
 
 ```dart
 import 'dart:typed_data';
@@ -39,15 +40,25 @@ for Flutter apps and re-exports the API.
 | macOS / iOS | CoreBluetooth via an Obj-C C-ABI wrapper + `dart:ffi` | native-assets hook (iOS works for non-MFi devices) |
 | Linux | BlueZ GATT over D-Bus (`package:dbus`) | pure Dart |
 | Android | `BluetoothGatt` via Kotlin + C JNI shim | `bluetooth_le_flutter` |
-| Windows | Win32 GATT C API via `dart:ffi` | pure Dart (paired devices; unpaired scan is a WinRT follow-up) |
+| Windows | Win32 GATT C API via `dart:ffi` | pure Dart — **paired devices only** |
+
+**Windows limits (Win32 GATT FFI):** connect/read/write/discover work for
+already-paired devices, but the Win32 path has **no unpaired-advertisement scan**
+(`startScan` throws — pairing + scanning is a WinRT follow-up) and **no
+notifications** (`subscribe` throws), so `asSerial().input` (the serial RX path)
+is unavailable on Windows. TX (write) works; pair the device in Windows settings,
+then connect by address. Notifications need a small native shim (a future
+enhancement). All other platforms support the full GATT-as-serial flow.
 
 ## GATT-as-serial
 
 `BleConnection.asSerial({service, writeCharacteristic, notifyCharacteristic})`
 returns a `BleSerial`: `input` (a `Stream<Uint8List>` of notifications) plus
 `add`/`write`/`flush` (writes chunked to the ATT payload, serialised to preserve
-order). Defaults to the Nordic UART Service. Call `negotiateMtu()` to raise
-throughput.
+order). Defaults to the Nordic UART Service. `negotiateMtu()` updates the chunk
+size from the connection's usable MTU — note the OS negotiates the MTU
+automatically on most platforms (only Android honours an explicit request;
+Windows is fixed at the 23-byte default).
 
 ## Testing without hardware
 

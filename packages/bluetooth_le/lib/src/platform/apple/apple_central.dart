@@ -24,7 +24,15 @@ import 'apple_bindings.dart';
 /// Full GATT central: adapter state, scanning, connect, service discovery, and
 /// characteristic read/write/subscribe/MTU are all wired.
 class AppleBleCentral extends BleCentralPlatform {
-  AppleBleCentral() {
+  // The native CoreBluetooth layer is a process singleton (one central manager,
+  // one set of registered callbacks), so the Dart backend is too: constructing
+  // it more than once returns the same instance. This keeps the static
+  // connection/scan/op state single-owner — `dispose()` on "one" central can't
+  // tear down another's connections.
+  factory AppleBleCentral() => _instance ??= AppleBleCentral._();
+  static AppleBleCentral? _instance;
+
+  AppleBleCentral._() {
     bleRegister(
       _scanCb.nativeFunction,
       _stateCb.nativeFunction,
@@ -76,6 +84,14 @@ class AppleBleCentral extends BleCentralPlatform {
     late StreamController<BleScanResult> controller;
     controller = StreamController<BleScanResult>.broadcast(
       onListen: () {
+        // CoreBluetooth runs a single scan; reject a second concurrent one with
+        // a clear error rather than silently replacing the first.
+        if (_scanController != null && !_scanController!.isClosed) {
+          controller.addError(
+            const BleScanException('a scan is already in progress'),
+          );
+          return;
+        }
         _scanController = controller;
         _scanToken = token;
         final csv = (withServices == null || withServices.isEmpty)
@@ -430,19 +446,26 @@ class AppleGattConnection implements GattConnection {
   @override
   Stream<Uint8List> subscribe(Uuid service, Uuid characteristic) {
     final key = '${service.value}|${characteristic.value}';
-    late StreamController<Uint8List> controller;
-    controller = StreamController<Uint8List>.broadcast(
-      onListen: () {
-        _notifyControllers[key] = controller;
-        _setNotify(service, characteristic, enable: true);
-        logGatt.fine(() => 'subscribe ${characteristic.value} conn $_token');
-      },
-      onCancel: () {
-        _setNotify(service, characteristic, enable: false);
-        _notifyControllers.remove(key);
-        if (!controller.isClosed) controller.close();
-      },
-    );
+    // One shared broadcast controller per characteristic: every subscriber gets
+    // the same stream, so notifications fan out to all. The broadcast
+    // onListen/onCancel fire on the first/last listener across all subscribers,
+    // giving enable-on-first / disable-on-last for free.
+    final controller = _notifyControllers.putIfAbsent(key, () {
+      late StreamController<Uint8List> c;
+      c = StreamController<Uint8List>.broadcast(
+        onListen: () {
+          _setNotify(service, characteristic, enable: true);
+          logGatt.fine(() => 'subscribe ${characteristic.value} conn $_token');
+        },
+        onCancel: () {
+          _setNotify(service, characteristic, enable: false);
+          // Drop the (now listener-less) controller so a later subscribe starts
+          // a fresh one; teardown closes any that remain.
+          _notifyControllers.remove(key);
+        },
+      );
+      return c;
+    });
     return controller.stream;
   }
 

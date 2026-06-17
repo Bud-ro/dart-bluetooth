@@ -25,7 +25,11 @@ abstract class BleCentralPlatform {
 
   Future<BluetoothAdapterState> adapterState();
 
-  /// Adapter-state changes; emits the current state on listen.
+  /// Adapter-state stream. Always emits the current state on listen. Live
+  /// transition events are emitted by the Linux (BlueZ) backend; macOS, iOS,
+  /// Android and Windows currently emit the current state once (continuous
+  /// change events on those platforms are a future enhancement). Use
+  /// [adapterState] for a one-shot snapshot.
   Stream<BluetoothAdapterState> adapterStateChanges();
 
   Future<void> setAdapterEnabled(bool enabled);
@@ -69,7 +73,9 @@ abstract class GattConnection {
   /// values the peripheral pushes. Cancelling the subscription disables them.
   Stream<Uint8List> subscribe(Uuid service, Uuid characteristic);
 
-  /// Requests a larger ATT MTU; returns the negotiated MTU.
+  /// Returns the usable ATT MTU. Most platforms negotiate the MTU automatically
+  /// and ignore the requested [mtu] (reporting the auto-negotiated value);
+  /// Android honours an explicit request. Windows reports the ATT default (23).
   Future<int> requestMtu(int mtu);
 
   /// Closes the connection. Idempotent.

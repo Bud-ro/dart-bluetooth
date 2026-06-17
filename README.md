@@ -10,8 +10,8 @@ core.
 | --- | --- | --- |
 | [`bluetooth_rfcomm`](packages/bluetooth_rfcomm) | implemented | Bluetooth Classic RFCOMM serial (read/write `Uint8List`). The full API + Windows, Linux and macOS backends. Pure Dart — CLI and Flutter desktop. |
 | [`bluetooth_rfcomm_flutter`](packages/bluetooth_rfcomm_flutter) | implemented | Flutter plugin that adds the Android (and Apple) native builds for `bluetooth_rfcomm`. Add it to a Flutter app targeting Android/iOS. |
-| [`bluetooth_le`](packages/bluetooth_le) | in development | Bluetooth Low Energy (GATT) with a GATT-as-serial channel; the path for non-MFi devices on iOS. Pure-Dart core done; native backends landing per iteration. |
-| `bluetooth_le_flutter` | planned | Flutter plugin companion for `bluetooth_le` (Android native build; same split as above). |
+| [`bluetooth_le`](packages/bluetooth_le) | in development | Bluetooth Low Energy (GATT) with a GATT-as-serial channel; the path for non-MFi devices on iOS. Pure-Dart core + all four native backends implemented (pending broader on-device validation). |
+| [`bluetooth_le_flutter`](packages/bluetooth_le_flutter) | in development | Flutter plugin companion for `bluetooth_le` (Android native build; same split as above). |
 
 ## Why the split
 

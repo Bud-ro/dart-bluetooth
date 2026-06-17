@@ -42,7 +42,9 @@ class BleCentral {
     return state;
   }
 
-  /// Adapter-state changes. Broadcast; emits the current state on listen.
+  /// Adapter-state stream. Emits the current state on listen; live transition
+  /// events are emitted on Linux today, while macOS/iOS/Android/Windows emit the
+  /// current state once (see [BleCentralPlatform.adapterStateChanges]).
   Stream<BluetoothAdapterState> get adapterStateChanges =>
       _platform.adapterStateChanges().map((s) {
         logAdapter.fine(() => 'adapter -> ${s.name}');

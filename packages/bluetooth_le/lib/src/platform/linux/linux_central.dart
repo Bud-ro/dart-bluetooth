@@ -416,8 +416,6 @@ class LinuxGattConnection implements GattConnection {
       }
     });
     final device = _obj(_devicePath);
-    // BlueZ's Connect blocks until the link is up and services are resolved, so
-    // there's no separate ServicesResolved wait needed once it returns.
     final connect = device.callMethod(
       _deviceIface,
       'Connect',
@@ -430,6 +428,10 @@ class LinuxGattConnection implements GattConnection {
       } else {
         await connect;
       }
+      // BlueZ's Connect usually returns once services are resolved, but for
+      // cached/re-connected devices ServicesResolved can briefly lag — making
+      // the first discoverServices() see an empty tree. Wait for it (bounded).
+      await _awaitServicesResolved(timeout);
     } on TimeoutException {
       unawaited(close());
       throw BleTimeoutException('connect timed out', timeout: timeout);
@@ -438,7 +440,41 @@ class LinuxGattConnection implements GattConnection {
       _deviceSub = null;
       _mapDbus(e, 'connect');
     }
+    // A disconnect that fired during the handshake already tore us down; don't
+    // resurrect a dead link as "connected".
+    if (_closed || _current == BleConnectionState.disconnected) {
+      throw const BleConnectionException('disconnected during connect');
+    }
     _setState(BleConnectionState.connected);
+  }
+
+  Future<void> _awaitServicesResolved(Duration? timeout) async {
+    final device = _obj(_devicePath);
+    try {
+      final resolved = await device
+          .getProperty(_deviceIface, 'ServicesResolved')
+          .timeout(LinuxBleCentral._busTimeout);
+      if (resolved is DBusBoolean && resolved.value) return;
+    } catch (_) {
+      return; // property absent / bus issue — discoverServices lazy-resolves
+    }
+    final done = Completer<void>();
+    final sub = device.propertiesChanged.listen((sig) {
+      if (sig.propertiesInterface != _deviceIface) return;
+      final r = sig.changedProperties['ServicesResolved'];
+      if (r is DBusBoolean && r.value && !done.isCompleted) done.complete();
+      final c = sig.changedProperties['Connected'];
+      if (c is DBusBoolean && !c.value && !done.isCompleted) {
+        done.complete(); // disconnect; the device watch handles teardown
+      }
+    });
+    try {
+      await done.future.timeout(timeout ?? LinuxBleCentral._busTimeout);
+    } on TimeoutException {
+      // Proceed; discoverServices() lazy-resolves and surfaces a clear error.
+    } finally {
+      await sub.cancel();
+    }
   }
 
   @override

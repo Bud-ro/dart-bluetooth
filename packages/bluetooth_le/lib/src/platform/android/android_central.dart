@@ -29,7 +29,14 @@ import 'android_bindings.dart';
 /// All BluetoothGatt operations are non-blocking and complete via callbacks, so
 /// (unlike the RFCOMM Android socket path) no helper isolate is needed.
 class AndroidBleCentral extends BleCentralPlatform {
-  AndroidBleCentral() : _lib = AndroidBindings.open() {
+  // The native JNI layer is a process singleton (one registered callback set,
+  // one JVM bridge), so the Dart backend is too: constructing it more than once
+  // returns the same instance, keeping the static connection/scan/op state
+  // single-owner.
+  factory AndroidBleCentral() => _instance ??= AndroidBleCentral._();
+  static AndroidBleCentral? _instance;
+
+  AndroidBleCentral._() : _lib = AndroidBindings.open() {
     _activeLib = _lib;
     _lib.register(
       _scanCb.nativeFunction,
@@ -91,6 +98,14 @@ class AndroidBleCentral extends BleCentralPlatform {
     late StreamController<BleScanResult> controller;
     controller = StreamController<BleScanResult>.broadcast(
       onListen: () {
+        // One active scan at a time; reject a second concurrent one clearly
+        // rather than silently replacing the first.
+        if (_scanController != null && !_scanController!.isClosed) {
+          controller.addError(
+            const BleScanException('a scan is already in progress'),
+          );
+          return;
+        }
         _scanController = controller;
         _scanToken = token;
         final csv = (withServices == null || withServices.isEmpty)
@@ -447,31 +462,41 @@ class AndroidGattConnection implements GattConnection {
   @override
   Stream<Uint8List> subscribe(Uuid service, Uuid characteristic) {
     final key = '${service.value}|${characteristic.value}';
-    late StreamController<Uint8List> controller;
-    controller = StreamController<Uint8List>.broadcast(
-      onListen: () {
-        _notifyControllers[key] = controller;
-        _setNotify(service, characteristic, enable: true);
-        logGatt.fine(() => 'subscribe ${characteristic.value} conn $_token');
-      },
-      onCancel: () {
-        _setNotify(service, characteristic, enable: false);
-        _notifyControllers.remove(key);
-        if (!controller.isClosed) controller.close();
-      },
-    );
+    // Shared broadcast controller per characteristic (enable-on-first /
+    // disable-on-last across all subscribers; notifications fan out to all).
+    final controller = _notifyControllers.putIfAbsent(key, () {
+      late StreamController<Uint8List> c;
+      c = StreamController<Uint8List>.broadcast(
+        onListen: () {
+          _setNotify(service, characteristic, enable: true);
+          logGatt.fine(() => 'subscribe ${characteristic.value} conn $_token');
+        },
+        onCancel: () {
+          _setNotify(service, characteristic, enable: false);
+          _notifyControllers.remove(key);
+        },
+      );
+      return c;
+    });
     return controller.stream;
   }
 
   void _setNotify(Uuid service, Uuid characteristic, {required bool enable}) {
-    final sPtr = service.value.toNativeUtf8();
-    final cPtr = characteristic.value.toNativeUtf8();
-    try {
-      _lib.subscribe(_token, sPtr.cast(), cPtr.cast(), enable ? 1 : 0);
-    } finally {
-      calloc.free(sPtr);
-      calloc.free(cPtr);
-    }
+    // Route the CCCD write through the op chain: Android allows only one
+    // outstanding GATT op, so issuing it directly could collide with an
+    // in-flight read/write/discover and silently never start notifications.
+    unawaited(
+      _enqueue(() async {
+        final sPtr = service.value.toNativeUtf8();
+        final cPtr = characteristic.value.toNativeUtf8();
+        try {
+          _lib.subscribe(_token, sPtr.cast(), cPtr.cast(), enable ? 1 : 0);
+        } finally {
+          calloc.free(sPtr);
+          calloc.free(cPtr);
+        }
+      }),
+    );
   }
 
   @override
