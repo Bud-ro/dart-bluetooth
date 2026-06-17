@@ -34,6 +34,11 @@ class LinuxBleCentral extends BleCentralPlatform {
   static const String _propsIface = 'org.freedesktop.DBus.Properties';
   static const String _omIface = 'org.freedesktop.DBus.ObjectManager';
 
+  // Backstop so a wedged or absent D-Bus / BlueZ can never hang adapter or scan
+  // control calls forever (a missing org.bluez may otherwise block on bus
+  // service activation). Normal calls resolve in milliseconds.
+  static const Duration _busTimeout = Duration(seconds: 10);
+
   DBusObjectPath get _adapterPath => DBusObjectPath('/org/bluez/$_adapterName');
 
   DBusRemoteObject _obj(DBusObjectPath path) =>
@@ -42,7 +47,9 @@ class LinuxBleCentral extends BleCentralPlatform {
   @override
   Future<bool> isSupported() async {
     try {
-      await _obj(_adapterPath).getProperty(_adapterIface, 'Address');
+      await _obj(
+        _adapterPath,
+      ).getProperty(_adapterIface, 'Address').timeout(_busTimeout);
       return true;
     } catch (_) {
       return false;
@@ -56,7 +63,7 @@ class LinuxBleCentral extends BleCentralPlatform {
     try {
       final powered = await _obj(
         _adapterPath,
-      ).getProperty(_adapterIface, 'Powered');
+      ).getProperty(_adapterIface, 'Powered').timeout(_busTimeout);
       if (powered is DBusBoolean) {
         return powered.value
             ? BluetoothAdapterState.on
@@ -170,10 +177,14 @@ class LinuxBleCentral extends BleCentralPlatform {
           withServices.map((u) => u.value).toList(),
         );
       }
-      await _obj(_adapterPath).callMethod(_adapterIface, 'SetDiscoveryFilter', [
-        DBusDict.stringVariant(filter),
-      ], replySignature: DBusSignature(''));
-      await _obj(_adapterPath).callMethod(_adapterIface, 'StartDiscovery', []);
+      await _obj(_adapterPath)
+          .callMethod(_adapterIface, 'SetDiscoveryFilter', [
+            DBusDict.stringVariant(filter),
+          ], replySignature: DBusSignature(''))
+          .timeout(_busTimeout);
+      await _obj(
+        _adapterPath,
+      ).callMethod(_adapterIface, 'StartDiscovery', []).timeout(_busTimeout);
       logScan.fine('scan started');
     }
 
@@ -197,9 +208,11 @@ class LinuxBleCentral extends BleCentralPlatform {
   @override
   Future<void> stopScan() async {
     try {
-      await _obj(_adapterPath).callMethod(_adapterIface, 'StopDiscovery', []);
+      await _obj(
+        _adapterPath,
+      ).callMethod(_adapterIface, 'StopDiscovery', []).timeout(_busTimeout);
     } catch (_) {
-      // Not scanning — ignore.
+      // Not scanning / wedged bus — ignore.
     }
   }
 

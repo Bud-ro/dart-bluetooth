@@ -332,3 +332,84 @@ jobs:
           flutter create --platforms=windows --org lol.carson .
           flutter pub get
           flutter build windows --debug
+
+  # BLE Flutter Apple: macOS build + launch smoke (loads the CoreBluetooth code
+  # asset built by bluetooth_le's native-assets hook); iOS build-only. This is
+  # what validates Flutter builds the BLE Apple code asset for both targets.
+  build-apple-le:
+    timeout-minutes: 30
+    name: flutter apple le (build + launch)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
+      - name: build + launch macOS
+        working-directory: ${{ env.EXAMPLE_LE }}
+        run: |
+          flutter create --platforms=macos --org lol.carson .
+          flutter pub get
+          flutter build macos --debug
+          flutter test integration_test/app_launch_test.dart -d macos
+      - name: build iOS (no codesign)
+        working-directory: ${{ env.EXAMPLE_LE }}
+        run: |
+          flutter create --platforms=ios --org lol.carson .
+          flutter pub get
+          flutter build ios --debug --no-codesign
+
+  # BLE Flutter Linux: build + headless launch smoke (xvfb) — loads the BlueZ
+  # D-Bus backend.
+  build-linux-le:
+    timeout-minutes: 20
+    name: flutter linux le (build + launch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtk-3-dev libdbus-1-dev xvfb
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
+      - name: generate runners + build
+        working-directory: ${{ env.EXAMPLE_LE }}
+        run: |
+          flutter create --platforms=linux --org lol.carson .
+          flutter pub get
+          flutter build linux --debug
+      - name: launch smoke (xvfb)
+        working-directory: ${{ env.EXAMPLE_LE }}
+        run: xvfb-run -a flutter test integration_test/app_launch_test.dart -d linux
+
+  # BLE Flutter Windows: build only. The Windows backend is pure FFI to system
+  # DLLs; the FFI struct ABI is pinned by the windows_ffi byte-layout tests in the
+  # `dart ble (windows-latest)` job. `flutter test integration_test` mis-reports
+  # on Windows desktop, so a launch smoke is intentionally dropped.
+  build-windows-le:
+    timeout-minutes: 25
+    name: flutter windows le (build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: generate runners + build
+        working-directory: ${{ env.EXAMPLE_LE }}
+        run: |
+          flutter create --platforms=windows --org lol.carson .
+          flutter pub get
+          flutter build windows --debug

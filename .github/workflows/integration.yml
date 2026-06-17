@@ -16,6 +16,8 @@ env:
   FLUTTER_VERSION: "3.44.0"
   PKG: packages/bluetooth_rfcomm
   EXAMPLE: packages/bluetooth_rfcomm_flutter/example
+  PKG_LE: packages/bluetooth_le
+  EXAMPLE_LE: packages/bluetooth_le_flutter/example
 
 jobs:
   # Desktop (Windows/Winsock, Linux/BlueZ, macOS/IOBluetooth) via pure Dart — no
@@ -112,4 +114,108 @@ jobs:
           flutter pub get
       - name: real-backend integration tests on simulator
         working-directory: ${{ env.EXAMPLE }}
+        run: flutter test integration_test/headless_behavior_test.dart -d "$SIM_UDID"
+
+  # === BLE (bluetooth_le) real-backend integration ========================
+
+  # Desktop BLE (macOS/CoreBluetooth, Linux/BlueZ, Windows/Win32 GATT) via pure
+  # Dart. Drives the real native path with no device present, asserting calls
+  # return cleanly or throw domain exceptions (incl. Windows scan-unsupported and
+  # absent-device connect). `dart test` builds the macOS code asset itself.
+  desktop-le:
+    timeout-minutes: 20
+    name: integration ble ${{ matrix.os }} (real backend)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: linux bluez deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev bluez
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: pub get
+        working-directory: ${{ env.PKG_LE }}
+        run: dart pub get
+      - name: real-backend integration tests (headless)
+        working-directory: ${{ env.PKG_LE }}
+        run: dart test integration
+
+  # Android BLE via the Flutter example on an emulator. Loads the JNI/Kotlin
+  # BluetoothGatt backend and exercises the same assertions.
+  android-le:
+    timeout-minutes: 30
+    name: integration ble android (emulator, real backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: generate android runner + pub get
+        working-directory: ${{ env.EXAMPLE_LE }}
+        run: |
+          flutter create --platforms=android --org lol.carson .
+          flutter pub get
+      - name: real-backend integration tests on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          working-directory: ${{ env.EXAMPLE_LE }}
+          script: flutter test integration_test/headless_behavior_test.dart -d emulator-5554
+
+  # iOS BLE via the Flutter example on a simulator. The simulator has no
+  # Bluetooth, so this confirms the CoreBluetooth backend loads and that calls
+  # fail with domain exceptions. Native code is built as an iOS-simulator code
+  # asset by the hook.
+  ios-le:
+    timeout-minutes: 35
+    name: integration ble ios (simulator, real backend)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
+      - name: boot iOS simulator
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; ids=[x['udid'] for v in d.values() for x in v if 'iPhone' in x['name']]; print(ids[0])")
+          echo "Booting simulator $UDID"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID"
+          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
+      - name: generate ios runner + pub get
+        working-directory: ${{ env.EXAMPLE_LE }}
+        run: |
+          flutter create --platforms=ios --org lol.carson .
+          flutter pub get
+      - name: real-backend integration tests on simulator
+        working-directory: ${{ env.EXAMPLE_LE }}
         run: flutter test integration_test/headless_behavior_test.dart -d "$SIM_UDID"
