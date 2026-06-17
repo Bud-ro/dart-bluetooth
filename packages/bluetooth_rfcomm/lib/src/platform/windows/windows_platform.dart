@@ -248,6 +248,7 @@ class _RawDevice {
     this.connected,
     this.remembered,
     this.authenticated,
+    this.lastSeen,
   );
   final int addr;
   final String name;
@@ -255,7 +256,17 @@ class _RawDevice {
   final bool connected;
   final bool remembered;
   final bool authenticated;
+
+  /// `BLUETOOTH_DEVICE_INFO.stLastSeen` as UTC, or null if unset. An inquiry
+  /// refreshes this for devices that actually respond, so it's how we tell a
+  /// device seen *now* from a cached pairing that didn't answer.
+  final DateTime? lastSeen;
 }
+
+/// How recently a device must have been seen to count as "discovered" during an
+/// inquiry. The inquiry window is ~10s; this is generous enough to keep every
+/// responding device while excluding pairings last seen minutes/hours/days ago.
+const Duration _discoveryFreshness = Duration(seconds: 60);
 
 List<_RawDevice> _enumerateDevices({
   bool remembered = false,
@@ -290,6 +301,22 @@ List<_RawDevice> _enumerateDevices({
     } finally {
       ws.findDeviceClose(find);
     }
+    if (inquiry) {
+      // BluetoothFindFirstDevice returns ALL remembered (paired) devices even
+      // after a real inquiry, regardless of whether they answered. Keep only
+      // those actually seen during/just-before this inquiry, so "discovered"
+      // means "nearby" rather than "ever paired". Fail open when the timestamp
+      // is missing or implausible (clock skew) so a present device is never
+      // wrongly dropped.
+      final now = DateTime.now().toUtc();
+      out.removeWhere((d) {
+        final ls = d.lastSeen;
+        if (ls == null) return false;
+        final age = now.difference(ls);
+        if (age.isNegative) return false;
+        return age > _discoveryFreshness;
+      });
+    }
     return out;
   } finally {
     calloc.free(params);
@@ -317,7 +344,20 @@ _RawDevice _readDevice(BluetoothDeviceInfo info) {
     info.fConnected != 0,
     info.fRemembered != 0,
     info.fAuthenticated != 0,
+    _systemTimeToUtc(info.stLastSeen),
   );
+}
+
+/// Converts a Win32 `SYSTEMTIME` (8 WORDs: year, month, dayOfWeek, day, hour,
+/// minute, second, millisecond — in UTC) to a [DateTime], or null if unset.
+DateTime? _systemTimeToUtc(ffi.Array<ffi.Uint16> st) {
+  final year = st[0];
+  if (year == 0) return null; // unset / never seen
+  try {
+    return DateTime.utc(year, st[1], st[3], st[4], st[5], st[6], st[7]);
+  } catch (_) {
+    return null; // malformed -> treat as unknown (fail open)
+  }
 }
 
 /// A WSA error code, or -1 when the call failed but `WSAGetLastError()` was 0.
