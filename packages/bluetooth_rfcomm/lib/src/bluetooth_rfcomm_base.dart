@@ -205,18 +205,41 @@ class BluetoothRfcomm {
     Duration? scanInterval,
   }) {
     return Stream<List<BluetoothDevice>>.multi((controller) {
+      // Time from subscription to the first list actually delivered to this
+      // subscriber — this is "how long until your UI can paint the list". If
+      // this is ~0ms but the UI still lags, the delay is downstream of us.
+      final sw = Stopwatch()..start();
+      var firstDelivered = false;
+      void deliver(List<BluetoothDevice> list) {
+        if (!firstDelivered) {
+          firstDelivered = true;
+          logDiscovery.fine(
+            () =>
+                'bondedAndDiscoveredStream: first emission delivered to '
+                'subscriber after ${sw.elapsedMilliseconds}ms '
+                '(${list.length} device(s))',
+          );
+        }
+        controller.add(list);
+      }
+
       // Forward shared updates to this subscriber, then hand it the current
       // cached snapshot right away (only if we already have something, so a
       // fresh stream's `first` is a real sighting, not an empty list).
       final sub = _nearbyUpdates.stream.listen(
-        controller.add,
+        deliver,
         onError: controller.addError,
       );
       if (_nearby.isNotEmpty) {
-        controller.add(_nearby.values.toList(growable: false));
+        deliver(_nearby.values.toList(growable: false));
       }
       if (scanInterval != null) _scanInterval = scanInterval;
       _nearbyListeners++;
+      logDiscovery.fine(
+        () =>
+            'bondedAndDiscoveredStream: subscriber added '
+            '(listeners=$_nearbyListeners, cached=${_nearby.length})',
+      );
       _startNearbyScan();
       controller.onCancel = () {
         _nearbyListeners--;
@@ -246,7 +269,10 @@ class BluetoothRfcomm {
   }
 
   Future<void> _nearbyScanLoop() async {
+    logDiscovery.fine('nearby scan loop started');
+    var firstCycle = true;
     while (_nearbyListeners > 0) {
+      final cycleSw = Stopwatch()..start();
       final Map<DeviceId, BluetoothDevice> byId;
       try {
         byId = {for (final d in await bondedDevices()) d.id: d};
@@ -275,6 +301,14 @@ class BluetoothRfcomm {
         }
       }
       if (changed) _emitNearby();
+      if (firstCycle) {
+        firstCycle = false;
+        logDiscovery.fine(
+          () =>
+              'nearby scan: first cycle read+emitted ${_nearby.length} '
+              'device(s) in ${cycleSw.elapsedMilliseconds}ms',
+        );
+      }
 
       // Active inquiry only if explicitly requested (scanInterval) AND no connect
       // is in flight. Default is no inquiry at all — the radio stays free.
