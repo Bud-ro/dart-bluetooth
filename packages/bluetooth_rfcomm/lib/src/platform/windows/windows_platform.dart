@@ -86,6 +86,11 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
   Stream<BluetoothDiscoveryResult> startDiscovery() async* {
     // BluetoothFindFirstDevice with fIssueInquiry blocks for the inquiry window,
     // so we run it on a worker isolate and emit the results when it completes.
+    // The "is this device actually nearby?" filtering happens HERE on the main
+    // isolate (not in the worker) so every decision is visible to the app's log
+    // handler — the worker isolate can't reach package:logging.
+    logDiscovery.fine('inquiry starting (~10s window)');
+    final start = DateTime.now();
     final List<_RawDevice> raw;
     try {
       raw = await Isolate.run(
@@ -97,14 +102,55 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
       throw BluetoothDiscoveryException('inquiry failed', cause: e);
     }
     final now = DateTime.now();
+    final nowUtc = now.toUtc();
+    logDiscovery.fine(
+      () =>
+          'inquiry returned ${raw.length} raw device(s) in '
+          '${now.difference(start).inMilliseconds}ms; '
+          'filtering to those seen within ${_discoveryFreshness.inSeconds}s',
+    );
+    var kept = 0;
     for (final r in raw) {
       final device = _toDevice(r);
+      final ls = r.lastSeen;
+      // A paired device that did NOT answer this inquiry keeps its stale
+      // stLastSeen; one that answered has it refreshed to ~now. Fail open on a
+      // missing or future timestamp so a present device is never wrongly hidden.
+      final age = ls == null ? null : nowUtc.difference(ls);
+      final bool fresh;
+      final String reason;
+      if (ls == null) {
+        fresh = true;
+        reason = 'kept: no lastSeen reported (failing open)';
+      } else if (age!.isNegative) {
+        fresh = true;
+        reason = 'kept: lastSeen is in the future (clock skew, failing open)';
+      } else if (age <= _discoveryFreshness) {
+        fresh = true;
+        reason = 'kept: last seen ${age.inSeconds}s ago';
+      } else {
+        fresh = false;
+        reason =
+            'dropped: last seen ${age.inSeconds}s ago '
+            '(> ${_discoveryFreshness.inSeconds}s threshold)';
+      }
+      logDiscovery.finer(
+        () =>
+            'device "${device.name ?? '(unnamed)'}" ${device.id.address} '
+            'remembered=${r.remembered} connected=${r.connected} '
+            'lastSeen=${ls?.toIso8601String() ?? 'never'} -> $reason',
+      );
+      if (!fresh) continue;
+      kept++;
       yield BluetoothDiscoveryResult(
         device: device,
         rssi: device.rssi,
         timestamp: now,
       );
     }
+    logDiscovery.fine(
+      () => 'inquiry complete: $kept of ${raw.length} device(s) reported nearby',
+    );
   }
 
   @override
@@ -317,22 +363,10 @@ List<_RawDevice> _enumerateDevices({
     } finally {
       ws.findDeviceClose(find);
     }
-    if (inquiry) {
-      // BluetoothFindFirstDevice returns ALL remembered (paired) devices even
-      // after a real inquiry, regardless of whether they answered. Keep only
-      // those actually seen during/just-before this inquiry, so "discovered"
-      // means "nearby" rather than "ever paired". Fail open when the timestamp
-      // is missing or implausible (clock skew) so a present device is never
-      // wrongly dropped.
-      final now = DateTime.now().toUtc();
-      out.removeWhere((d) {
-        final ls = d.lastSeen;
-        if (ls == null) return false;
-        final age = now.difference(ls);
-        if (age.isNegative) return false;
-        return age > _discoveryFreshness;
-      });
-    }
+    // No nearby/stale filtering here: BluetoothFindFirstDevice returns ALL
+    // remembered (paired) devices even after a real inquiry, so the caller
+    // (startDiscovery, on the main isolate) decides which count as nearby using
+    // each device's stLastSeen — that way every keep/drop decision can be logged.
     return out;
   } finally {
     calloc.free(params);
