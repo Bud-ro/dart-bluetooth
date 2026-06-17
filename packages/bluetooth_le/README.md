@@ -2,15 +2,16 @@
 
 [![CI](https://github.com/Bud-ro/dart-bluetooth/actions/workflows/ci.yml/badge.svg)](https://github.com/Bud-ro/dart-bluetooth/actions/workflows/ci.yml)
 
-Cross-platform **Bluetooth Low Energy (GATT)** for Dart and Flutter — with a
-**GATT-as-serial** channel. Usable from a **pure-Dart CLI** (`dart run`) and from
-**Flutter** apps. A CLI-capable alternative to `universal_ble`, focused on using
-a GATT characteristic pair like a serial port.
+Cross-platform **Bluetooth Low Energy (GATT)** for Dart and Flutter. Scan,
+connect, discover services, read/write/subscribe to characteristics — and use a
+write+notify characteristic pair as a **serial channel** (the BLE analogue of an
+RFCOMM port, defaulting to the Nordic UART Service).
 
-> Status: **in development.** The pure-Dart core, the serial abstraction, the
-> test fake, and all four native backends (macOS/iOS, Linux, Android, Windows)
-> are implemented; the native paths are pending broader on-device validation.
-> See [`DESIGN.md`](DESIGN.md).
+This is a pure-Dart package: it runs from a command-line tool (`dart run`) and in
+Flutter desktop apps with no extra dependency. Linux, macOS and Windows are
+supported here directly. For **Android and iOS**, add the companion Flutter plugin
+[`bluetooth_le_flutter`](https://pub.dev/packages/bluetooth_le_flutter), which
+supplies the native build those platforms need and re-exports this same API.
 
 ```dart
 import 'dart:typed_data';
@@ -26,39 +27,135 @@ serial.input.listen((bytes) => print('rx: ${bytes.length}'));
 await serial.write(Uint8List.fromList('AT\r\n'.codeUnits));
 ```
 
-## The two packages
+## Support
 
-Same split as [`bluetooth_rfcomm`](../bluetooth_rfcomm): **`bluetooth_le`** is the
-pure-Dart core (full API + Windows/Linux/macOS backends, CLI-friendly);
-**`bluetooth_le_flutter`** (a Flutter plugin) supplies the Android native build
-for Flutter apps and re-exports the API.
+| Platform | Scan | Connect + read/write | Notifications |
+| --- | --- | --- | --- |
+| Linux | ✅ | ✅ | ✅ |
+| macOS | ✅ | ✅ | ✅ |
+| Android | ✅ | ✅ | ✅ |
+| iOS | ✅ | ✅ | ✅ |
+| Windows | ❌ | ✅ | ❌ |
 
-## Platform plan
+✅ supported · ⚠️ partial · ❌ not supported
 
-| Platform | Backend | Distribution |
-| --- | --- | --- |
-| macOS / iOS | CoreBluetooth via an Obj-C C-ABI wrapper + `dart:ffi` | native-assets hook (iOS works for non-MFi devices) |
-| Linux | BlueZ GATT over D-Bus (`package:dbus`) | pure Dart |
-| Android | `BluetoothGatt` via Kotlin + C JNI shim | `bluetooth_le_flutter` |
-| Windows | Win32 GATT C API via `dart:ffi` | pure Dart — **paired devices only** |
+Notes:
 
-**Windows limits (Win32 GATT FFI):** connect/read/write/discover work for
-already-paired devices, but the Win32 path has **no unpaired-advertisement scan**
-(`startScan` throws — pairing + scanning is a WinRT follow-up) and **no
-notifications** (`subscribe` throws), so `asSerial().input` (the serial RX path)
-is unavailable on Windows. TX (write) works; pair the device in Windows settings,
-then connect by address. Notifications need a small native shim (a future
-enhancement). All other platforms support the full GATT-as-serial flow.
+- **iOS / macOS** use a per-host opaque device identifier rather than a MAC
+  address (a CoreBluetooth peculiarity); treat `DeviceId` as an opaque token.
+- **Windows** currently uses the Win32 GATT API, which reaches already-paired
+  devices: connect, read, write and service discovery work, but it has no
+  unpaired-device scan and no notifications — so `asSerial().input` (the serial
+  receive path) is unavailable there. Pair the device in Windows settings, then
+  connect by address. Lifting these is the next step, planned via WinRT while
+  keeping the pure-Dart/CLI goal.
 
-## GATT-as-serial
+How each platform is reached: Linux via BlueZ over D-Bus (`package:dbus`); macOS
+and iOS via a CoreBluetooth wrapper; Windows via the Win32 GATT API; Android via a
+Kotlin `BluetoothGatt` + JNI bridge. Linux and Windows talk to system APIs
+directly (no build step); the Apple and Android native code builds automatically
+(a native-assets hook and the Flutter plugin's Gradle build, respectively).
 
-`BleConnection.asSerial({service, writeCharacteristic, notifyCharacteristic})`
-returns a `BleSerial`: `input` (a `Stream<Uint8List>` of notifications) plus
-`add`/`write`/`flush` (writes chunked to the ATT payload, serialised to preserve
-order). Defaults to the Nordic UART Service. `negotiateMtu()` updates the chunk
-size from the connection's usable MTU — note the OS negotiates the MTU
-automatically on most platforms (only Android honours an explicit request;
-Windows is fixed at the 23-byte default).
+## Install
+
+Command-line or Flutter desktop:
+
+```yaml
+dependencies:
+  bluetooth_le: ^0.1.0
+```
+
+Flutter app targeting Android/iOS — add the companion plugin too:
+
+```yaml
+dependencies:
+  bluetooth_le: ^0.1.0
+  bluetooth_le_flutter: ^0.1.0
+```
+
+## API
+
+`BleCentral` (use `.instance`, or construct with a `platform:` for tests):
+
+- `isSupported()`, `adapterState()`, `adapterStateChanges` (stream),
+  `setAdapterEnabled()` (where the OS permits)
+- `startScan({withServices})` → `Stream<BleScanResult>`, `stopScan()`
+- `connect(device, {timeout})` → `BleConnection`
+
+`BleConnection`:
+
+- `discoverServices()` → `List<BleService>`
+- `readCharacteristic(service, char)`, `writeCharacteristic(service, char, value,
+  {withoutResponse})`
+- `subscribe(service, char)` → `Stream<Uint8List>` (enables notifications while
+  listened)
+- `requestMtu(mtu)`, `stateChanges`, `state`, `close()`
+- `asSerial({service, writeCharacteristic, notifyCharacteristic})` → `BleSerial`
+
+### GATT-as-serial
+
+`asSerial()` returns a `BleSerial`: `input` (a `Stream<Uint8List>` of
+notifications) plus `add`/`write`/`flush` (writes chunked to the ATT payload and
+serialised to preserve order). It defaults to the Nordic UART Service.
+`negotiateMtu()` updates the chunk size from the connection's usable MTU — note
+the OS negotiates the MTU automatically on most platforms (only Android honours
+an explicit request; Windows is fixed at the 23-byte default).
+
+### Errors
+
+Every failure throws a subtype of `BleException`: `BleUnsupportedException`,
+`BlePermissionException`, `BleDisabledException`, `BleConnectionException`,
+`BleTimeoutException`, `DeviceNotFoundException`, `BleScanException`,
+`BleGattException`, `ServiceNotFoundException`, `CharacteristicNotFoundException`.
+`isTransient == true` marks failures worth retrying (connection, timeout,
+device-not-found).
+
+## Platform setup
+
+- **macOS / iOS** — add `NSBluetoothAlwaysUsageDescription` to the app's
+  `Info.plist`; sandboxed macOS apps need the
+  `com.apple.security.device.bluetooth` entitlement. Under `dart run`, the first
+  run triggers a TCC prompt.
+- **Android** — add `bluetooth_le_flutter` and request the runtime permissions
+  before scanning/connecting: `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT` on Android
+  12+ (API 31+), or location on older versions.
+- **Linux** — needs BlueZ + D-Bus (preinstalled on most desktops and Raspberry
+  Pi OS); the user must be in the `bluetooth` group.
+- **Windows** — pair the device in Windows settings first, then connect by
+  address (see the support note above).
+
+## Logging
+
+Logging goes through [`package:logging`](https://pub.dev/packages/logging). No
+handler is installed by default — nothing is emitted until you attach a listener
+and raise the level.
+
+Loggers (children of `bluetooth_le`, names in `BleLoggers`):
+
+| Logger | Covers |
+| --- | --- |
+| `bluetooth_le.scan` | scan start/stop and sightings |
+| `bluetooth_le.connection` | connect/disconnect and state changes |
+| `bluetooth_le.gatt` | service discovery, reads, writes, subscriptions |
+| `bluetooth_le.data` | raw bytes read/written (short hex preview) |
+| `bluetooth_le.adapter` | adapter power/authorization state |
+| `bluetooth_le.native` | diagnostics from the native backends |
+
+Raw bytes log at `FINEST`, lifecycle at `FINE`, and recoverable problems at
+`WARNING`/`SEVERE`.
+
+```dart
+import 'package:logging/logging.dart';
+
+Logger.root.level = Level.FINE;
+Logger.root.onRecord.listen((r) {
+  print('${r.level.name} ${r.loggerName}: ${r.message}');
+});
+```
+
+For per-subsystem levels, set `hierarchicalLoggingEnabled = true` and configure
+individual loggers (e.g. silence `BleLoggers.data` to drop raw bytes). Raw-byte
+messages are built lazily, so leaving that logger off costs nothing.
 
 ## Testing without hardware
 
@@ -69,8 +166,18 @@ final fake = FakeBleCentralPlatform();
 final ble = BleCentral(platform: fake);
 ```
 
-## Logging
+Real-backend integration tests (`integration/headless_test.dart` for desktop and
+the example's `integration_test/headless_behavior_test.dart` for mobile) drive
+the actual OS APIs with no hardware present, asserting that calls return cleanly
+or throw domain exceptions rather than crashing. They run live system services,
+so they are triggered manually (the **Integration** workflow), or locally with
+`dart test integration`.
 
-Via `package:logging` under `bluetooth_le.{scan,connection,gatt,data,adapter,native}`
-(names in `BleLoggers`). No handler installed by default; see the
-`bluetooth_rfcomm` README's Logging section for the same setup.
+## Status
+
+The Dart layer is implemented and unit-tested, and every backend compiles in CI.
+The native paths are pending broader validation against real hardware on each OS.
+
+## License
+
+BSD 3-Clause. See [LICENSE](LICENSE).

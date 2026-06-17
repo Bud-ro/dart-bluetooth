@@ -1,19 +1,32 @@
 # bluetooth_le_flutter
 
-Flutter plugin companion for [`bluetooth_le`](../bluetooth_le). It provides the
-native builds `bluetooth_le` needs on mobile and re-exports the same API — there
-is no separate Dart surface.
+[![CI](https://github.com/Bud-ro/dart-bluetooth/actions/workflows/ci.yml/badge.svg)](https://github.com/Bud-ro/dart-bluetooth/actions/workflows/ci.yml)
 
-## What it does
+The Flutter plugin for **Bluetooth Low Energy (GATT)**. It adds the native build
+that Android and iOS need and re-exports the
+[`bluetooth_le`](https://pub.dev/packages/bluetooth_le) API, so there is no
+separate Dart surface to learn.
 
-- **Android**: builds the Kotlin `BluetoothGatt` backend + its JNI C shim
-  (Gradle/CMake) into `libbluetooth_le_android.so` and bundles it into your APK.
-- **iOS / macOS**: the CoreBluetooth code asset is built from `bluetooth_le`'s
-  own native-assets hook (not declared here).
-- **Windows / Linux desktop**: no native build — pure Dart (Win32 GATT FFI /
-  BlueZ over D-Bus).
+[`bluetooth_le`](https://pub.dev/packages/bluetooth_le) is pure Dart and works on
+its own for Linux, macOS and Windows (command-line and Flutter desktop). Android
+needs a JVM + Gradle build for its Kotlin `BluetoothGatt` + JNI bridge, which
+can't ship as a Dart-only package — this plugin provides it and bundles the
+native library into your app. Add this plugin to any Flutter app that targets
+**Android or iOS**; desktop-only Flutter apps can depend on `bluetooth_le`
+directly.
 
-## Usage
+## Support
+
+| Platform | Scan | Connect + read/write | Notifications |
+| --- | --- | --- | --- |
+| Android | ✅ | ✅ | ✅ |
+| iOS | ✅ | ✅ | ✅ |
+
+✅ supported · ⚠️ partial · ❌ not supported
+
+(Linux, macOS and Windows are handled by the `bluetooth_le` core directly.)
+
+## Install
 
 ```yaml
 dependencies:
@@ -21,18 +34,25 @@ dependencies:
   bluetooth_le_flutter: ^0.1.0
 ```
 
+## Usage
+
+Import `bluetooth_le` and use it exactly as in a pure-Dart app:
+
 ```dart
 import 'package:bluetooth_le/bluetooth_le.dart';
-// or: import 'package:bluetooth_le_flutter/bluetooth_le_flutter.dart';
 
 final ble = BleCentral.instance;
+final hit = await ble.startScan(withServices: [Uuid.nordicUartService]).first;
+final conn = await ble.connect(hit.device);
+final serial = conn.asSerial();
 ```
 
-Use [`BleCentral`] exactly as in a pure-Dart app.
+The full API, the GATT-as-serial channel, platform setup (Android runtime
+permissions, iOS `Info.plist` keys), logging control, and the test fake are
+documented in the
+[`bluetooth_le` README](https://pub.dev/packages/bluetooth_le). A runnable Flutter
+demo is in [`example/`](example).
 
-## Android permissions
+## License
 
-The host app must request the runtime BLE permissions before scanning or
-connecting: `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT` on Android 12+ (API 31+),
-or location on older versions. The plugin declares them in its manifest, but the
-runtime grant is the app's responsibility.
+BSD 3-Clause. See [LICENSE](LICENSE).

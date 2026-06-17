@@ -8,13 +8,12 @@ A sibling to `bluetooth_rfcomm` for Bluetooth **Low Energy** (GATT). In progress
 - **`bluetooth_le_flutter`** — Flutter plugin providing the Android native build
   (Apple uses the core's native-assets hook); re-exports the core API.
 
-## vs. `universal_ble`
+## Goals
 
-`universal_ble` is the capable cross-platform BLE plugin, but it is **exclusively
-a Flutter plugin** (MethodChannel on every platform; no pure-Dart/CLI path). This
-package's differentiators: (1) **pure-Dart CLI** support alongside Flutter, and
-(2) a first-class **GATT-as-serial** channel — a duplex `Stream<Uint8List>` + sink
-over an RX(notify)/TX(write) characteristic pair (defaulting to the Nordic UART
+Two things shape the design: (1) **pure-Dart CLI** support alongside Flutter, so
+the same package runs under `dart run` and inside a Flutter app, and (2) a
+first-class **GATT-as-serial** channel — a duplex `Stream<Uint8List>` + sink over
+an RX(notify)/TX(write) characteristic pair (defaulting to the Nordic UART
 service), mirroring RFCOMM's `BluetoothConnection`. Raw GATT (read/write/notify)
 is also exposed for general use.
 
