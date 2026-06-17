@@ -169,12 +169,38 @@ jobs:
           flutter create --platforms=android --org lol.carson .
           flutter pub get
           flutter build apk --debug
+      # Cache a booted-emulator snapshot so the launch step restores in seconds
+      # instead of cold-booting (the cold boot is what intermittently times out).
+      - name: AVD cache
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-30-x86_64-default
+      - name: create AVD snapshot (on cache miss)
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          emulator-boot-timeout: 900
+          script: echo "AVD snapshot created."
       - name: launch smoke on emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 30
           arch: x86_64
-          target: google_apis
+          target: default
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          emulator-boot-timeout: 900
           working-directory: ${{ env.EXAMPLE }}
           script: flutter test integration_test/app_launch_test.dart -d emulator-5554
 
@@ -235,12 +261,38 @@ jobs:
           flutter create --platforms=android --org lol.carson .
           flutter pub get
           flutter build apk --debug
+      # Cache a booted-emulator snapshot so the launch step restores in seconds
+      # instead of cold-booting (the cold boot is what intermittently times out).
+      - name: AVD cache
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-30-x86_64-default
+      - name: create AVD snapshot (on cache miss)
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          emulator-boot-timeout: 900
+          script: echo "AVD snapshot created."
       - name: launch smoke on emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 30
           arch: x86_64
-          target: google_apis
+          target: default
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          emulator-boot-timeout: 900
           working-directory: ${{ env.EXAMPLE_LE }}
           script: flutter test integration_test/app_launch_test.dart -d emulator-5554
 
