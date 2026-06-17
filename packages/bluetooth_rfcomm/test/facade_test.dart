@@ -104,7 +104,7 @@ void main() {
     );
   });
 
-  test('bondedAndDiscoveredStream emits accumulated paired+seen', () async {
+  test('bondedAndDiscoveredStream paints paired instantly then refines', () async {
     final inRange = FakeBluetoothRfcommPlatform.sampleDevice(
       address: 'AA:AA:AA:AA:AA:AA',
       name: 'InRange',
@@ -126,11 +126,21 @@ void main() {
       ),
     ]);
 
-    final first = await bt.bondedAndDiscoveredStream().first;
-    expect(first, hasLength(1));
-    expect(first.first.id, inRange.id);
-    expect(first.first.rssi, -42);
-    expect(fake.discoveryStopped, isTrue); // cancelled after first event
+    final emissions = <List<BluetoothDevice>>[];
+    final sub = bt.bondedAndDiscoveredStream().listen(emissions.add);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await sub.cancel();
+
+    expect(emissions, isNotEmpty);
+    // First paint: the paired device surfaces immediately, before any inquiry.
+    expect(emissions.first, hasLength(1));
+    expect(emissions.first.first.id, inRange.id);
+    // After the inquiry: refined with RSSI; the non-paired stranger excluded.
+    final last = emissions.last;
+    expect(last, hasLength(1));
+    expect(last.first.id, inRange.id);
+    expect(last.first.rssi, -42);
+    expect(fake.discoveryStopped, isTrue);
   });
 
   test('connect with explicit channel', () async {

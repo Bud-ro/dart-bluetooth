@@ -27,6 +27,21 @@ const int soRcvTimeo = 0x1006; // SO_RCVTIMEO
 /// `INVALID_SOCKET` is `(SOCKET)(~0)`; SOCKET is `UINT_PTR` (64-bit on x64).
 final int invalidSocket = -1; // all-ones when read as a pointer-sized int
 
+// --- Registry constants (advapi32.dll) ---------------------------------------
+// The paired-device list lives under HKLM\...\BTHPORT\Parameters\Devices and can
+// be read radio-silently and instantly. BluetoothFindFirstDevice, by contrast,
+// can trigger a blocking per-device remote-name request (HCI RNR) when a name
+// isn't cached — seconds per absent device — which is the root of the slow list.
+
+/// `HKEY_LOCAL_MACHINE`. The predefined HKEYs are sign-extended pointer values
+/// on 64-bit Windows: `(HKEY)(ULONG_PTR)(LONG)0x80000002` -> 0xFFFFFFFF80000002.
+const int hkeyLocalMachine = 0xFFFFFFFF80000002;
+const int keyRead = 0x20019; // KEY_READ
+const int errorMoreData = 234; // ERROR_MORE_DATA
+const int errorNoMoreItems = 259; // ERROR_NO_MORE_ITEMS
+const int regSz = 1; // REG_SZ (null-terminated UTF-16 string)
+const int regBinary = 3; // REG_BINARY (raw bytes)
+
 // --- Structs -----------------------------------------------------------------
 
 /// `SOCKADDR_BTH` from `ws2bth.h`. That header is byte-packed (`pshpack1.h`), so
@@ -304,6 +319,97 @@ class WinsockBindings {
       calloc.free(data);
     }
   }
+}
+
+// --- Registry function typedefs ----------------------------------------------
+
+typedef _RegOpenKeyExC =
+    ffi.Int32 Function(
+      ffi.IntPtr hKey,
+      ffi.Pointer<ffi.Uint16> lpSubKey,
+      ffi.Uint32 ulOptions,
+      ffi.Uint32 samDesired,
+      ffi.Pointer<ffi.IntPtr> phkResult,
+    );
+typedef RegOpenKeyExDart =
+    int Function(
+      int hKey,
+      ffi.Pointer<ffi.Uint16> lpSubKey,
+      int ulOptions,
+      int samDesired,
+      ffi.Pointer<ffi.IntPtr> phkResult,
+    );
+
+typedef _RegEnumKeyExC =
+    ffi.Int32 Function(
+      ffi.IntPtr hKey,
+      ffi.Uint32 dwIndex,
+      ffi.Pointer<ffi.Uint16> lpName,
+      ffi.Pointer<ffi.Uint32> lpcchName,
+      ffi.Pointer<ffi.Uint32> lpReserved,
+      ffi.Pointer<ffi.Uint16> lpClass,
+      ffi.Pointer<ffi.Uint32> lpcchClass,
+      ffi.Pointer<ffi.Void> lpftLastWriteTime,
+    );
+typedef RegEnumKeyExDart =
+    int Function(
+      int hKey,
+      int dwIndex,
+      ffi.Pointer<ffi.Uint16> lpName,
+      ffi.Pointer<ffi.Uint32> lpcchName,
+      ffi.Pointer<ffi.Uint32> lpReserved,
+      ffi.Pointer<ffi.Uint16> lpClass,
+      ffi.Pointer<ffi.Uint32> lpcchClass,
+      ffi.Pointer<ffi.Void> lpftLastWriteTime,
+    );
+
+typedef _RegQueryValueExC =
+    ffi.Int32 Function(
+      ffi.IntPtr hKey,
+      ffi.Pointer<ffi.Uint16> lpValueName,
+      ffi.Pointer<ffi.Uint32> lpReserved,
+      ffi.Pointer<ffi.Uint32> lpType,
+      ffi.Pointer<ffi.Uint8> lpData,
+      ffi.Pointer<ffi.Uint32> lpcbData,
+    );
+typedef RegQueryValueExDart =
+    int Function(
+      int hKey,
+      ffi.Pointer<ffi.Uint16> lpValueName,
+      ffi.Pointer<ffi.Uint32> lpReserved,
+      ffi.Pointer<ffi.Uint32> lpType,
+      ffi.Pointer<ffi.Uint8> lpData,
+      ffi.Pointer<ffi.Uint32> lpcbData,
+    );
+
+typedef _RegCloseKeyC = ffi.Int32 Function(ffi.IntPtr hKey);
+typedef RegCloseKeyDart = int Function(int hKey);
+
+/// Resolved `advapi32.dll` registry symbols. Construct one per isolate (the
+/// `DynamicLibrary` handle is not shareable across isolates).
+class RegistryBindings {
+  RegistryBindings() : _adv = ffi.DynamicLibrary.open('advapi32.dll') {
+    regOpenKeyEx = _adv.lookupFunction<_RegOpenKeyExC, RegOpenKeyExDart>(
+      'RegOpenKeyExW',
+    );
+    regEnumKeyEx = _adv.lookupFunction<_RegEnumKeyExC, RegEnumKeyExDart>(
+      'RegEnumKeyExW',
+    );
+    regQueryValueEx = _adv
+        .lookupFunction<_RegQueryValueExC, RegQueryValueExDart>(
+          'RegQueryValueExW',
+        );
+    regCloseKey = _adv.lookupFunction<_RegCloseKeyC, RegCloseKeyDart>(
+      'RegCloseKey',
+    );
+  }
+
+  final ffi.DynamicLibrary _adv;
+
+  late final RegOpenKeyExDart regOpenKeyEx;
+  late final RegEnumKeyExDart regEnumKeyEx;
+  late final RegQueryValueExDart regQueryValueEx;
+  late final RegCloseKeyDart regCloseKey;
 }
 
 /// Parses a 48-bit Bluetooth address `AA:BB:CC:DD:EE:FF` into the `BTH_ADDR`

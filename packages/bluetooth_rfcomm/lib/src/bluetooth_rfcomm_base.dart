@@ -228,6 +228,21 @@ class BluetoothRfcomm {
         continue;
       }
       if (_nearbyListeners <= 0) break;
+      // Instant first paint: surface the paired list right away instead of
+      // making the subscriber wait for a full inquiry cycle (~10s on Windows).
+      // The inquiry below then refreshes RSSI/presence as results arrive. On
+      // platforms where the inquiry can't tell "paired & nearby" from "paired &
+      // absent" cheaply, this means the list appears immediately and stays
+      // presence-agnostic until a usable nearby signal exists.
+      var seeded = false;
+      for (final d in byId.values) {
+        if (!_nearby.containsKey(d.id)) {
+          _nearby[d.id] = d;
+          _nearbySeenAt[d.id] = DateTime.now();
+          seeded = true;
+        }
+      }
+      if (seeded) _emitNearby();
       final done = _nearbyCycleDone = Completer<void>();
       _nearbyScanSub = startDiscovery().listen(
         (r) {

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:isolate';
 import 'dart:typed_data';
@@ -69,8 +70,25 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
   @override
   Future<List<BluetoothDevice>> bondedDevices() async {
     try {
-      final raw = await Isolate.run(() => _enumerateDevices(remembered: true));
-      return raw.map(_toDevice).toList();
+      // Read the paired list straight from the registry: this is radio-silent
+      // and instant. BluetoothFindFirstDevice can block on a per-device remote-
+      // name request (HCI RNR) when a name isn't cached — seconds per absent
+      // device — which is why the old path felt slow. Fall back to it only if the
+      // registry yields nothing (unexpected layout / locked-down machine).
+      final raw = await Isolate.run(_enumeratePairedFromRegistry);
+      if (raw.isNotEmpty) {
+        logDiscovery.fine(
+          () => 'bondedDevices: ${raw.length} paired device(s) from registry',
+        );
+        return raw.map(_toDevice).toList();
+      }
+      logDiscovery.fine(
+        'bondedDevices: registry empty, falling back to BluetoothFindFirstDevice',
+      );
+      final fallback = await Isolate.run(
+        () => _enumerateDevices(remembered: true),
+      );
+      return fallback.map(_toDevice).toList();
     } on BluetoothException {
       rethrow;
     } catch (e) {
@@ -86,9 +104,15 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
   Stream<BluetoothDiscoveryResult> startDiscovery() async* {
     // BluetoothFindFirstDevice with fIssueInquiry blocks for the inquiry window,
     // so we run it on a worker isolate and emit the results when it completes.
-    // The "is this device actually nearby?" filtering happens HERE on the main
-    // isolate (not in the worker) so every decision is visible to the app's log
-    // handler — the worker isolate can't reach package:logging.
+    //
+    // NOTE: this inquiry returns ALL remembered (paired) devices regardless of
+    // whether they actually answered, and Windows gives no reliable per-device
+    // "seen in this inquiry" flag — stLastSeen is frozen at the pairing date on
+    // real hardware, so it cannot distinguish a nearby device from an absent
+    // paired one. We therefore no longer filter by it (the previous freshness
+    // filter was pure noise). Telling "paired AND nearby" apart cheaply isn't
+    // possible through this API; that needs the Winsock WSALookupService inquiry
+    // (LUP_FLUSHCACHE returns only responders) — tracked as a follow-up.
     logDiscovery.fine('inquiry starting (~10s window)');
     final start = DateTime.now();
     final List<_RawDevice> raw;
@@ -102,55 +126,24 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
       throw BluetoothDiscoveryException('inquiry failed', cause: e);
     }
     final now = DateTime.now();
-    final nowUtc = now.toUtc();
     logDiscovery.fine(
       () =>
-          'inquiry returned ${raw.length} raw device(s) in '
-          '${now.difference(start).inMilliseconds}ms; '
-          'filtering to those seen within ${_discoveryFreshness.inSeconds}s',
+          'inquiry returned ${raw.length} device(s) in '
+          '${now.difference(start).inMilliseconds}ms',
     );
-    var kept = 0;
     for (final r in raw) {
       final device = _toDevice(r);
-      final ls = r.lastSeen;
-      // A paired device that did NOT answer this inquiry keeps its stale
-      // stLastSeen; one that answered has it refreshed to ~now. Fail open on a
-      // missing or future timestamp so a present device is never wrongly hidden.
-      final age = ls == null ? null : nowUtc.difference(ls);
-      final bool fresh;
-      final String reason;
-      if (ls == null) {
-        fresh = true;
-        reason = 'kept: no lastSeen reported (failing open)';
-      } else if (age!.isNegative) {
-        fresh = true;
-        reason = 'kept: lastSeen is in the future (clock skew, failing open)';
-      } else if (age <= _discoveryFreshness) {
-        fresh = true;
-        reason = 'kept: last seen ${age.inSeconds}s ago';
-      } else {
-        fresh = false;
-        reason =
-            'dropped: last seen ${age.inSeconds}s ago '
-            '(> ${_discoveryFreshness.inSeconds}s threshold)';
-      }
       logDiscovery.finer(
         () =>
             'device "${device.name ?? '(unnamed)'}" ${device.id.address} '
-            'remembered=${r.remembered} connected=${r.connected} '
-            'lastSeen=${ls?.toIso8601String() ?? 'never'} -> $reason',
+            'remembered=${r.remembered} connected=${r.connected}',
       );
-      if (!fresh) continue;
-      kept++;
       yield BluetoothDiscoveryResult(
         device: device,
         rssi: device.rssi,
         timestamp: now,
       );
     }
-    logDiscovery.fine(
-      () => 'inquiry complete: $kept of ${raw.length} device(s) reported nearby',
-    );
   }
 
   @override
@@ -310,7 +303,6 @@ class _RawDevice {
     this.connected,
     this.remembered,
     this.authenticated,
-    this.lastSeen,
   );
   final int addr;
   final String name;
@@ -318,17 +310,204 @@ class _RawDevice {
   final bool connected;
   final bool remembered;
   final bool authenticated;
-
-  /// `BLUETOOTH_DEVICE_INFO.stLastSeen` as UTC, or null if unset. An inquiry
-  /// refreshes this for devices that actually respond, so it's how we tell a
-  /// device seen *now* from a cached pairing that didn't answer.
-  final DateTime? lastSeen;
 }
 
-/// How recently a device must have been seen to count as "discovered" during an
-/// inquiry. The inquiry window is ~10s; this is generous enough to keep every
-/// responding device while excluding pairings last seen minutes/hours/days ago.
-const Duration _discoveryFreshness = Duration(seconds: 60);
+/// Registry subkey holding the paired devices: subkey name is the 12-hex MAC
+/// (no separators), and each holds a `Name` value with the friendly name.
+const String _pairedDevicesKey =
+    r'SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices';
+
+/// Lists paired devices by reading the registry directly — no radio I/O, so it
+/// returns instantly even when a paired device is powered off or out of range
+/// (unlike BluetoothFindFirstDevice, which can block on a remote-name request
+/// per device). Returns an empty list on any failure so the caller can fall back
+/// to the FindFirstDevice path. classOfDevice/connected aren't in this registry
+/// view, so they default (a paired device is authenticated/remembered by
+/// definition; live connection state comes from the connection's own stream).
+List<_RawDevice> _enumeratePairedFromRegistry() {
+  final reg = RegistryBindings();
+  final out = <_RawDevice>[];
+  final subPath = _pairedDevicesKey.toNativeUtf16();
+  final hDevices = calloc<ffi.IntPtr>();
+  // Subkey names are 12 hex chars; 64 WCHARs is ample headroom.
+  final nameBuf = calloc<ffi.Uint16>(64);
+  final nameLen = calloc<ffi.Uint32>();
+  try {
+    if (reg.regOpenKeyEx(
+          hkeyLocalMachine,
+          subPath.cast(),
+          0,
+          keyRead,
+          hDevices,
+        ) !=
+        0) {
+      return out;
+    }
+    final devicesKey = hDevices.value;
+    try {
+      for (var i = 0; ; i++) {
+        nameLen.value = 64;
+        final rc = reg.regEnumKeyEx(
+          devicesKey,
+          i,
+          nameBuf,
+          nameLen,
+          ffi.nullptr,
+          ffi.nullptr,
+          ffi.nullptr,
+          ffi.nullptr,
+        );
+        if (rc != 0) break; // ERROR_NO_MORE_ITEMS or any error -> done
+        final mac = _utf16ToString(nameBuf, nameLen.value);
+        final addr = _parseRegistryMac(mac);
+        if (addr == null) continue; // not a MAC subkey -> skip
+        final name = _readRegistryName(reg, devicesKey, nameBuf);
+        out.add(
+          _RawDevice(
+            addr,
+            name ?? '',
+            0, // classOfDevice unknown from this view
+            false, // connected unknown; live state via the connection stream
+            true, // listed here => remembered
+            true, // and authenticated/paired
+          ),
+        );
+      }
+    } finally {
+      reg.regCloseKey(devicesKey);
+    }
+  } catch (_) {
+    return out; // any FFI mishap -> empty so the caller falls back
+  } finally {
+    calloc.free(subPath);
+    calloc.free(hDevices);
+    calloc.free(nameBuf);
+    calloc.free(nameLen);
+  }
+  return out;
+}
+
+/// Reads the `Name` value of the paired-device subkey named by [macNameBuf]
+/// (a null-terminated WSTR already holding the MAC, reused from the enumeration).
+String? _readRegistryName(
+  RegistryBindings reg,
+  int devicesKey,
+  ffi.Pointer<ffi.Uint16> macNameBuf,
+) {
+  final hSub = calloc<ffi.IntPtr>();
+  final valueName = 'Name'.toNativeUtf16();
+  final type = calloc<ffi.Uint32>();
+  final size = calloc<ffi.Uint32>();
+  try {
+    if (reg.regOpenKeyEx(devicesKey, macNameBuf, 0, keyRead, hSub) != 0) {
+      return null;
+    }
+    final subKey = hSub.value;
+    try {
+      // Size probe first (lpData null) to learn the byte length.
+      final probe = reg.regQueryValueEx(
+        subKey,
+        valueName.cast(),
+        ffi.nullptr,
+        type,
+        ffi.nullptr,
+        size,
+      );
+      if ((probe != 0 && probe != errorMoreData) || size.value == 0) {
+        return null;
+      }
+      final data = calloc<ffi.Uint8>(size.value + 2); // +2 NUL slack
+      try {
+        if (reg.regQueryValueEx(
+              subKey,
+              valueName.cast(),
+              ffi.nullptr,
+              type,
+              data,
+              size,
+            ) !=
+            0) {
+          return null;
+        }
+        return _decodeRegistryName(type.value, data, size.value);
+      } finally {
+        calloc.free(data);
+      }
+    } finally {
+      reg.regCloseKey(subKey);
+    }
+  } finally {
+    calloc.free(hSub);
+    calloc.free(valueName);
+    calloc.free(type);
+    calloc.free(size);
+  }
+}
+
+/// Decodes a registry `Name` value. Windows stores it inconsistently across
+/// stacks/versions: usually REG_BINARY (raw name bytes, sometimes NUL-padded),
+/// occasionally REG_SZ (UTF-16). Handle both, then UTF-16 vs UTF-8 heuristically.
+String? _decodeRegistryName(int type, ffi.Pointer<ffi.Uint8> data, int size) {
+  final bytes = data.asTypedList(size);
+  if (type == regSz || (size >= 2 && size.isEven && _looksUtf16(bytes))) {
+    final units = <int>[];
+    for (var i = 0; i + 1 < size; i += 2) {
+      final c = bytes[i] | (bytes[i + 1] << 8);
+      if (c == 0) break;
+      units.add(c);
+    }
+    final s = String.fromCharCodes(units).trim();
+    return s.isEmpty ? null : s;
+  }
+  // REG_BINARY as a single-byte encoding: strip trailing NULs, decode UTF-8
+  // (covers ASCII), falling back to Latin-1 for any non-UTF-8 bytes.
+  var end = size;
+  while (end > 0 && bytes[end - 1] == 0) {
+    end--;
+  }
+  if (end == 0) return null;
+  final slice = bytes.sublist(0, end);
+  String s;
+  try {
+    s = utf8.decode(slice);
+  } catch (_) {
+    s = String.fromCharCodes(slice);
+  }
+  s = s.trim();
+  return s.isEmpty ? null : s;
+}
+
+/// Heuristic: REG_BINARY name bytes are UTF-16LE if the high byte of each WCHAR
+/// is mostly zero (ASCII text encoded as UTF-16 has every other byte == 0).
+bool _looksUtf16(Uint8List bytes) {
+  var oddZeros = 0;
+  var pairs = 0;
+  for (var i = 1; i < bytes.length; i += 2) {
+    pairs++;
+    if (bytes[i] == 0) oddZeros++;
+  }
+  return pairs > 0 && oddZeros >= (pairs * 3) ~/ 4;
+}
+
+/// Reads [len] UTF-16 code units from [buf] into a Dart string.
+String _utf16ToString(ffi.Pointer<ffi.Uint16> buf, int len) {
+  final units = <int>[];
+  for (var i = 0; i < len; i++) {
+    final c = buf[i];
+    if (c == 0) break;
+    units.add(c);
+  }
+  return String.fromCharCodes(units);
+}
+
+/// Parses a registry paired-device subkey name (12 hex digits, no separators)
+/// into a `BTH_ADDR`, or null if it isn't a MAC subkey.
+int? _parseRegistryMac(String name) {
+  if (name.length != 12) return null;
+  final v = int.tryParse(name, radix: 16);
+  if (v == null) return null;
+  return v;
+}
 
 List<_RawDevice> _enumerateDevices({
   bool remembered = false,
@@ -394,20 +573,7 @@ _RawDevice _readDevice(BluetoothDeviceInfo info) {
     info.fConnected != 0,
     info.fRemembered != 0,
     info.fAuthenticated != 0,
-    _systemTimeToUtc(info.stLastSeen),
   );
-}
-
-/// Converts a Win32 `SYSTEMTIME` (8 WORDs: year, month, dayOfWeek, day, hour,
-/// minute, second, millisecond — in UTC) to a [DateTime], or null if unset.
-DateTime? _systemTimeToUtc(ffi.Array<ffi.Uint16> st) {
-  final year = st[0];
-  if (year == 0) return null; // unset / never seen
-  try {
-    return DateTime.utc(year, st[1], st[3], st[4], st[5], st[6], st[7]);
-  } catch (_) {
-    return null; // malformed -> treat as unknown (fail open)
-  }
 }
 
 /// A WSA error code, or -1 when the call failed but `WSAGetLastError()` was 0.
