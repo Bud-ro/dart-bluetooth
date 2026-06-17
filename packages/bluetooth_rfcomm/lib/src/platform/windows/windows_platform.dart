@@ -142,9 +142,16 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     // can never be misread as an error code, whatever its high bit.
     final (int, int) connectResult;
     try {
-      final connectFuture = Isolate.run(
-        () => _connectSocket(address, channel, uuid),
-      );
+      // Spawn the connect via a STATIC helper, never an inline closure here.
+      // The `.then(...)` callback below references `_ws`, so it captures `this`;
+      // an inline `Isolate.run(() => _connectSocket(...))` in this same method
+      // would share that closure context and get `this` serialized into the
+      // isolate message. Once `_bindings` is lazily created (a non-sendable
+      // DynamicLibrary), that serialization throws "object is a DynamicLibrary"
+      // — which is exactly why the FIRST connect worked (bindings still null →
+      // sendable) but every later one failed. The static helper has no `this`
+      // in scope, so its closure captures only the sendable args.
+      final connectFuture = _spawnConnect(address, channel, uuid);
       var timedOut = false;
       // Isolate.run can't be cancelled: if connect succeeds AFTER we time out,
       // the returned SOCKET would be dropped without closesocket — leaking the
@@ -206,6 +213,14 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
       );
 
   // --- main-isolate helpers ------------------------------------------------
+
+  // Static (no `this` in scope) so the Isolate.run closure captures only the
+  // sendable args — see the note in openRfcomm.
+  static Future<(int, int)> _spawnConnect(
+    String address,
+    int? channel,
+    String uuid,
+  ) => Isolate.run(() => _connectSocket(address, channel, uuid));
 
   BluetoothDevice _toDevice(_RawDevice r) => BluetoothDevice(
     id: DeviceId.address(formatBthAddr(r.addr)),
