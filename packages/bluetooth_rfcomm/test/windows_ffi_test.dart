@@ -27,8 +27,12 @@ void main() {
       // SOCKADDR_BTH is byte-packed in ws2bth.h (pshpack1): 2 + 8 + 16 + 4 = 30.
       // (Natural alignment would give 40 — that mismatch made connect() fail.)
       expect(ffi.sizeOf<SockaddrBth>(), 30);
-      expect(ffi.sizeOf<BluetoothDeviceInfo>(), 560);
-      expect(ffi.sizeOf<BluetoothDeviceSearchParams>(), 40);
+      // The WSALookupService result structs (x64 natural alignment). These are
+      // ABI-determined, so validating them here (on any x64 host) pins the layout
+      // the Windows inquiry parser depends on, even without Windows hardware.
+      expect(ffi.sizeOf<SocketAddress>(), 16);
+      expect(ffi.sizeOf<CsAddrInfo>(), 40);
+      expect(ffi.sizeOf<WsaQuerySet>(), 120);
     },
     skip: ffi.sizeOf<ffi.IntPtr>() != 8 ? '64-bit host only' : false,
   );
@@ -86,26 +90,37 @@ void main() {
   );
 
   test(
-    'BLUETOOTH_DEVICE_INFO 8-aligned field offsets (natural alignment)',
+    'WSAQUERYSET field offsets the inquiry parser reads (x64)',
     () {
-      final p = calloc<BluetoothDeviceInfo>();
+      final p = calloc<WsaQuerySet>();
       try {
-        p.ref.dwSize = 0x01020304;
-        p.ref.address = 0x1122334455667788; // 8-aligned -> offset 8 (4B pad)
-        final b = p.cast<ffi.Uint8>().asTypedList(
-          ffi.sizeOf<BluetoothDeviceInfo>(),
-        );
+        // The parser reads dwNameSpace (set on input) and dwNumberOfCsAddrs /
+        // lpcsaBuffer / lpszServiceInstanceName (read from results). Pin the
+        // offsets of the scalar fields that bracket the pointers.
+        p.ref.dwSize = 0x01020304; // @0
+        p.ref.dwNameSpace = 0x11121314; // @40
+        p.ref.dwNumberOfCsAddrs = 0x21222324; // @88
+        p.ref.dwOutputFlags = 0x31323334; // @104
+        final b = p.cast<ffi.Uint8>().asTypedList(ffi.sizeOf<WsaQuerySet>());
         expect(b.sublist(0, 4), [0x04, 0x03, 0x02, 0x01], reason: 'dwSize @0');
-        expect(b.sublist(8, 16), [
-          0x88,
-          0x77,
-          0x66,
-          0x55,
-          0x44,
-          0x33,
-          0x22,
+        expect(b.sublist(40, 44), [
+          0x14,
+          0x13,
+          0x12,
           0x11,
-        ], reason: 'address @8 (after 4B pad)');
+        ], reason: 'dwNameSpace @40');
+        expect(b.sublist(88, 92), [
+          0x24,
+          0x23,
+          0x22,
+          0x21,
+        ], reason: 'dwNumberOfCsAddrs @88 (lpcsaBuffer follows @96)');
+        expect(b.sublist(104, 108), [
+          0x34,
+          0x33,
+          0x32,
+          0x31,
+        ], reason: 'dwOutputFlags @104');
       } finally {
         calloc.free(p);
       }
@@ -114,26 +129,17 @@ void main() {
   );
 
   test(
-    'BLUETOOTH_DEVICE_SEARCH_PARAMS hRadio offset (natural alignment)',
+    'CSADDR_INFO.RemoteAddr offset (x64 natural alignment)',
     () {
-      final p = calloc<BluetoothDeviceSearchParams>();
+      final p = calloc<CsAddrInfo>();
       try {
-        p.ref.cTimeoutMultiplier = 0x5A; // UCHAR @24
-        p.ref.hRadio = 0x1122334455667788; // HANDLE @32 (after 7B pad)
-        final b = p.cast<ffi.Uint8>().asTypedList(
-          ffi.sizeOf<BluetoothDeviceSearchParams>(),
-        );
-        expect(b[24], 0x5A, reason: 'cTimeoutMultiplier @24');
-        expect(b.sublist(32, 40), [
-          0x88,
-          0x77,
-          0x66,
-          0x55,
-          0x44,
-          0x33,
-          0x22,
-          0x11,
-        ], reason: 'hRadio @32 (after 7B pad)');
+        // RemoteAddr is the second SOCKET_ADDRESS (@16); its iSockaddrLength is
+        // at +8 within it, i.e. @24. The parser reads RemoteAddr.lpSockaddr (@16).
+        p.ref.remoteAddr.iSockaddrLength = 0x5A; // @24
+        p.ref.iProtocol = 0x6B; // @36
+        final b = p.cast<ffi.Uint8>().asTypedList(ffi.sizeOf<CsAddrInfo>());
+        expect(b[24], 0x5A, reason: 'RemoteAddr.iSockaddrLength @24');
+        expect(b[36], 0x6B, reason: 'iProtocol @36');
       } finally {
         calloc.free(p);
       }

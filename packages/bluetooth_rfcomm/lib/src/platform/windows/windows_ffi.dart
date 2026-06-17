@@ -85,62 +85,6 @@ final class SockaddrBth extends ffi.Struct {
   external int port;
 }
 
-/// `BLUETOOTH_DEVICE_INFO` from `bluetoothapis.h` (`BLUETOOTH_MAX_NAME_SIZE`
-/// = 248 WCHARs).
-final class BluetoothDeviceInfo extends ffi.Struct {
-  @ffi.Uint32()
-  external int dwSize;
-
-  @ffi.Uint64()
-  external int address; // BLUETOOTH_ADDRESS union -> ULONGLONG
-
-  @ffi.Uint32()
-  external int ulClassofDevice;
-
-  @ffi.Int32()
-  external int fConnected; // BOOL
-
-  @ffi.Int32()
-  external int fRemembered; // BOOL
-
-  @ffi.Int32()
-  external int fAuthenticated; // BOOL
-
-  // SYSTEMTIME stLastSeen (8 x WORD)
-  @ffi.Array<ffi.Uint16>(8)
-  external ffi.Array<ffi.Uint16> stLastSeen;
-
-  // SYSTEMTIME stLastUsed
-  @ffi.Array<ffi.Uint16>(8)
-  external ffi.Array<ffi.Uint16> stLastUsed;
-
-  @ffi.Array<ffi.Uint16>(248)
-  external ffi.Array<ffi.Uint16> szName;
-}
-
-/// `BLUETOOTH_DEVICE_SEARCH_PARAMS` from `bluetoothapis.h`.
-final class BluetoothDeviceSearchParams extends ffi.Struct {
-  @ffi.Uint32()
-  external int dwSize;
-
-  @ffi.Int32()
-  external int fReturnAuthenticated;
-  @ffi.Int32()
-  external int fReturnRemembered;
-  @ffi.Int32()
-  external int fReturnUnknown;
-  @ffi.Int32()
-  external int fReturnConnected;
-  @ffi.Int32()
-  external int fIssueInquiry;
-
-  @ffi.Uint8()
-  external int cTimeoutMultiplier;
-
-  @ffi.IntPtr()
-  external int hRadio; // HANDLE
-}
-
 /// `SOCKET_ADDRESS` from `ws2def.h`. Natural alignment (Dart FFI matches the C
 /// ABI's padding), so no `@Packed` here — only `SOCKADDR_BTH` itself is packed.
 final class SocketAddress extends ffi.Struct {
@@ -304,25 +248,6 @@ typedef WSALookupServiceNextDart =
 typedef _WSALookupServiceEndC = ffi.Int32 Function(ffi.IntPtr hLookup);
 typedef WSALookupServiceEndDart = int Function(int hLookup);
 
-typedef _FindFirstDeviceC =
-    ffi.IntPtr Function(
-      ffi.Pointer<BluetoothDeviceSearchParams> params,
-      ffi.Pointer<BluetoothDeviceInfo> info,
-    );
-typedef FindFirstDeviceDart =
-    int Function(
-      ffi.Pointer<BluetoothDeviceSearchParams> params,
-      ffi.Pointer<BluetoothDeviceInfo> info,
-    );
-
-typedef _FindNextDeviceC =
-    ffi.Int32 Function(ffi.IntPtr find, ffi.Pointer<BluetoothDeviceInfo> info);
-typedef FindNextDeviceDart =
-    int Function(int find, ffi.Pointer<BluetoothDeviceInfo> info);
-
-typedef _FindDeviceCloseC = ffi.Int32 Function(ffi.IntPtr find);
-typedef FindDeviceCloseDart = int Function(int find);
-
 typedef _FindFirstRadioC =
     ffi.IntPtr Function(
       ffi.Pointer<ffi.Void> params,
@@ -378,17 +303,6 @@ class WinsockBindings {
           'WSALookupServiceEnd',
         );
 
-    findFirstDevice = _bth
-        .lookupFunction<_FindFirstDeviceC, FindFirstDeviceDart>(
-          'BluetoothFindFirstDevice',
-        );
-    findNextDevice = _bth.lookupFunction<_FindNextDeviceC, FindNextDeviceDart>(
-      'BluetoothFindNextDevice',
-    );
-    findDeviceClose = _bth
-        .lookupFunction<_FindDeviceCloseC, FindDeviceCloseDart>(
-          'BluetoothFindDeviceClose',
-        );
     findFirstRadio = _bth.lookupFunction<_FindFirstRadioC, FindFirstRadioDart>(
       'BluetoothFindFirstRadio',
     );
@@ -417,9 +331,6 @@ class WinsockBindings {
   late final WSALookupServiceBeginDart wsaLookupServiceBegin;
   late final WSALookupServiceNextDart wsaLookupServiceNext;
   late final WSALookupServiceEndDart wsaLookupServiceEnd;
-  late final FindFirstDeviceDart findFirstDevice;
-  late final FindNextDeviceDart findNextDevice;
-  late final FindDeviceCloseDart findDeviceClose;
   late final FindFirstRadioDart findFirstRadio;
   late final FindRadioCloseDart findRadioClose;
   late final CloseHandleDart closeHandle;

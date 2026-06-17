@@ -70,25 +70,16 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
   @override
   Future<List<BluetoothDevice>> bondedDevices() async {
     try {
-      // Read the paired list straight from the registry: this is radio-silent
-      // and instant. BluetoothFindFirstDevice can block on a per-device remote-
-      // name request (HCI RNR) when a name isn't cached — seconds per absent
-      // device — which is why the old path felt slow. Fall back to it only if the
-      // registry yields nothing (unexpected layout / locked-down machine).
-      final raw = await Isolate.run(_enumeratePairedFromRegistry);
-      if (raw.isNotEmpty) {
-        logDiscovery.fine(
-          () => 'bondedDevices: ${raw.length} paired device(s) from registry',
-        );
-        return raw.map(_toDevice).toList();
-      }
+      // Read the paired list straight from the registry: radio-silent and so
+      // cheap (a handful of small keys) that it runs inline on the calling
+      // isolate — spawning a worker just to read it cost more than the read.
+      // BluetoothFindFirstDevice is no longer used: it blocks on a per-device
+      // remote-name request, which was the whole reason listing felt slow.
+      final raw = _enumeratePairedFromRegistry();
       logDiscovery.fine(
-        'bondedDevices: registry empty, falling back to BluetoothFindFirstDevice',
+        () => 'bondedDevices: ${raw.length} paired device(s) from registry',
       );
-      final fallback = await Isolate.run(
-        () => _enumerateDevices(remembered: true),
-      );
-      return fallback.map(_toDevice).toList();
+      return raw.map(_toDevice).toList();
     } on BluetoothException {
       rethrow;
     } catch (e) {
@@ -102,37 +93,15 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() async* {
-    // Prefer the Winsock NS_BTH inquiry (LUP_FLUSHCACHE): it returns ONLY devices
-    // that actually answered the inquiry — i.e. genuinely nearby — so a paired but
-    // absent device does NOT show up. BluetoothFindFirstDevice, by contrast, always
-    // unions in every remembered device, and Windows offers no reliable per-device
-    // "seen now" flag (stLastSeen is frozen at the pairing date on real hardware),
-    // so it cannot tell nearby from absent. We fall back to it only if the Winsock
-    // inquiry can't be started, and log which path produced the results so the two
-    // backends can be told apart during verification.
+    // Discover via the Winsock NS_BTH inquiry (LUP_FLUSHCACHE): it returns ONLY
+    // devices that actually answered the inquiry — i.e. genuinely nearby — so a
+    // paired but absent device does NOT show up. This blocks for the inquiry
+    // window, so it runs on a worker isolate.
     logDiscovery.fine('inquiry starting (~10s window)');
     final start = DateTime.now();
-    List<_RawDevice> raw;
-    var via = 'WSALookupService';
+    final List<_RawDevice> raw;
     try {
       raw = await Isolate.run(_inquireViaWsaLookup);
-    } on _WsaLookupUnavailable catch (e) {
-      logDiscovery.warning(
-        () =>
-            'WSALookupService inquiry unavailable ($e); '
-            'falling back to BluetoothFindFirstDevice',
-      );
-      via = 'BluetoothFindFirstDevice';
-      try {
-        raw = await Isolate.run(
-          () =>
-              _enumerateDevices(remembered: true, unknown: true, inquiry: true),
-        );
-      } on BluetoothException {
-        rethrow;
-      } catch (e) {
-        throw BluetoothDiscoveryException('inquiry failed', cause: e);
-      }
     } on BluetoothException {
       rethrow;
     } catch (e) {
@@ -141,7 +110,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     final now = DateTime.now();
     logDiscovery.fine(
       () =>
-          'inquiry ($via) returned ${raw.length} device(s) in '
+          'inquiry returned ${raw.length} device(s) in '
           '${now.difference(start).inMilliseconds}ms',
     );
     for (final r in raw) {
@@ -523,9 +492,8 @@ int? _parseRegistryMac(String name) {
 }
 
 /// Thrown by [_inquireViaWsaLookup] when the Winsock inquiry can't even be
-/// started (`WSALookupServiceBegin` failed). Carries the WSA error so the caller
-/// can log it and fall back to `BluetoothFindFirstDevice`. Sendable across the
-/// `Isolate.run` boundary (plain fields only).
+/// started (`WSALookupServiceBegin` failed). Carries the WSA error for the
+/// surfaced exception. Sendable across the `Isolate.run` boundary (plain fields).
 class _WsaLookupUnavailable implements Exception {
   _WsaLookupUnavailable(this.code);
   final int code;
@@ -535,10 +503,8 @@ class _WsaLookupUnavailable implements Exception {
 
 /// Discovers devices via the Winsock NS_BTH inquiry. With `LUP_FLUSHCACHE` this
 /// performs a live inquiry and returns ONLY devices that actually responded —
-/// i.e. genuinely nearby — unlike [_enumerateDevices] (BluetoothFindFirstDevice),
-/// which always unions in every remembered/paired device. Runs in a worker
-/// isolate (blocks for the inquiry window). Throws [_WsaLookupUnavailable] if the
-/// inquiry can't be started so the caller can fall back.
+/// i.e. genuinely nearby. Runs in a worker isolate (blocks for the inquiry
+/// window). Throws [_WsaLookupUnavailable] if the inquiry can't be started.
 List<_RawDevice> _inquireViaWsaLookup() {
   final ws = WinsockBindings();
   ws.startup();
@@ -604,73 +570,6 @@ List<_RawDevice> _inquireViaWsaLookup() {
     calloc.free(hLookup);
     ws.wsaCleanup();
   }
-}
-
-List<_RawDevice> _enumerateDevices({
-  bool remembered = false,
-  bool unknown = false,
-  bool inquiry = false,
-}) {
-  final ws = WinsockBindings();
-  final params = calloc<BluetoothDeviceSearchParams>();
-  final info = calloc<BluetoothDeviceInfo>();
-  final out = <_RawDevice>[];
-  try {
-    params.ref
-      ..dwSize = ffi.sizeOf<BluetoothDeviceSearchParams>()
-      ..fReturnAuthenticated = 1
-      ..fReturnRemembered = remembered ? 1 : 0
-      ..fReturnUnknown = unknown ? 1 : 0
-      ..fReturnConnected = 1
-      ..fIssueInquiry = inquiry ? 1 : 0
-      ..cTimeoutMultiplier = inquiry
-          ? 8
-          : 0 // ~10.24s when inquiring
-      ..hRadio = 0;
-    info.ref.dwSize = ffi.sizeOf<BluetoothDeviceInfo>();
-
-    final find = ws.findFirstDevice(params, info);
-    if (find == 0 || find == invalidSocket) return out;
-    try {
-      do {
-        out.add(_readDevice(info.ref));
-        info.ref.dwSize = ffi.sizeOf<BluetoothDeviceInfo>();
-      } while (ws.findNextDevice(find, info) != 0);
-    } finally {
-      ws.findDeviceClose(find);
-    }
-    // No nearby/stale filtering here: BluetoothFindFirstDevice returns ALL
-    // remembered (paired) devices even after a real inquiry, so the caller
-    // (startDiscovery, on the main isolate) decides which count as nearby using
-    // each device's stLastSeen — that way every keep/drop decision can be logged.
-    return out;
-  } finally {
-    calloc.free(params);
-    calloc.free(info);
-    // No WSACleanup: BluetoothFindFirstDevice is a BluetoothAPIs call and never
-    // needed WSAStartup, so there is nothing to balance here. (Calling cleanup
-    // without a matching startup corrupts the process-global Winsock refcount.)
-  }
-}
-
-_RawDevice _readDevice(BluetoothDeviceInfo info) {
-  // szName is a null-terminated UTF-16 array. Collect the raw code units and let
-  // String.fromCharCodes assemble surrogate pairs — writeCharCode would reject a
-  // lone surrogate and mangle astral (emoji) names truncated at the 248 limit.
-  final units = <int>[];
-  for (var i = 0; i < 248; i++) {
-    final c = info.szName[i];
-    if (c == 0) break;
-    units.add(c);
-  }
-  return _RawDevice(
-    info.address,
-    String.fromCharCodes(units),
-    info.ulClassofDevice,
-    info.fConnected != 0,
-    info.fRemembered != 0,
-    info.fAuthenticated != 0,
-  );
 }
 
 /// A WSA error code, or -1 when the call failed but `WSAGetLastError()` was 0.

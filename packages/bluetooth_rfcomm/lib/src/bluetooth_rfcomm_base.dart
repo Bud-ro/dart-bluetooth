@@ -145,17 +145,16 @@ class BluetoothRfcomm {
     return seen.values.toList(growable: false);
   }
 
-  /// How long a sighted device stays in [bondedAndDiscoveredStream]'s cache
-  /// after it was last seen, before it's treated as gone. Long enough to ride
-  /// out a flaky inquiry cycle, short enough that a device that actually left
-  /// drops off.
-  static const Duration _nearbyStaleAfter = Duration(seconds: 30);
+  /// Gap left between inquiry cycles. A classic-Bluetooth radio can't run an
+  /// inquiry and open a connection at the same time, so back-to-back inquiries
+  /// starve connects (and slow everything on Windows). This leaves the radio idle
+  /// between scans; new/RSSI updates still arrive within roughly a cycle.
+  static const Duration _nearbyScanInterval = Duration(seconds: 6);
 
   // Shared, cached "paired + nearby" state, so every subscriber sees the same
   // continuously-updated set and a new subscriber gets the current snapshot
   // immediately instead of waiting for a fresh ~10s inquiry.
   final Map<DeviceId, BluetoothDevice> _nearby = {};
-  final Map<DeviceId, DateTime> _nearbySeenAt = {};
   final StreamController<List<BluetoothDevice>> _nearbyUpdates =
       StreamController<List<BluetoothDevice>>.broadcast();
   int _nearbyListeners = 0;
@@ -163,19 +162,27 @@ class BluetoothRfcomm {
   StreamSubscription<BluetoothDiscoveryResult>? _nearbyScanSub;
   Completer<void>? _nearbyCycleDone;
 
-  /// Continuously scans and emits the set of devices that are **both paired and
-  /// nearby**. Results are cached and shared across subscribers: a new listener
-  /// receives the current snapshot immediately (no wait for a fresh inquiry),
-  /// then live updates as devices appear, refresh their RSSI, or drop off after
-  /// [_nearbyStaleAfter] without being seen. Scanning runs while at least one
-  /// subscriber is listening and stops when the last one cancels; the cache is
-  /// kept so the next subscriber still gets an instant (if slightly stale)
-  /// snapshot. The bonded set is re-read each cycle, so devices paired mid-scan
-  /// are picked up.
+  /// Number of in-flight [connect] calls. While > 0 the scan loop skips its
+  /// inquiry so the radio is free for the connection handshake.
+  int _activeConnects = 0;
+
+  /// Emits the set of **paired** devices, refreshing RSSI from a periodic
+  /// background inquiry. Results are cached and shared across subscribers: a new
+  /// listener receives the current snapshot immediately (no wait for a fresh
+  /// inquiry), then live updates as devices are paired/unpaired or their RSSI
+  /// changes. Scanning runs while at least one subscriber is listening and stops
+  /// when the last one cancels; the cache is kept so the next subscriber still
+  /// gets an instant snapshot. The paired set is re-read each cycle, so devices
+  /// paired or unpaired mid-scan are picked up.
   ///
-  /// Because scanning is periodic, a device that just appeared may take up to a
-  /// scan cycle to show. Use [bondedAndDiscovered] for a one-shot snapshot, or
-  /// [bondedDevices] for the instant (presence-agnostic) paired list.
+  /// The inquiry pauses while a [connect] is in flight (a classic-Bluetooth radio
+  /// can't inquire and connect at once) and leaves a gap between cycles, so it
+  /// never starves connections. Use [bondedAndDiscovered] for a one-shot
+  /// snapshot, or [bondedDevices] for the instant paired list without scanning.
+  ///
+  /// Note: this currently surfaces every paired device (presence-agnostic);
+  /// filtering to only those answering the inquiry depends on the per-platform
+  /// inquiry being verified on hardware.
   Stream<List<BluetoothDevice>> bondedAndDiscoveredStream() {
     return Stream<List<BluetoothDevice>>.multi((controller) {
       // Forward shared updates to this subscriber, then hand it the current
@@ -228,60 +235,59 @@ class BluetoothRfcomm {
         continue;
       }
       if (_nearbyListeners <= 0) break;
-      // Instant first paint: surface the paired list right away instead of
-      // making the subscriber wait for a full inquiry cycle (~10s on Windows).
-      // The inquiry below then refreshes RSSI/presence as results arrive. On
-      // platforms where the inquiry can't tell "paired & nearby" from "paired &
-      // absent" cheaply, this means the list appears immediately and stays
-      // presence-agnostic until a usable nearby signal exists.
-      var seeded = false;
+      // Reconcile the cache with the current paired set: add newly-paired
+      // devices, keep any RSSI already learned, and drop devices that are no
+      // longer paired. The paired list is read instantly (registry on Windows),
+      // so this is the first paint — no waiting on the ~10s inquiry.
+      var changed = false;
       for (final d in byId.values) {
-        if (!_nearby.containsKey(d.id)) {
-          _nearby[d.id] = d;
-          _nearbySeenAt[d.id] = DateTime.now();
-          seeded = true;
+        final existing = _nearby[d.id];
+        _nearby[d.id] = existing == null
+            ? d
+            : d.copyWith(rssi: existing.rssi ?? d.rssi);
+        if (existing == null) changed = true;
+      }
+      for (final id in _nearby.keys.toList()) {
+        if (!byId.containsKey(id)) {
+          _nearby.remove(id);
+          changed = true;
         }
       }
-      if (seeded) _emitNearby();
-      final done = _nearbyCycleDone = Completer<void>();
-      _nearbyScanSub = startDiscovery().listen(
-        (r) {
-          final base = byId[r.device.id];
-          if (base == null) return;
-          _nearby[r.device.id] = base.copyWith(rssi: r.rssi ?? r.device.rssi);
-          _nearbySeenAt[r.device.id] = DateTime.now();
-          _emitNearby();
-        },
-        onError: (Object e) {
-          if (!_nearbyUpdates.isClosed) _nearbyUpdates.addError(e);
-        },
-        // Inquiry finished (macOS/Android/Windows close the stream; Linux keeps
-        // it open and streams continuously, so this never fires there).
-        onDone: () {
-          if (!done.isCompleted) done.complete();
-        },
-        cancelOnError: false,
-      );
-      await done.future;
-      await _nearbyScanSub?.cancel();
-      _nearbyScanSub = null;
-      _evictStaleNearby();
+      if (changed) _emitNearby();
+
+      // Skip the inquiry while a connect is in flight: a classic-Bluetooth radio
+      // can't inquire and page at once, so inquiring here stalls the connection
+      // (and vice versa). The cached paired list stays painted in the meantime.
+      if (_activeConnects == 0) {
+        final done = _nearbyCycleDone = Completer<void>();
+        _nearbyScanSub = startDiscovery().listen(
+          (r) {
+            final base = byId[r.device.id];
+            if (base == null) return;
+            _nearby[r.device.id] = base.copyWith(rssi: r.rssi ?? r.device.rssi);
+            _emitNearby();
+          },
+          onError: (Object e) {
+            if (!_nearbyUpdates.isClosed) _nearbyUpdates.addError(e);
+          },
+          // Inquiry finished (macOS/Android/Windows close the stream; Linux keeps
+          // it open and streams continuously, so this never fires there).
+          onDone: () {
+            if (!done.isCompleted) done.complete();
+          },
+          cancelOnError: false,
+        );
+        await done.future;
+        await _nearbyScanSub?.cancel();
+        _nearbyScanSub = null;
+      }
+
+      if (_nearbyListeners <= 0) break;
+      // Breathing room before the next inquiry so the radio is free for connects
+      // and isn't pinned doing back-to-back scans.
+      await Future<void>.delayed(_nearbyScanInterval);
     }
     _nearbyScanRunning = false;
-  }
-
-  void _evictStaleNearby() {
-    final cutoff = DateTime.now().subtract(_nearbyStaleAfter);
-    final gone = _nearbySeenAt.entries
-        .where((e) => e.value.isBefore(cutoff))
-        .map((e) => e.key)
-        .toList();
-    if (gone.isEmpty) return;
-    for (final id in gone) {
-      _nearby.remove(id);
-      _nearbySeenAt.remove(id);
-    }
-    _emitNearby();
   }
 
   void _emitNearby() {
@@ -332,6 +338,15 @@ class BluetoothRfcomm {
           'connecting to ${device.id} '
           '(channel: ${channel ?? 'SDP'}, uuid: $uuid)',
     );
+    // Free the radio for the handshake: a classic-Bluetooth radio can't inquire
+    // and page at the same time. Mark a connect in flight (so the scan loop skips
+    // its next inquiry) and stop listening to any inquiry already running.
+    _activeConnects++;
+    unawaited(_nearbyScanSub?.cancel());
+    _nearbyScanSub = null;
+    if (_nearbyCycleDone != null && !_nearbyCycleDone!.isCompleted) {
+      _nearbyCycleDone!.complete();
+    }
     try {
       final transport = await _platform.openRfcomm(
         device.id,
@@ -343,6 +358,8 @@ class BluetoothRfcomm {
     } on BluetoothException catch (e, st) {
       logConnection.severe(() => 'connect to ${device.id} failed: $e', e, st);
       rethrow;
+    } finally {
+      _activeConnects--;
     }
   }
 
