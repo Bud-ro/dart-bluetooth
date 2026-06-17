@@ -137,6 +137,25 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
     final address = device.address;
     final uuid = serviceUuid.value;
+    // Initialise Winsock once, on the main isolate, for the whole process —
+    // BEFORE any worker isolate touches a socket. WSAStartup keeps a
+    // process-global reference count, so the connect/recv/send workers must NOT
+    // run their own WSAStartup/WSACleanup: that churn could transiently drop the
+    // count to zero, which uninitialises Winsock for the entire process. Once
+    // that happened, the main isolate's cached bindings never re-initialised, so
+    // closesocket() during close() silently failed — leaking the socket, leaving
+    // the device's RFCOMM channel busy, and blocking every later connection
+    // until the app restarted.
+    final WinsockBindings ws;
+    try {
+      ws =
+          _ws; // first use triggers WSAStartup; cached for the process lifetime
+    } catch (e) {
+      throw BluetoothConnectionException(
+        'Winsock initialisation failed',
+        cause: e,
+      );
+    }
     // (socket, errorCode): separate fields so a SOCKET (an unsigned UINT_PTR)
     // can never be misread as an error code, whatever its high bit.
     final (int, int) connectResult;
@@ -153,7 +172,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
           final (sock, err) = r;
           if (timedOut && err == 0 && sock != 0) {
             try {
-              _ws.closesocket(sock);
+              ws.closesocket(sock);
             } catch (_) {}
           }
         }, onError: (_) {}),
@@ -187,7 +206,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
         code: error,
       );
     }
-    return _WindowsRfcommTransport(socket: socket, ws: _ws);
+    return _WindowsRfcommTransport(socket: socket, ws: ws);
   }
 
   @override
@@ -294,7 +313,9 @@ List<_RawDevice> _enumerateDevices({
   } finally {
     calloc.free(params);
     calloc.free(info);
-    ws.wsaCleanup(); // balance this isolate's WSAStartup
+    // No WSACleanup: BluetoothFindFirstDevice is a BluetoothAPIs call and never
+    // needed WSAStartup, so there is nothing to balance here. (Calling cleanup
+    // without a matching startup corrupts the process-global Winsock refcount.)
   }
 }
 
@@ -325,8 +346,11 @@ int _wsaError(int err) => err == 0 ? -1 : err;
 /// `(0, errorCode)` on failure. The handle and error are separate fields so a
 /// SOCKET (an unsigned `UINT_PTR`) can never be mistaken for an error code.
 (int, int) _connectSocket(String address, int? channel, String serviceUuid) {
+  // No WSAStartup here: the main isolate has already initialised Winsock for the
+  // whole process (see openRfcomm), and a SOCKET is a process-global handle that
+  // stays valid after this worker exits. This isolate only needs the DLL's FFI
+  // function pointers.
   final ws = WinsockBindings();
-  ws.startup();
   final sock = ws.socket(afBth, sockStream, bthprotoRfcomm);
   if (sock == invalidSocket) return (0, _wsaError(ws.wsaGetLastError()));
 
@@ -359,7 +383,9 @@ const int _sendChunkFlags = 0;
 void _recvEntry(List<Object?> args) {
   final socket = args[0] as int;
   final sendPort = args[1] as SendPort;
-  final ws = WinsockBindings()..startup();
+  // No WSAStartup/WSACleanup: Winsock is initialised process-wide by the main
+  // isolate and stays up for the process lifetime.
+  final ws = WinsockBindings();
   final buf = calloc<ffi.Uint8>(_recvBufSize);
   try {
     while (true) {
@@ -372,9 +398,6 @@ void _recvEntry(List<Object?> args) {
     // fall through to EOF
   } finally {
     calloc.free(buf);
-    // Balance this isolate's WSAStartup so the per-process Winsock refcount
-    // doesn't grow across connect/disconnect cycles.
-    ws.wsaCleanup();
     sendPort.send(null); // signal closed
   }
 }
@@ -382,13 +405,14 @@ void _recvEntry(List<Object?> args) {
 void _writeEntry(List<Object?> args) {
   final socket = args[0] as int;
   final mainPort = args[1] as SendPort;
-  final ws = WinsockBindings()..startup();
+  // No WSAStartup/WSACleanup: Winsock is initialised process-wide by the main
+  // isolate and stays up for the process lifetime.
+  final ws = WinsockBindings();
   final rp = ReceivePort();
   mainPort.send(rp.sendPort);
   rp.listen((msg) {
     if (msg == null) {
       rp.close();
-      ws.wsaCleanup(); // balance this isolate's WSAStartup on shutdown
       return;
     }
     final rec = msg as List<Object?>;
