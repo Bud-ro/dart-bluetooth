@@ -129,7 +129,11 @@ void main() {
       ]);
 
       final emissions = <List<BluetoothDevice>>[];
-      final sub = bt.bondedAndDiscoveredStream().listen(emissions.add);
+      // Opt into the active inquiry so RSSI is refined (the default streams the
+      // paired list only, with no radio inquiry).
+      final sub = bt
+          .bondedAndDiscoveredStream(scanInterval: const Duration(seconds: 1))
+          .listen(emissions.add);
       await Future<void>.delayed(const Duration(milliseconds: 50));
       await sub.cancel();
 
@@ -145,6 +149,14 @@ void main() {
       expect(fake.discoveryStopped, isTrue);
     },
   );
+
+  test('bondedAndDiscoveredStream defaults to no radio inquiry', () async {
+    fake.bonded.add(FakeBluetoothRfcommPlatform.sampleDevice());
+    final first = await bt.bondedAndDiscoveredStream().first;
+    expect(first, hasLength(1));
+    // No scanInterval => the inquiry must never start (keeps the radio free).
+    expect(fake.discoveryStarted, isFalse);
+  });
 
   test('connect with explicit channel', () async {
     final device = FakeBluetoothRfcommPlatform.sampleDevice();
