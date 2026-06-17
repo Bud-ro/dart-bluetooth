@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 import '../../exceptions.dart';
+import '../../logging.dart';
 import '../../models/bluetooth_device.dart';
 import '../../models/bluetooth_service.dart';
 import '../../models/device_id.dart';
@@ -616,12 +617,21 @@ class _WindowsRfcommTransport implements RfcommTransport {
     _current = ConnectionState.disconnected;
     // Release any flush() waiting on a writer ack that will never arrive.
     if (!_done.isCompleted) _done.complete();
-    // Unblock recv and break the connection.
+    // Unblock recv and break the connection. Log the closesocket result: if it
+    // fails the socket stays open and holds the device's RFCOMM channel, which is
+    // the prime suspect for "the next connect fails until the app restarts".
     try {
       _ws.shutdown(_socket, 2); // SD_BOTH
-      _ws.closesocket(_socket);
-    } catch (_) {
-      /* already gone */
+      final rc = _ws.closesocket(_socket);
+      if (rc != 0) {
+        logConnection.warning(
+          () => 'closesocket failed (rc=$rc, wsa=${_ws.wsaGetLastError()})',
+        );
+      } else {
+        logConnection.fine('socket closed');
+      }
+    } catch (e) {
+      logConnection.warning(() => 'socket teardown error: $e');
     }
     _writerSend?.send(null);
     _writerControlPort?.close();
