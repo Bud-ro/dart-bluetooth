@@ -102,24 +102,37 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() async* {
-    // BluetoothFindFirstDevice with fIssueInquiry blocks for the inquiry window,
-    // so we run it on a worker isolate and emit the results when it completes.
-    //
-    // NOTE: this inquiry returns ALL remembered (paired) devices regardless of
-    // whether they actually answered, and Windows gives no reliable per-device
-    // "seen in this inquiry" flag — stLastSeen is frozen at the pairing date on
-    // real hardware, so it cannot distinguish a nearby device from an absent
-    // paired one. We therefore no longer filter by it (the previous freshness
-    // filter was pure noise). Telling "paired AND nearby" apart cheaply isn't
-    // possible through this API; that needs the Winsock WSALookupService inquiry
-    // (LUP_FLUSHCACHE returns only responders) — tracked as a follow-up.
+    // Prefer the Winsock NS_BTH inquiry (LUP_FLUSHCACHE): it returns ONLY devices
+    // that actually answered the inquiry — i.e. genuinely nearby — so a paired but
+    // absent device does NOT show up. BluetoothFindFirstDevice, by contrast, always
+    // unions in every remembered device, and Windows offers no reliable per-device
+    // "seen now" flag (stLastSeen is frozen at the pairing date on real hardware),
+    // so it cannot tell nearby from absent. We fall back to it only if the Winsock
+    // inquiry can't be started, and log which path produced the results so the two
+    // backends can be told apart during verification.
     logDiscovery.fine('inquiry starting (~10s window)');
     final start = DateTime.now();
-    final List<_RawDevice> raw;
+    List<_RawDevice> raw;
+    var via = 'WSALookupService';
     try {
-      raw = await Isolate.run(
-        () => _enumerateDevices(remembered: true, unknown: true, inquiry: true),
+      raw = await Isolate.run(_inquireViaWsaLookup);
+    } on _WsaLookupUnavailable catch (e) {
+      logDiscovery.warning(
+        () =>
+            'WSALookupService inquiry unavailable ($e); '
+            'falling back to BluetoothFindFirstDevice',
       );
+      via = 'BluetoothFindFirstDevice';
+      try {
+        raw = await Isolate.run(
+          () =>
+              _enumerateDevices(remembered: true, unknown: true, inquiry: true),
+        );
+      } on BluetoothException {
+        rethrow;
+      } catch (e) {
+        throw BluetoothDiscoveryException('inquiry failed', cause: e);
+      }
     } on BluetoothException {
       rethrow;
     } catch (e) {
@@ -128,7 +141,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     final now = DateTime.now();
     logDiscovery.fine(
       () =>
-          'inquiry returned ${raw.length} device(s) in '
+          'inquiry ($via) returned ${raw.length} device(s) in '
           '${now.difference(start).inMilliseconds}ms',
     );
     for (final r in raw) {
@@ -507,6 +520,90 @@ int? _parseRegistryMac(String name) {
   final v = int.tryParse(name, radix: 16);
   if (v == null) return null;
   return v;
+}
+
+/// Thrown by [_inquireViaWsaLookup] when the Winsock inquiry can't even be
+/// started (`WSALookupServiceBegin` failed). Carries the WSA error so the caller
+/// can log it and fall back to `BluetoothFindFirstDevice`. Sendable across the
+/// `Isolate.run` boundary (plain fields only).
+class _WsaLookupUnavailable implements Exception {
+  _WsaLookupUnavailable(this.code);
+  final int code;
+  @override
+  String toString() => 'WSALookupServiceBegin failed (WSA $code)';
+}
+
+/// Discovers devices via the Winsock NS_BTH inquiry. With `LUP_FLUSHCACHE` this
+/// performs a live inquiry and returns ONLY devices that actually responded —
+/// i.e. genuinely nearby — unlike [_enumerateDevices] (BluetoothFindFirstDevice),
+/// which always unions in every remembered/paired device. Runs in a worker
+/// isolate (blocks for the inquiry window). Throws [_WsaLookupUnavailable] if the
+/// inquiry can't be started so the caller can fall back.
+List<_RawDevice> _inquireViaWsaLookup() {
+  final ws = WinsockBindings();
+  ws.startup();
+  final out = <_RawDevice>[];
+  final restrictions = calloc<WsaQuerySet>();
+  final hLookup = calloc<ffi.IntPtr>();
+  try {
+    restrictions.ref
+      ..dwSize = ffi.sizeOf<WsaQuerySet>()
+      ..dwNameSpace = nsBth;
+    final begin = ws.wsaLookupServiceBegin(
+      restrictions,
+      lupContainers | lupFlushCache,
+      hLookup,
+    );
+    if (begin != 0) {
+      throw _WsaLookupUnavailable(ws.wsaGetLastError());
+    }
+    final handle = hLookup.value;
+    const bufSize = 4096; // one device per Next; ample for the set + its strings
+    final buf = calloc<ffi.Uint8>(bufSize);
+    final lenPtr = calloc<ffi.Uint32>();
+    final results = buf.cast<WsaQuerySet>();
+    try {
+      while (true) {
+        lenPtr.value = bufSize;
+        final rc = ws.wsaLookupServiceNext(
+          handle,
+          lupReturnName | lupReturnAddr | lupReturnType,
+          lenPtr,
+          results,
+        );
+        if (rc != 0) break; // WSA_E_NO_MORE / WSAEFAULT / any error -> stop
+        final qs = results.ref;
+        if (qs.dwNumberOfCsAddrs == 0 || qs.lpcsaBuffer == ffi.nullptr) {
+          continue; // no address -> can't identify the device, skip
+        }
+        final remote = qs.lpcsaBuffer.ref.remoteAddr;
+        if (remote.lpSockaddr == ffi.nullptr) continue;
+        final addr = remote.lpSockaddr.cast<SockaddrBth>().ref.btAddr;
+        final name = qs.lpszServiceInstanceName == ffi.nullptr
+            ? ''
+            : qs.lpszServiceInstanceName.cast<Utf16>().toDartString();
+        out.add(
+          _RawDevice(
+            addr,
+            name,
+            0, // class-of-device not requested here
+            false, // connection state isn't reported by the inquiry
+            false, // remembered/authenticated unknown from an inquiry result;
+            false, // the stream intersects with the bonded set for those flags
+          ),
+        );
+      }
+    } finally {
+      ws.wsaLookupServiceEnd(handle);
+      calloc.free(buf);
+      calloc.free(lenPtr);
+    }
+    return out;
+  } finally {
+    calloc.free(restrictions);
+    calloc.free(hLookup);
+    ws.wsaCleanup();
+  }
 }
 
 List<_RawDevice> _enumerateDevices({

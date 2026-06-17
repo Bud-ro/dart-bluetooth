@@ -24,6 +24,21 @@ const int wsaeTimedOut = 10060; // WSAETIMEDOUT (a recv() SO_RCVTIMEO expiry)
 const int solSocket = 0xffff; // SOL_SOCKET
 const int soRcvTimeo = 0x1006; // SO_RCVTIMEO
 
+// --- WSALookupService* device inquiry (ws2_32.dll) ---------------------------
+// Unlike BluetoothFindFirstDevice (which unions in ALL remembered devices), a
+// Winsock NS_BTH inquiry with LUP_FLUSHCACHE returns ONLY devices that actually
+// answered the inquiry — i.e. devices that are genuinely nearby right now.
+
+const int nsBth = 16; // NS_BTH
+const int lupContainers = 0x0002; // LUP_CONTAINERS — enumerate devices
+const int lupReturnName = 0x0010; // LUP_RETURN_NAME
+const int lupReturnType = 0x0020; // LUP_RETURN_TYPE
+const int lupReturnAddr = 0x0100; // LUP_RETURN_ADDR
+const int lupFlushCache = 0x1000; // LUP_FLUSHCACHE — force a live inquiry
+const int wsaeFault = 10014; // WSAEFAULT (result buffer too small)
+const int wsaeNoMore = 10110; // WSA_E_NO_MORE (end of enumeration)
+const int wsaNoMore = 10102; // WSAENOMORE (legacy end-of-enumeration code)
+
 /// `INVALID_SOCKET` is `(SOCKET)(~0)`; SOCKET is `UINT_PTR` (64-bit on x64).
 final int invalidSocket = -1; // all-ones when read as a pointer-sized int
 
@@ -126,6 +141,62 @@ final class BluetoothDeviceSearchParams extends ffi.Struct {
   external int hRadio; // HANDLE
 }
 
+/// `SOCKET_ADDRESS` from `ws2def.h`. Natural alignment (Dart FFI matches the C
+/// ABI's padding), so no `@Packed` here — only `SOCKADDR_BTH` itself is packed.
+final class SocketAddress extends ffi.Struct {
+  external ffi.Pointer<ffi.Void> lpSockaddr;
+
+  @ffi.Int32()
+  external int iSockaddrLength;
+}
+
+/// `CSADDR_INFO` from `ws2def.h`. We only read [remoteAddr], which for an NS_BTH
+/// inquiry result points at a `SOCKADDR_BTH`.
+final class CsAddrInfo extends ffi.Struct {
+  external SocketAddress localAddr;
+  external SocketAddress remoteAddr;
+
+  @ffi.Int32()
+  external int iSocketType;
+  @ffi.Int32()
+  external int iProtocol;
+}
+
+/// `WSAQUERYSETW` from `winsock2.h`. Pointer fields we never set/read are typed
+/// as `Pointer<Void>` and left null. Dart FFI applies the platform C struct
+/// padding, so declaring the fields in order gives the correct layout.
+final class WsaQuerySet extends ffi.Struct {
+  @ffi.Uint32()
+  external int dwSize;
+
+  external ffi.Pointer<ffi.Uint16> lpszServiceInstanceName;
+  external ffi.Pointer<ffi.Void> lpServiceClassId;
+  external ffi.Pointer<ffi.Void> lpVersion;
+  external ffi.Pointer<ffi.Uint16> lpszComment;
+
+  @ffi.Uint32()
+  external int dwNameSpace;
+
+  external ffi.Pointer<ffi.Void> lpNSProviderId;
+  external ffi.Pointer<ffi.Uint16> lpszContext;
+
+  @ffi.Uint32()
+  external int dwNumberOfProtocols;
+
+  external ffi.Pointer<ffi.Void> lpafpProtocols;
+  external ffi.Pointer<ffi.Uint16> lpszQueryString;
+
+  @ffi.Uint32()
+  external int dwNumberOfCsAddrs;
+
+  external ffi.Pointer<CsAddrInfo> lpcsaBuffer;
+
+  @ffi.Uint32()
+  external int dwOutputFlags;
+
+  external ffi.Pointer<ffi.Void> lpBlob;
+}
+
 /// `WSADATA` is opaque to us; we only need a scratch buffer of the right size
 /// (~408 bytes on x64). We over-allocate to be safe.
 const int wsaDataSize = 512;
@@ -202,6 +273,37 @@ typedef SetSockOptDart =
       int optlen,
     );
 
+typedef _WSALookupServiceBeginC =
+    ffi.Int32 Function(
+      ffi.Pointer<WsaQuerySet> lpqsRestrictions,
+      ffi.Uint32 dwControlFlags,
+      ffi.Pointer<ffi.IntPtr> lphLookup,
+    );
+typedef WSALookupServiceBeginDart =
+    int Function(
+      ffi.Pointer<WsaQuerySet> lpqsRestrictions,
+      int dwControlFlags,
+      ffi.Pointer<ffi.IntPtr> lphLookup,
+    );
+
+typedef _WSALookupServiceNextC =
+    ffi.Int32 Function(
+      ffi.IntPtr hLookup,
+      ffi.Uint32 dwControlFlags,
+      ffi.Pointer<ffi.Uint32> lpdwBufferLength,
+      ffi.Pointer<WsaQuerySet> lpqsResults,
+    );
+typedef WSALookupServiceNextDart =
+    int Function(
+      int hLookup,
+      int dwControlFlags,
+      ffi.Pointer<ffi.Uint32> lpdwBufferLength,
+      ffi.Pointer<WsaQuerySet> lpqsResults,
+    );
+
+typedef _WSALookupServiceEndC = ffi.Int32 Function(ffi.IntPtr hLookup);
+typedef WSALookupServiceEndDart = int Function(int hLookup);
+
 typedef _FindFirstDeviceC =
     ffi.IntPtr Function(
       ffi.Pointer<BluetoothDeviceSearchParams> params,
@@ -263,6 +365,18 @@ class WinsockBindings {
     setsockopt = _ws2.lookupFunction<_SetSockOptC, SetSockOptDart>(
       'setsockopt',
     );
+    wsaLookupServiceBegin = _ws2
+        .lookupFunction<_WSALookupServiceBeginC, WSALookupServiceBeginDart>(
+          'WSALookupServiceBeginW',
+        );
+    wsaLookupServiceNext = _ws2
+        .lookupFunction<_WSALookupServiceNextC, WSALookupServiceNextDart>(
+          'WSALookupServiceNextW',
+        );
+    wsaLookupServiceEnd = _ws2
+        .lookupFunction<_WSALookupServiceEndC, WSALookupServiceEndDart>(
+          'WSALookupServiceEnd',
+        );
 
     findFirstDevice = _bth
         .lookupFunction<_FindFirstDeviceC, FindFirstDeviceDart>(
@@ -300,6 +414,9 @@ class WinsockBindings {
   late final CloseSocketDart closesocket;
   late final ShutdownDart shutdown;
   late final SetSockOptDart setsockopt;
+  late final WSALookupServiceBeginDart wsaLookupServiceBegin;
+  late final WSALookupServiceNextDart wsaLookupServiceNext;
+  late final WSALookupServiceEndDart wsaLookupServiceEnd;
   late final FindFirstDeviceDart findFirstDevice;
   late final FindNextDeviceDart findNextDevice;
   late final FindDeviceCloseDart findDeviceClose;
