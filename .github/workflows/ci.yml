@@ -16,6 +16,8 @@ env:
   PKGF: packages/bluetooth_rfcomm_flutter # Flutter plugin (native builds)
   EXAMPLE: packages/bluetooth_rfcomm_flutter/example # Flutter demo app
   PKG_LE: packages/bluetooth_le # BLE pure-Dart core (in development)
+  PKG_LE_F: packages/bluetooth_le_flutter # BLE Flutter plugin (Android native)
+  EXAMPLE_LE: packages/bluetooth_le_flutter/example # BLE Flutter demo app
 
 jobs:
   # Pure-Dart core: analyze + unit tests on every desktop OS, then build and
@@ -174,6 +176,72 @@ jobs:
           arch: x86_64
           target: google_apis
           working-directory: ${{ env.EXAMPLE }}
+          script: flutter test integration_test/app_launch_test.dart -d emulator-5554
+
+  # BLE Flutter plugin package: analyze the plugin + its example.
+  flutter-package-le:
+    timeout-minutes: 20
+    name: flutter package le (analyze)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: analyze plugin
+        working-directory: ${{ env.PKG_LE_F }}
+        run: |
+          flutter pub get
+          dart format --output=none --set-exit-if-changed .
+          flutter analyze
+      - name: analyze example
+        working-directory: ${{ env.EXAMPLE_LE }}
+        run: |
+          flutter pub get
+          dart format --output=none --set-exit-if-changed .
+          flutter analyze
+
+  # BLE Flutter Android: compile (apk) + a runtime launch smoke on an emulator,
+  # which loads libbluetooth_le_android.so and exercises the JNI shim
+  # (JNI_GetCreatedJavaVMs + RegisterNatives). The native .so is built by the
+  # bluetooth_le_flutter plugin's CMake/Kotlin build.
+  build-android-le:
+    timeout-minutes: 30
+    name: flutter android le (build + emulator launch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: enable native assets
+        run: flutter config --enable-native-assets
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: generate runners + build apk
+        working-directory: ${{ env.EXAMPLE_LE }}
+        run: |
+          flutter create --platforms=android --org lol.carson .
+          flutter pub get
+          flutter build apk --debug
+      - name: launch smoke on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          working-directory: ${{ env.EXAMPLE_LE }}
           script: flutter test integration_test/app_launch_test.dart -d emulator-5554
 
   # Flutter Linux: build + headless launch smoke (xvfb) — loads the D-Bus backend.

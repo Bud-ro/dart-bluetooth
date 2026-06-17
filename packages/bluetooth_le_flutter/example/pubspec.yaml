@@ -1,0 +1,38 @@
+name: bluetooth_le_flutter_example
+description: Flutter demo for bluetooth_le (via bluetooth_le_flutter).
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.0
+  flutter: ">=3.44.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # The Flutter plugin provides the native builds; it re-exports the API, and we
+  # also depend on bluetooth_le directly for the explicit import.
+  bluetooth_le: ^0.1.0
+  bluetooth_le_flutter: ^0.1.0
+
+# Resolve the in-repo packages locally (stripped on publish). Overrides — not
+# bare path deps — are required so the plugin's own hosted constraint on
+# bluetooth_le doesn't conflict with the example's path source.
+dependency_overrides:
+  bluetooth_le:
+    path: ../../bluetooth_le
+  bluetooth_le_flutter:
+    path: ../
+
+dev_dependencies:
+  flutter_lints: ^5.0.0
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+# Run `flutter create .` here once to generate the android/ios/macos/windows/
+# linux runner projects, then add the platform permission strings documented in
+# the package README (NSBluetoothAlwaysUsageDescription, etc.).

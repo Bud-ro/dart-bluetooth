@@ -1,0 +1,42 @@
+name: bluetooth_le_flutter
+description: >-
+  Flutter plugin providing the Android (and Apple, via native assets) native
+  builds for bluetooth_le. Add it to a Flutter app and use the bluetooth_le API.
+version: 0.1.0
+repository: https://github.com/Bud-ro/dart-bluetooth
+homepage: https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_le_flutter
+issue_tracker: https://github.com/Bud-ro/dart-bluetooth/issues
+topics:
+  - bluetooth
+  - ble
+  - gatt
+  - flutter
+
+environment:
+  sdk: ^3.10.0
+  flutter: ">=3.44.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  bluetooth_le: ^0.1.0
+
+# Develop against the in-repo package; stripped on publish.
+dependency_overrides:
+  bluetooth_le:
+    path: ../bluetooth_le
+
+dev_dependencies:
+  flutter_lints: ^5.0.0
+  flutter_test:
+    sdk: flutter
+
+# Android needs the JVM/Gradle + a JNI C shim, so it can't be a Dart native
+# asset — this plugin builds it (CMake .so + Kotlin) and bundles it into the APK.
+# iOS/macOS native code is built from bluetooth_le's native-assets hook, so they
+# are not declared here.
+flutter:
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
