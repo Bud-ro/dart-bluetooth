@@ -145,69 +145,134 @@ class BluetoothRfcomm {
     return seen.values.toList(growable: false);
   }
 
+  /// How long a sighted device stays in [bondedAndDiscoveredStream]'s cache
+  /// after it was last seen, before it's treated as gone. Long enough to ride
+  /// out a flaky inquiry cycle, short enough that a device that actually left
+  /// drops off.
+  static const Duration _nearbyStaleAfter = Duration(seconds: 30);
+
+  // Shared, cached "paired + nearby" state, so every subscriber sees the same
+  // continuously-updated set and a new subscriber gets the current snapshot
+  // immediately instead of waiting for a fresh ~10s inquiry.
+  final Map<DeviceId, BluetoothDevice> _nearby = {};
+  final Map<DeviceId, DateTime> _nearbySeenAt = {};
+  final StreamController<List<BluetoothDevice>> _nearbyUpdates =
+      StreamController<List<BluetoothDevice>>.broadcast();
+  int _nearbyListeners = 0;
+  bool _nearbyScanRunning = false;
+  StreamSubscription<BluetoothDiscoveryResult>? _nearbyScanSub;
+  Completer<void>? _nearbyCycleDone;
+
   /// Continuously scans and emits the set of devices that are **both paired and
-  /// have been seen nearby** during this scan. The set is cumulative — once a
-  /// paired device is sighted it stays in the list (with its latest RSSI); a new
-  /// list is emitted whenever a fresh match appears or a known one's RSSI
-  /// updates. The inquiry is re-run automatically so scanning continues until the
-  /// subscription is cancelled, which stops it. The bonded set is re-read each
-  /// cycle, so devices paired mid-scan are picked up.
+  /// nearby**. Results are cached and shared across subscribers: a new listener
+  /// receives the current snapshot immediately (no wait for a fresh inquiry),
+  /// then live updates as devices appear, refresh their RSSI, or drop off after
+  /// [_nearbyStaleAfter] without being seen. Scanning runs while at least one
+  /// subscriber is listening and stops when the last one cancels; the cache is
+  /// kept so the next subscriber still gets an instant (if slightly stale)
+  /// snapshot. The bonded set is re-read each cycle, so devices paired mid-scan
+  /// are picked up.
   ///
-  /// This is the "list of my paired devices that are around right now (and stay
-  /// listed once seen)" stream; use [bondedAndDiscovered] for a one-shot snapshot.
+  /// Because scanning is periodic, a device that just appeared may take up to a
+  /// scan cycle to show. Use [bondedAndDiscovered] for a one-shot snapshot, or
+  /// [bondedDevices] for the instant (presence-agnostic) paired list.
   Stream<List<BluetoothDevice>> bondedAndDiscoveredStream() {
-    late StreamController<List<BluetoothDevice>> controller;
-    StreamSubscription<BluetoothDiscoveryResult>? sub;
-    Completer<void>? cycleDone;
-    var cancelled = false;
-    final seen = <DeviceId, BluetoothDevice>{};
-
-    Future<void> loop() async {
-      while (!cancelled) {
-        final byId = {for (final d in await bondedDevices()) d.id: d};
-        if (cancelled) return;
-        final done = cycleDone = Completer<void>();
-        sub = startDiscovery().listen(
-          (r) {
-            final base = byId[r.device.id];
-            if (base != null && !controller.isClosed) {
-              seen[r.device.id] = base.copyWith(rssi: r.rssi ?? r.device.rssi);
-              controller.add(seen.values.toList(growable: false));
-            }
-          },
-          onError: (Object e) {
-            if (!controller.isClosed) controller.addError(e);
-          },
-          // Inquiry finished (macOS/Android/Windows close the stream; Linux keeps
-          // it open and streams continuously, so this simply never fires there).
-          onDone: () {
-            if (!done.isCompleted) done.complete();
-          },
-          cancelOnError: false,
-        );
-        await done.future;
-        await sub?.cancel();
-        sub = null;
+    return Stream<List<BluetoothDevice>>.multi((controller) {
+      // Forward shared updates to this subscriber, then hand it the current
+      // cached snapshot right away (only if we already have something, so a
+      // fresh stream's `first` is a real sighting, not an empty list).
+      final sub = _nearbyUpdates.stream.listen(
+        controller.add,
+        onError: controller.addError,
+      );
+      if (_nearby.isNotEmpty) {
+        controller.add(_nearby.values.toList(growable: false));
       }
-    }
+      _nearbyListeners++;
+      _startNearbyScan();
+      controller.onCancel = () {
+        _nearbyListeners--;
+        if (_nearbyListeners <= 0) _stopNearbyScan();
+        return sub.cancel();
+      };
+    });
+  }
 
-    controller = StreamController<List<BluetoothDevice>>.broadcast(
-      onListen: () {
-        cancelled = false;
-        unawaited(
-          loop().catchError((Object e) {
-            if (!controller.isClosed) controller.addError(e);
-          }),
-        );
-      },
-      onCancel: () async {
-        cancelled = true;
-        if (cycleDone != null && !cycleDone!.isCompleted) cycleDone!.complete();
-        await sub?.cancel();
-        await stopDiscovery();
-      },
+  void _startNearbyScan() {
+    if (_nearbyScanRunning) return;
+    _nearbyScanRunning = true;
+    unawaited(
+      _nearbyScanLoop().catchError((Object e) {
+        if (!_nearbyUpdates.isClosed) _nearbyUpdates.addError(e);
+      }),
     );
-    return controller.stream;
+  }
+
+  void _stopNearbyScan() {
+    if (_nearbyCycleDone != null && !_nearbyCycleDone!.isCompleted) {
+      _nearbyCycleDone!.complete();
+    }
+    unawaited(_nearbyScanSub?.cancel());
+    _nearbyScanSub = null;
+    unawaited(stopDiscovery());
+  }
+
+  Future<void> _nearbyScanLoop() async {
+    while (_nearbyListeners > 0) {
+      final Map<DeviceId, BluetoothDevice> byId;
+      try {
+        byId = {for (final d in await bondedDevices()) d.id: d};
+      } catch (e) {
+        if (!_nearbyUpdates.isClosed) _nearbyUpdates.addError(e);
+        await Future<void>.delayed(const Duration(seconds: 2));
+        continue;
+      }
+      if (_nearbyListeners <= 0) break;
+      final done = _nearbyCycleDone = Completer<void>();
+      _nearbyScanSub = startDiscovery().listen(
+        (r) {
+          final base = byId[r.device.id];
+          if (base == null) return;
+          _nearby[r.device.id] = base.copyWith(rssi: r.rssi ?? r.device.rssi);
+          _nearbySeenAt[r.device.id] = DateTime.now();
+          _emitNearby();
+        },
+        onError: (Object e) {
+          if (!_nearbyUpdates.isClosed) _nearbyUpdates.addError(e);
+        },
+        // Inquiry finished (macOS/Android/Windows close the stream; Linux keeps
+        // it open and streams continuously, so this never fires there).
+        onDone: () {
+          if (!done.isCompleted) done.complete();
+        },
+        cancelOnError: false,
+      );
+      await done.future;
+      await _nearbyScanSub?.cancel();
+      _nearbyScanSub = null;
+      _evictStaleNearby();
+    }
+    _nearbyScanRunning = false;
+  }
+
+  void _evictStaleNearby() {
+    final cutoff = DateTime.now().subtract(_nearbyStaleAfter);
+    final gone = _nearbySeenAt.entries
+        .where((e) => e.value.isBefore(cutoff))
+        .map((e) => e.key)
+        .toList();
+    if (gone.isEmpty) return;
+    for (final id in gone) {
+      _nearby.remove(id);
+      _nearbySeenAt.remove(id);
+    }
+    _emitNearby();
+  }
+
+  void _emitNearby() {
+    if (!_nearbyUpdates.isClosed) {
+      _nearbyUpdates.add(_nearby.values.toList(growable: false));
+    }
   }
 
   /// Resolves the RFCOMM services [device] advertises via SDP. Pass the result's
@@ -241,6 +306,11 @@ class BluetoothRfcomm {
     Uuid? serviceUuid,
     Duration? timeout,
   }) async {
+    // Yield to the event loop before any (potentially blocking) native/isolate
+    // setup, so a caller that flips its UI to "connecting" right before calling
+    // connect() gets that frame painted immediately — rather than after the
+    // worker-isolate spawn that some backends (Windows) do synchronously.
+    await Future<void>.delayed(Duration.zero);
     final uuid = serviceUuid ?? Uuid.spp;
     logConnection.fine(
       () =>
@@ -284,5 +354,10 @@ class BluetoothRfcomm {
   /// Process-lifetime native callback registrations (the FFI `NativeCallable`
   /// listeners on Android/macOS/iOS) are intentionally not torn down; the shared
   /// [instance] generally lives for the app's lifetime.
-  Future<void> dispose() => _platform.dispose();
+  Future<void> dispose() async {
+    _nearbyListeners = 0;
+    _stopNearbyScan();
+    if (!_nearbyUpdates.isClosed) await _nearbyUpdates.close();
+    await _platform.dispose();
+  }
 }
