@@ -137,13 +137,15 @@ jobs:
           dart format --output=none --set-exit-if-changed .
           flutter analyze
 
-  # Flutter Android: compile (apk) + a runtime launch smoke on an emulator,
-  # which loads libbluetooth_rfcomm_android.so and exercises the JNI shim
-  # (JNI_GetCreatedJavaVMs + RegisterNatives) — the riskiest loading path. The
-  # native .so comes from the bluetooth_rfcomm_flutter plugin's CMake build.
+  # Flutter Android: build the debug APK, which compiles the Kotlin backend and
+  # the JNI C shim (CMake) and bundles libbluetooth_rfcomm_android.so — the real
+  # native gate. The runtime launch smoke (loading the .so + JNI registration on
+  # a booted emulator) is intentionally NOT run here: GitHub-hosted Android
+  # emulators boot too slowly/flakily to gate every push. That runtime check
+  # lives in the manually-triggered Integration workflow's emulator job.
   build-android:
-    timeout-minutes: 30
-    name: flutter android (build + emulator launch)
+    timeout-minutes: 25
+    name: flutter android (build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -156,53 +158,12 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-      - name: enable native assets
-        run: flutter config --enable-native-assets
-      - name: enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
       - name: generate runners + build apk
         working-directory: ${{ env.EXAMPLE }}
         run: |
           flutter create --platforms=android --org lol.carson .
           flutter pub get
           flutter build apk --debug
-      # Cache a booted-emulator snapshot so the launch step restores in seconds
-      # instead of cold-booting (the cold boot is what intermittently times out).
-      - name: AVD cache
-        uses: actions/cache@v4
-        id: avd-cache
-        with:
-          path: |
-            ~/.android/avd/*
-            ~/.android/adb*
-          key: avd-30-x86_64-default
-      - name: create AVD snapshot (on cache miss)
-        if: steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 30
-          arch: x86_64
-          target: default
-          force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: false
-          emulator-boot-timeout: 900
-          script: echo "AVD snapshot created."
-      - name: launch smoke on emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 30
-          arch: x86_64
-          target: default
-          force-avd-creation: false
-          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: true
-          emulator-boot-timeout: 900
-          working-directory: ${{ env.EXAMPLE }}
-          script: flutter test integration_test/app_launch_test.dart -d emulator-5554
 
   # BLE Flutter plugin package: analyze the plugin + its example.
   flutter-package-le:
@@ -229,13 +190,15 @@ jobs:
           dart format --output=none --set-exit-if-changed .
           flutter analyze
 
-  # BLE Flutter Android: compile (apk) + a runtime launch smoke on an emulator,
-  # which loads libbluetooth_le_android.so and exercises the JNI shim
-  # (JNI_GetCreatedJavaVMs + RegisterNatives). The native .so is built by the
-  # bluetooth_le_flutter plugin's CMake/Kotlin build.
+  # BLE Flutter Android: build the debug APK, which compiles the Kotlin
+  # BluetoothGatt backend and the JNI C shim (CMake) and bundles
+  # libbluetooth_le_android.so — the real native gate. The runtime launch smoke
+  # is intentionally NOT run here (hosted Android emulators boot too
+  # slowly/flakily to gate every push); it lives in the manually-triggered
+  # Integration workflow's emulator job.
   build-android-le:
-    timeout-minutes: 30
-    name: flutter android le (build + emulator launch)
+    timeout-minutes: 25
+    name: flutter android le (build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -248,53 +211,12 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-      - name: enable native assets
-        run: flutter config --enable-native-assets
-      - name: enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
       - name: generate runners + build apk
         working-directory: ${{ env.EXAMPLE_LE }}
         run: |
           flutter create --platforms=android --org lol.carson .
           flutter pub get
           flutter build apk --debug
-      # Cache a booted-emulator snapshot so the launch step restores in seconds
-      # instead of cold-booting (the cold boot is what intermittently times out).
-      - name: AVD cache
-        uses: actions/cache@v4
-        id: avd-cache
-        with:
-          path: |
-            ~/.android/avd/*
-            ~/.android/adb*
-          key: avd-30-x86_64-default
-      - name: create AVD snapshot (on cache miss)
-        if: steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 30
-          arch: x86_64
-          target: default
-          force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: false
-          emulator-boot-timeout: 900
-          script: echo "AVD snapshot created."
-      - name: launch smoke on emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 30
-          arch: x86_64
-          target: default
-          force-avd-creation: false
-          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: true
-          emulator-boot-timeout: 900
-          working-directory: ${{ env.EXAMPLE_LE }}
-          script: flutter test integration_test/app_launch_test.dart -d emulator-5554
 
   # Flutter Linux: build + headless launch smoke (xvfb) — loads the D-Bus backend.
   build-linux:
