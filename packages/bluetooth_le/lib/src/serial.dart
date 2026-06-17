@@ -63,14 +63,20 @@ class BleSerial {
   /// bytes). Returns the negotiated MTU.
   Future<int> negotiateMtu([int mtu = 247]) async {
     final negotiated = await _conn.requestMtu(mtu);
-    if (negotiated > 23) chunkSize = negotiated - 3;
+    // Always (re)set chunkSize so a later small MTU can't leave a stale large
+    // value that would overflow the real ATT payload.
+    chunkSize = negotiated > 23 ? negotiated - 3 : 20;
     return negotiated;
   }
 
   /// Sends [data], chunked to [chunkSize], awaiting the OS accepting each chunk.
   /// Serialised after any earlier [add]/[write]. Throws if the serial is closed.
   Future<void> write(Uint8List data) {
-    if (_closed) throw const BleGattException('serial is closed');
+    // Return an errored future (not a synchronous throw) so [add] stays
+    // fire-and-forget even on a closed serial; `await write(...)` still throws.
+    if (_closed) {
+      return Future<void>.error(const BleGattException('serial is closed'));
+    }
     if (data.isEmpty) return Future<void>.value();
     final result = _chain.then((_) => _writeChunked(data));
     // Keep the ordering chain alive past a failed write (caller still sees the

@@ -36,9 +36,18 @@ class WindowsBleCentral extends BleCentralPlatform {
   WindowsBleCentral() : _lib = WindowsBleBindings();
 
   final WindowsBleBindings _lib;
+  final Set<WindowsGattConnection> _open = {};
 
   @override
   Future<bool> isSupported() async => true;
+
+  @override
+  Future<void> dispose() async {
+    for (final c in _open.toList()) {
+      await c.close();
+    }
+    _open.clear();
+  }
 
   @override
   Future<BluetoothAdapterState> adapterState() async {
@@ -118,7 +127,10 @@ class WindowsBleCentral extends BleCentralPlatform {
         code: _lib.getLastError(),
       );
     }
-    return WindowsGattConnection(handle, _lib);
+    final conn = WindowsGattConnection(handle, _lib);
+    _open.add(conn);
+    conn._onClosed = () => _open.remove(conn);
+    return conn;
   }
 
   /// Enumerates `GUID_BLUETOOTHLE_DEVICE_INTERFACE` and returns the device
@@ -200,12 +212,14 @@ class WindowsBleCentral extends BleCentralPlatform {
 
 /// A live Win32 GATT connection backed by a device `HANDLE`.
 class WindowsGattConnection implements GattConnection {
-  WindowsGattConnection(this._handle, this._lib) {
-    _stateController.add(BleConnectionState.connected);
-  }
+  // Already connected on construction (CreateFile succeeded). The initial state
+  // is exposed via [state]; the broadcast controller only emits transitions
+  // (e.g. the disconnect on close), matching the other backends.
+  WindowsGattConnection(this._handle, this._lib);
 
   int _handle;
   final WindowsBleBindings _lib;
+  void Function()? _onClosed;
   final StreamController<BleConnectionState> _stateController =
       StreamController<BleConnectionState>.broadcast();
   // Malloc'd characteristic structs kept for the connection's lifetime so
@@ -228,46 +242,56 @@ class WindowsGattConnection implements GattConnection {
   BleConnectionState get state => _current;
 
   @override
-  Future<List<BleService>> discoverServices() {
-    return _enqueue(() async {
-      logGatt.fine('discoverServices');
-      _freeChars();
-      final services = <BleService>[];
-      final actual = calloc<ffi.Uint16>();
+  Future<List<BleService>> discoverServices() =>
+      _enqueue(_discoverServicesUnlocked);
+
+  // The discovery body WITHOUT _enqueue, so callers already holding the op chain
+  // (e.g. _charPtr inside a read/write) can run it without self-deadlocking.
+  Future<List<BleService>> _discoverServicesUnlocked() async {
+    if (_closed) throw const BleGattException('connection closed');
+    logGatt.fine('discoverServices');
+    _freeChars();
+    final services = <BleService>[];
+    final actual = calloc<ffi.Uint16>();
+    try {
+      final sizeHr = _lib.gattGetServices(
+        _handle,
+        0,
+        ffi.nullptr.cast(),
+        actual,
+        bluetoothGattFlagNone,
+      );
+      if (!_sizingOk(sizeHr)) {
+        throw BleGattException('GetServices (size) failed', code: sizeHr);
+      }
+      final count = actual.value;
+      if (count == 0) return services;
+      final buf = calloc<BthLeGattService>(count);
       try {
-        var hr = _lib.gattGetServices(
+        final hr = _lib.gattGetServices(
           _handle,
-          0,
-          ffi.nullptr.cast(),
+          count,
+          buf,
           actual,
           bluetoothGattFlagNone,
         );
-        final count = actual.value;
-        if (count == 0) return services;
-        final buf = calloc<BthLeGattService>(count);
-        try {
-          hr = _lib.gattGetServices(
-            _handle,
-            count,
-            buf,
-            actual,
-            bluetoothGattFlagNone,
+        if (hr != sOk) throw BleGattException('GetServices failed', code: hr);
+        // Clamp to the buffer we sized: never index past `count` even if the
+        // device's service set grew between the two calls.
+        final n = actual.value < count ? actual.value : count;
+        for (var i = 0; i < n; i++) {
+          final svcPtr = ffi.Pointer<BthLeGattService>.fromAddress(
+            buf.address + i * ffi.sizeOf<BthLeGattService>(),
           );
-          if (hr != sOk) throw BleGattException('GetServices failed', code: hr);
-          for (var i = 0; i < actual.value; i++) {
-            final svcPtr = ffi.Pointer<BthLeGattService>.fromAddress(
-              buf.address + i * ffi.sizeOf<BthLeGattService>(),
-            );
-            services.add(_discoverCharacteristics(svcPtr));
-          }
-        } finally {
-          calloc.free(buf);
+          services.add(_discoverCharacteristics(svcPtr));
         }
-        return services;
       } finally {
-        calloc.free(actual);
+        calloc.free(buf);
       }
-    });
+      return services;
+    } finally {
+      calloc.free(actual);
+    }
   }
 
   BleService _discoverCharacteristics(ffi.Pointer<BthLeGattService> svcPtr) {
@@ -275,7 +299,7 @@ class WindowsGattConnection implements GattConnection {
     final chars = <BleCharacteristic>[];
     final actual = calloc<ffi.Uint16>();
     try {
-      _lib.gattGetCharacteristics(
+      final sizeHr = _lib.gattGetCharacteristics(
         _handle,
         svcPtr,
         0,
@@ -283,6 +307,12 @@ class WindowsGattConnection implements GattConnection {
         actual,
         bluetoothGattFlagNone,
       );
+      if (!_sizingOk(sizeHr)) {
+        throw BleGattException(
+          'GetCharacteristics (size) failed',
+          code: sizeHr,
+        );
+      }
       final count = actual.value;
       if (count == 0) return BleService(uuid: serviceUuid, characteristics: []);
       final buf = calloc<BthLeGattCharacteristic>(count);
@@ -298,7 +328,8 @@ class WindowsGattConnection implements GattConnection {
         calloc.free(buf);
         throw BleGattException('GetCharacteristics failed', code: hr);
       }
-      for (var i = 0; i < actual.value; i++) {
+      final n = actual.value < count ? actual.value : count;
+      for (var i = 0; i < n; i++) {
         final src = ffi.Pointer<BthLeGattCharacteristic>.fromAddress(
           buf.address + i * ffi.sizeOf<BthLeGattCharacteristic>(),
         );
@@ -329,7 +360,7 @@ class WindowsGattConnection implements GattConnection {
       logGatt.fine(() => 'read ${characteristic.value}');
       final sizeReq = calloc<ffi.Uint16>();
       try {
-        _lib.gattGetCharacteristicValue(
+        final sizeHr = _lib.gattGetCharacteristicValue(
           _handle,
           charPtr,
           0,
@@ -337,6 +368,9 @@ class WindowsGattConnection implements GattConnection {
           sizeReq,
           bluetoothGattFlagNone,
         );
+        if (!_sizingOk(sizeHr)) {
+          throw BleGattException('read (size) failed', code: sizeHr);
+        }
         final size = sizeReq.value;
         if (size == 0) return Uint8List(0);
         final buf = calloc<ffi.Uint8>(size);
@@ -430,6 +464,7 @@ class WindowsGattConnection implements GattConnection {
       }
     }
     if (!_stateController.isClosed) await _stateController.close();
+    _onClosed?.call();
   }
 
   Future<ffi.Pointer<BthLeGattCharacteristic>> _charPtr(
@@ -439,7 +474,9 @@ class WindowsGattConnection implements GattConnection {
     final key = '${service.value}|${characteristic.value}';
     final cached = _chars[key];
     if (cached != null) return cached;
-    await discoverServices();
+    // Called from inside an enqueued op, so run discovery UNLOCKED to avoid a
+    // self-deadlock on the per-connection op chain.
+    await _discoverServicesUnlocked();
     final p = _chars[key];
     if (p == null) {
       throw CharacteristicNotFoundException(
@@ -448,6 +485,11 @@ class WindowsGattConnection implements GattConnection {
     }
     return p;
   }
+
+  // The sizing (first) call of a two-call GATT API returns S_OK or
+  // HRESULT_FROM_WIN32(ERROR_MORE_DATA); anything else is a real failure.
+  static bool _sizingOk(int hr) => hr == sOk || hr == _hrErrorMoreData;
+  static const int _hrErrorMoreData = 0x800700EA;
 
   void _freeChars() {
     for (final p in _chars.values) {

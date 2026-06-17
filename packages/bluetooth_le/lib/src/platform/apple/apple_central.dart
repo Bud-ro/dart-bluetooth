@@ -137,6 +137,18 @@ class AppleBleCentral extends BleCentralPlatform {
     return conn;
   }
 
+  @override
+  Future<void> dispose() async {
+    for (final c in _connections.values.toList()) {
+      await c.close();
+    }
+    bleStopScan();
+    if (_scanController != null && !_scanController!.isClosed) {
+      await _scanController!.close();
+    }
+    _scanController = null;
+  }
+
   // --- native callback dispatch --------------------------------------------
 
   static void _onScan(int token, ffi.Pointer<ffi.Char> json) {
@@ -264,6 +276,32 @@ class AppleGattConnection implements GattConnection {
     return result;
   }
 
+  // reqIds for this connection's in-flight ops, so teardown can fail them
+  // instead of leaving their Completers (and the op chain) hung forever.
+  final Set<int> _pendingReqs = {};
+
+  // Registers an op, issues the native call, and awaits its result — removing
+  // the Completer if the native call throws synchronously (no leak) and on
+  // completion (so teardown only sees genuinely in-flight ops).
+  Future<_OpResult> _runOp(void Function(int reqId) issue) async {
+    final reqId = AppleBleCentral._nextReqId++;
+    final completer = Completer<_OpResult>();
+    AppleBleCentral._ops[reqId] = completer;
+    _pendingReqs.add(reqId);
+    try {
+      issue(reqId);
+    } catch (_) {
+      AppleBleCentral._ops.remove(reqId);
+      _pendingReqs.remove(reqId);
+      rethrow;
+    }
+    try {
+      return await completer.future;
+    } finally {
+      _pendingReqs.remove(reqId);
+    }
+  }
+
   void _onNotifyNative(String key, Uint8List value) {
     _notifyControllers[key]?.add(value);
   }
@@ -289,6 +327,9 @@ class AppleGattConnection implements GattConnection {
 
   Future<void> waitConnected(Duration? timeout) {
     if (timeout == null) return _connected.future;
+    // _teardown() may completeError(_connected) after the timeout already fired;
+    // a detached handler keeps that from surfacing as an unhandled async error.
+    unawaited(_connected.future.catchError((_) {}));
     return _connected.future.timeout(
       timeout,
       onTimeout: () {
@@ -306,35 +347,35 @@ class AppleGattConnection implements GattConnection {
   BleConnectionState get state => _current;
 
   @override
-  Future<List<BleService>> discoverServices() async {
-    final reqId = AppleBleCentral._nextReqId++;
-    final completer = Completer<_OpResult>();
-    AppleBleCentral._ops[reqId] = completer;
-    logGatt.fine(() => 'discoverServices conn $_token');
-    bleDiscoverServices(reqId, _token);
-    final r = await completer.future;
-    if (r.status != 0 || r.json == null) {
-      throw BleGattException('service discovery failed', code: r.status);
-    }
-    return _parseServices(r.json!);
+  Future<List<BleService>> discoverServices() {
+    return _enqueue(() async {
+      logGatt.fine(() => 'discoverServices conn $_token');
+      final r = await _runOp((reqId) => bleDiscoverServices(reqId, _token));
+      if (r.status != 0 || r.json == null) {
+        throw BleGattException('service discovery failed', code: r.status);
+      }
+      try {
+        return _parseServices(r.json!);
+      } catch (e) {
+        throw BleGattException('malformed service discovery payload', cause: e);
+      }
+    });
   }
 
   @override
   Future<Uint8List> readCharacteristic(Uuid service, Uuid characteristic) {
     return _enqueue(() async {
-      final reqId = AppleBleCentral._nextReqId++;
-      final completer = Completer<_OpResult>();
-      AppleBleCentral._ops[reqId] = completer;
       logGatt.fine(() => 'read ${characteristic.value} conn $_token');
-      final sPtr = service.value.toNativeUtf8();
-      final cPtr = characteristic.value.toNativeUtf8();
-      try {
-        bleRead(reqId, _token, sPtr.cast(), cPtr.cast());
-      } finally {
-        calloc.free(sPtr);
-        calloc.free(cPtr);
-      }
-      final r = await completer.future;
+      final r = await _runOp((reqId) {
+        final sPtr = service.value.toNativeUtf8();
+        final cPtr = characteristic.value.toNativeUtf8();
+        try {
+          bleRead(reqId, _token, sPtr.cast(), cPtr.cast());
+        } finally {
+          calloc.free(sPtr);
+          calloc.free(cPtr);
+        }
+      });
       if (r.status != 0) {
         throw BleGattException('read failed', code: r.status);
       }
@@ -350,38 +391,36 @@ class AppleGattConnection implements GattConnection {
     bool withoutResponse = false,
   }) {
     return _enqueue(() async {
-      final reqId = AppleBleCentral._nextReqId++;
-      final completer = Completer<_OpResult>();
-      AppleBleCentral._ops[reqId] = completer;
       logData.finest(
         () => 'write ${characteristic.value} ${describeBytes(value)}',
       );
-      final sPtr = service.value.toNativeUtf8();
-      final cPtr = characteristic.value.toNativeUtf8();
-      // ble_write copies the bytes into an NSData synchronously, so freeing the
-      // buffer right after the call returns is safe.
-      final dPtr = value.isEmpty
-          ? ffi.nullptr
-          : calloc<ffi.Uint8>(value.length);
-      if (value.isNotEmpty) {
-        dPtr.asTypedList(value.length).setAll(0, value);
-      }
-      try {
-        bleWrite(
-          reqId,
-          _token,
-          sPtr.cast(),
-          cPtr.cast(),
-          dPtr.cast(),
-          value.length,
-          withoutResponse ? 1 : 0,
-        );
-      } finally {
-        calloc.free(sPtr);
-        calloc.free(cPtr);
-        if (value.isNotEmpty) calloc.free(dPtr);
-      }
-      final r = await completer.future;
+      final r = await _runOp((reqId) {
+        final sPtr = service.value.toNativeUtf8();
+        final cPtr = characteristic.value.toNativeUtf8();
+        // ble_write copies the bytes into an NSData synchronously, so freeing
+        // the buffer right after the call returns is safe.
+        final dPtr = value.isEmpty
+            ? ffi.nullptr
+            : calloc<ffi.Uint8>(value.length);
+        if (value.isNotEmpty) {
+          dPtr.asTypedList(value.length).setAll(0, value);
+        }
+        try {
+          bleWrite(
+            reqId,
+            _token,
+            sPtr.cast(),
+            cPtr.cast(),
+            dPtr.cast(),
+            value.length,
+            withoutResponse ? 1 : 0,
+          );
+        } finally {
+          calloc.free(sPtr);
+          calloc.free(cPtr);
+          if (value.isNotEmpty) calloc.free(dPtr);
+        }
+      });
       if (r.status != 0) {
         throw BleGattException('write failed', code: r.status);
       }
@@ -401,6 +440,7 @@ class AppleGattConnection implements GattConnection {
       onCancel: () {
         _setNotify(service, characteristic, enable: false);
         _notifyControllers.remove(key);
+        if (!controller.isClosed) controller.close();
       },
     );
     return controller.stream;
@@ -432,8 +472,26 @@ class AppleGattConnection implements GattConnection {
     _teardown();
   }
 
+  bool _torn = false;
+
   void _teardown() {
+    if (_torn) return;
+    _torn = true;
     AppleBleCentral._connections.remove(_token);
+    // Fail any in-flight GATT ops so their awaits (and the op chain) don't hang
+    // forever when the link drops or close() races a pending op.
+    for (final reqId in _pendingReqs.toList()) {
+      AppleBleCentral._ops
+          .remove(reqId)
+          ?.complete(const _OpResult(-1, null, null));
+    }
+    _pendingReqs.clear();
+    if (!_connected.isCompleted) {
+      _connected.completeError(
+        const BleConnectionException('connection closed'),
+        StackTrace.current,
+      );
+    }
     if (_current != BleConnectionState.disconnected) {
       _current = BleConnectionState.disconnected;
       if (!_stateController.isClosed) {

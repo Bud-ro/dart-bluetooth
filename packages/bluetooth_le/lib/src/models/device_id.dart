@@ -42,16 +42,27 @@ class DeviceId {
   }
 
   static String _normalizeAddress(String raw) {
-    final cleaned = raw.replaceAll('-', ':').toUpperCase().trim();
-    if (cleaned.contains(':')) return cleaned;
-    if (cleaned.length == 12) {
+    final cleaned = raw.trim().replaceAll('-', ':').toUpperCase();
+    final String colonForm;
+    if (cleaned.contains(':')) {
+      colonForm = cleaned;
+    } else if (cleaned.length == 12) {
       final pairs = <String>[];
       for (var i = 0; i < 12; i += 2) {
         pairs.add(cleaned.substring(i, i + 2));
       }
-      return pairs.join(':');
+      colonForm = pairs.join(':');
+    } else {
+      throw FormatException('Invalid Bluetooth address: $raw');
     }
-    return cleaned;
+    final parts = colonForm.split(':');
+    final valid =
+        parts.length == 6 &&
+        parts.every((p) => p.length == 2 && int.tryParse(p, radix: 16) != null);
+    if (!valid) {
+      throw FormatException('Invalid Bluetooth address: $raw');
+    }
+    return colonForm;
   }
 
   @override

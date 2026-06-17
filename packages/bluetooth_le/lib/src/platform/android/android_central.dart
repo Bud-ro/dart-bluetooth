@@ -301,6 +301,30 @@ class AndroidGattConnection implements GattConnection {
     return result;
   }
 
+  // reqIds for this connection's in-flight ops, so teardown can fail them
+  // instead of leaving their Completers (and the op chain) hung forever.
+  final Set<int> _pendingReqs = {};
+  bool _torn = false;
+
+  Future<_OpResult> _runOp(void Function(int reqId) issue) async {
+    final reqId = AndroidBleCentral._nextReqId++;
+    final completer = Completer<_OpResult>();
+    AndroidBleCentral._ops[reqId] = completer;
+    _pendingReqs.add(reqId);
+    try {
+      issue(reqId);
+    } catch (_) {
+      AndroidBleCentral._ops.remove(reqId);
+      _pendingReqs.remove(reqId);
+      rethrow;
+    }
+    try {
+      return await completer.future;
+    } finally {
+      _pendingReqs.remove(reqId);
+    }
+  }
+
   void _onNotifyNative(String key, Uint8List value) {
     _notifyControllers[key]?.add(value);
   }
@@ -326,6 +350,9 @@ class AndroidGattConnection implements GattConnection {
 
   Future<void> waitConnected(Duration? timeout) {
     if (timeout == null) return _connected.future;
+    // _teardown() may completeError(_connected) after the timeout already fired;
+    // a detached handler keeps that from surfacing as an unhandled async error.
+    unawaited(_connected.future.catchError((_) {}));
     return _connected.future.timeout(
       timeout,
       onTimeout: () {
@@ -343,35 +370,35 @@ class AndroidGattConnection implements GattConnection {
   BleConnectionState get state => _current;
 
   @override
-  Future<List<BleService>> discoverServices() async {
-    final reqId = AndroidBleCentral._nextReqId++;
-    final completer = Completer<_OpResult>();
-    AndroidBleCentral._ops[reqId] = completer;
-    logGatt.fine(() => 'discoverServices conn $_token');
-    _lib.discoverServices(reqId, _token);
-    final r = await completer.future;
-    if (r.status != 0 || r.json == null) {
-      throw BleGattException('service discovery failed', code: r.status);
-    }
-    return _parseServices(r.json!);
+  Future<List<BleService>> discoverServices() {
+    return _enqueue(() async {
+      logGatt.fine(() => 'discoverServices conn $_token');
+      final r = await _runOp((reqId) => _lib.discoverServices(reqId, _token));
+      if (r.status != 0 || r.json == null) {
+        throw BleGattException('service discovery failed', code: r.status);
+      }
+      try {
+        return _parseServices(r.json!);
+      } catch (e) {
+        throw BleGattException('malformed service discovery payload', cause: e);
+      }
+    });
   }
 
   @override
   Future<Uint8List> readCharacteristic(Uuid service, Uuid characteristic) {
     return _enqueue(() async {
-      final reqId = AndroidBleCentral._nextReqId++;
-      final completer = Completer<_OpResult>();
-      AndroidBleCentral._ops[reqId] = completer;
       logGatt.fine(() => 'read ${characteristic.value} conn $_token');
-      final sPtr = service.value.toNativeUtf8();
-      final cPtr = characteristic.value.toNativeUtf8();
-      try {
-        _lib.read(reqId, _token, sPtr.cast(), cPtr.cast());
-      } finally {
-        calloc.free(sPtr);
-        calloc.free(cPtr);
-      }
-      final r = await completer.future;
+      final r = await _runOp((reqId) {
+        final sPtr = service.value.toNativeUtf8();
+        final cPtr = characteristic.value.toNativeUtf8();
+        try {
+          _lib.read(reqId, _token, sPtr.cast(), cPtr.cast());
+        } finally {
+          calloc.free(sPtr);
+          calloc.free(cPtr);
+        }
+      });
       if (r.status != 0) throw BleGattException('read failed', code: r.status);
       return r.data ?? Uint8List(0);
     });
@@ -385,36 +412,34 @@ class AndroidGattConnection implements GattConnection {
     bool withoutResponse = false,
   }) {
     return _enqueue(() async {
-      final reqId = AndroidBleCentral._nextReqId++;
-      final completer = Completer<_OpResult>();
-      AndroidBleCentral._ops[reqId] = completer;
       logData.finest(
         () => 'write ${characteristic.value} ${describeBytes(value)}',
       );
-      final sPtr = service.value.toNativeUtf8();
-      final cPtr = characteristic.value.toNativeUtf8();
-      final dPtr = value.isEmpty
-          ? ffi.nullptr
-          : calloc<ffi.Uint8>(value.length);
-      if (value.isNotEmpty) {
-        dPtr.asTypedList(value.length).setAll(0, value);
-      }
-      try {
-        _lib.write(
-          reqId,
-          _token,
-          sPtr.cast(),
-          cPtr.cast(),
-          dPtr.cast(),
-          value.length,
-          withoutResponse ? 1 : 0,
-        );
-      } finally {
-        calloc.free(sPtr);
-        calloc.free(cPtr);
-        if (value.isNotEmpty) calloc.free(dPtr);
-      }
-      final r = await completer.future;
+      final r = await _runOp((reqId) {
+        final sPtr = service.value.toNativeUtf8();
+        final cPtr = characteristic.value.toNativeUtf8();
+        final dPtr = value.isEmpty
+            ? ffi.nullptr
+            : calloc<ffi.Uint8>(value.length);
+        if (value.isNotEmpty) {
+          dPtr.asTypedList(value.length).setAll(0, value);
+        }
+        try {
+          _lib.write(
+            reqId,
+            _token,
+            sPtr.cast(),
+            cPtr.cast(),
+            dPtr.cast(),
+            value.length,
+            withoutResponse ? 1 : 0,
+          );
+        } finally {
+          calloc.free(sPtr);
+          calloc.free(cPtr);
+          if (value.isNotEmpty) calloc.free(dPtr);
+        }
+      });
       if (r.status != 0) throw BleGattException('write failed', code: r.status);
     });
   }
@@ -432,6 +457,7 @@ class AndroidGattConnection implements GattConnection {
       onCancel: () {
         _setNotify(service, characteristic, enable: false);
         _notifyControllers.remove(key);
+        if (!controller.isClosed) controller.close();
       },
     );
     return controller.stream;
@@ -451,16 +477,18 @@ class AndroidGattConnection implements GattConnection {
   @override
   Future<int> requestMtu(int mtu) {
     return _enqueue(() async {
-      final reqId = AndroidBleCentral._nextReqId++;
-      final completer = Completer<_OpResult>();
-      AndroidBleCentral._ops[reqId] = completer;
-      _lib.requestMtu(reqId, _token, mtu);
-      final r = await completer.future;
-      final negotiated = (r.json != null)
-          ? (jsonDecode(r.json!) as Map<String, dynamic>)['mtu'] as int?
-          : null;
-      // MTU exchange is best-effort; fall back to the ATT default.
-      return negotiated ?? 23;
+      final r = await _runOp((reqId) => _lib.requestMtu(reqId, _token, mtu));
+      // MTU exchange is best-effort; tolerate any malformed/absent payload and
+      // fall back to the ATT default rather than throwing.
+      try {
+        final decoded = r.json != null ? jsonDecode(r.json!) : null;
+        if (decoded is Map && decoded['mtu'] is num) {
+          return (decoded['mtu'] as num).toInt();
+        }
+      } catch (_) {
+        // fall through to default
+      }
+      return 23;
     });
   }
 
@@ -473,7 +501,23 @@ class AndroidGattConnection implements GattConnection {
   }
 
   void _teardown() {
+    if (_torn) return;
+    _torn = true;
     AndroidBleCentral._connections.remove(_token);
+    // Fail any in-flight GATT ops so their awaits (and the op chain) don't hang
+    // forever when the link drops or close() races a pending op.
+    for (final reqId in _pendingReqs.toList()) {
+      AndroidBleCentral._ops
+          .remove(reqId)
+          ?.complete(const _OpResult(-1, null, null));
+    }
+    _pendingReqs.clear();
+    if (!_connected.isCompleted) {
+      _connected.completeError(
+        const BleConnectionException('connection closed'),
+        StackTrace.current,
+      );
+    }
     if (_current != BleConnectionState.disconnected) {
       _current = BleConnectionState.disconnected;
       if (!_stateController.isClosed) {

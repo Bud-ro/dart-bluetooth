@@ -59,6 +59,12 @@ static NSString *cbuuid_canonical(CBUUID *u) {
         stringWithFormat:@"0000%02x%02x-0000-1000-8000-00805f9b34fb", b[0],
                          b[1]];
   }
+  if (n == 4) {
+    // 32-bit UUID: expand against the Bluetooth base UUID, matching Dart.
+    return [NSString
+        stringWithFormat:@"%02x%02x%02x%02x-0000-1000-8000-00805f9b34fb", b[0],
+                         b[1], b[2], b[3]];
+  }
   if (n == 16) {
     NSMutableString *s = [NSMutableString stringWithCapacity:36];
     for (int i = 0; i < 16; i++) {

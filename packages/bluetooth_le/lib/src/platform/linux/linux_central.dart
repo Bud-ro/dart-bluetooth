@@ -245,6 +245,9 @@ class LinuxBleCentral extends BleCentralPlatform {
 
   Never _mapDbus(Object e, String op) {
     if (e is BleException) throw e;
+    if (e is TimeoutException) {
+      throw BleTimeoutException('timed out during $op', cause: e);
+    }
     if (e is DBusServiceUnknownException) {
       throw BleDisabledException(
         'BlueZ (org.bluez) is unavailable — is the bluetooth service running?',
@@ -383,6 +386,11 @@ class LinuxGattConnection implements GattConnection {
   final StreamController<BleConnectionState> _stateController =
       StreamController<BleConnectionState>.broadcast();
   StreamSubscription<DBusPropertiesChangedSignal>? _deviceSub;
+  // Active notify subscriptions, so a disconnect-driven teardown cancels their
+  // D-Bus match rules and closes their controllers (the stream onCancel won't
+  // fire just because the link dropped).
+  final Set<StreamController<Uint8List>> _notifyCtrls = {};
+  final Set<StreamSubscription<DBusPropertiesChangedSignal>> _notifySubs = {};
   Future<void> _opChain = Future<void>.value();
   BleConnectionState _current = BleConnectionState.connecting;
   bool _closed = false;
@@ -455,7 +463,9 @@ class LinuxGattConnection implements GattConnection {
       });
 
       final charsByService = <String, List<BleCharacteristic>>{};
-      _charPaths.clear();
+      // Build into a local map and swap atomically at the end, so a concurrent
+      // op resolving a cached path never sees a transiently-empty map.
+      final newPaths = <String, DBusObjectPath>{};
       managed.forEach((path, ifaces) {
         if (!path.value.startsWith(prefix)) return;
         final c = ifaces[_charIface];
@@ -470,7 +480,7 @@ class LinuxGattConnection implements GattConnection {
             .map((e) => e.value)
             .toList();
         final charUuid = Uuid(uuid);
-        _charPaths['${serviceUuid.value}|${charUuid.value}'] = path;
+        newPaths['${serviceUuid.value}|${charUuid.value}'] = path;
         charsByService
             .putIfAbsent(servicePath, () => [])
             .add(
@@ -481,6 +491,9 @@ class LinuxGattConnection implements GattConnection {
               ),
             );
       });
+      _charPaths
+        ..clear()
+        ..addAll(newPaths);
 
       return serviceUuidByPath.entries
           .map(
@@ -544,6 +557,7 @@ class LinuxGattConnection implements GattConnection {
     var cancelled = false;
     controller = StreamController<Uint8List>.broadcast(
       onListen: () async {
+        _notifyCtrls.add(controller);
         try {
           final path = await _charPath(service, characteristic);
           if (cancelled) return;
@@ -554,6 +568,7 @@ class LinuxGattConnection implements GattConnection {
               controller.add(LinuxBleCentral._bytesOf(value));
             }
           });
+          _notifySubs.add(sub!);
           await _obj(path).callMethod(
             _charIface,
             'StartNotify',
@@ -562,12 +577,22 @@ class LinuxGattConnection implements GattConnection {
           );
           logGatt.fine(() => 'subscribe ${characteristic.value}');
         } catch (e) {
+          // Don't leak the match rule if StartNotify failed after listening.
+          if (sub != null) {
+            _notifySubs.remove(sub);
+            await sub!.cancel();
+            sub = null;
+          }
           controller.addError(_gattError(e, 'subscribe'));
         }
       },
       onCancel: () async {
         cancelled = true;
-        await sub?.cancel();
+        if (sub != null) {
+          _notifySubs.remove(sub);
+          await sub!.cancel();
+        }
+        _notifyCtrls.remove(controller);
         try {
           final path = await _charPath(service, characteristic);
           await _obj(path).callMethod(
@@ -645,6 +670,14 @@ class LinuxGattConnection implements GattConnection {
   Future<void> _teardown() async {
     await _deviceSub?.cancel();
     _deviceSub = null;
+    for (final s in _notifySubs.toList()) {
+      await s.cancel();
+    }
+    _notifySubs.clear();
+    for (final c in _notifyCtrls.toList()) {
+      if (!c.isClosed) await c.close();
+    }
+    _notifyCtrls.clear();
     if (!_stateController.isClosed) await _stateController.close();
   }
 
@@ -672,6 +705,9 @@ class LinuxGattConnection implements GattConnection {
 
   Never _mapDbus(Object e, String op) {
     if (e is BleException) throw e;
+    if (e is TimeoutException) {
+      throw BleTimeoutException('timed out during $op', cause: e);
+    }
     if (e is DBusServiceUnknownException) {
       throw BleDisabledException('BlueZ unavailable during $op', cause: e);
     }
@@ -680,6 +716,9 @@ class LinuxGattConnection implements GattConnection {
     }
     if (e is DBusUnknownObjectException) {
       throw DeviceNotFoundException('Unknown object during $op', cause: e);
+    }
+    if (e is FormatException) {
+      throw BleGattException('malformed data during $op', cause: e);
     }
     throw BleConnectionException('D-Bus error during $op', cause: e);
   }
@@ -690,6 +729,9 @@ class LinuxGattConnection implements GattConnection {
 
   BleException _gattError(Object e, String op) {
     if (e is BleException) return e;
+    if (e is TimeoutException) {
+      return BleTimeoutException('GATT $op timed out', cause: e);
+    }
     return BleGattException('GATT $op failed', cause: e);
   }
 

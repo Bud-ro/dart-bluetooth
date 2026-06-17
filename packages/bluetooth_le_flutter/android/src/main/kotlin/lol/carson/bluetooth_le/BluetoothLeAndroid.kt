@@ -358,14 +358,18 @@ object BluetoothLeAndroid {
                 gatt: BluetoothGatt,
                 characteristic: BluetoothGattCharacteristic,
                 value: ByteArray,
-            ) = deliverNotify(characteristic, value)
+            ) = deliverNotify(connToken, characteristic, value)
 
             override fun onCharacteristicChanged(
                 gatt: BluetoothGatt,
                 characteristic: BluetoothGattCharacteristic,
             ) {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                    deliverNotify(characteristic, characteristic.value ?: ByteArray(0))
+                    deliverNotify(
+                        connToken,
+                        characteristic,
+                        characteristic.value ?: ByteArray(0),
+                    )
                 }
             }
 
@@ -387,15 +391,16 @@ object BluetoothLeAndroid {
         if (reqId != 0L) nativeOnOp(reqId, status, null, value)
     }
 
-    private fun deliverNotify(ch: BluetoothGattCharacteristic, value: ByteArray) {
+    private fun deliverNotify(
+        connToken: Long,
+        ch: BluetoothGattCharacteristic,
+        value: ByteArray,
+    ) {
         val service = ch.service ?: return
+        // Route by the callback's own connToken (it closes over it), so a service
+        // exposing two characteristics with the same UUID can't misroute.
         val key = "${service.uuid}|${ch.uuid}"
-        for ((token, conn) in connections) {
-            if (conn.gatt?.getService(service.uuid)?.getCharacteristic(ch.uuid) === ch) {
-                nativeOnNotify(token, key, value)
-                return
-            }
-        }
+        nativeOnNotify(connToken, key, value)
     }
 
     @SuppressLint("MissingPermission")
