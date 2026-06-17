@@ -109,12 +109,11 @@ void main() {
           0x12,
           0x11,
         ], reason: 'dwNameSpace @40');
-        expect(b.sublist(88, 92), [
-          0x24,
-          0x23,
-          0x22,
-          0x21,
-        ], reason: 'dwNumberOfCsAddrs @88 (lpcsaBuffer follows @96)');
+        expect(
+          b.sublist(88, 92),
+          [0x24, 0x23, 0x22, 0x21],
+          reason: 'dwNumberOfCsAddrs @88 (lpcsaBuffer follows @96)',
+        );
         expect(b.sublist(104, 108), [
           0x34,
           0x33,

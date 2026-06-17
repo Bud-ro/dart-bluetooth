@@ -524,7 +524,8 @@ List<_RawDevice> _inquireViaWsaLookup() {
       throw _WsaLookupUnavailable(ws.wsaGetLastError());
     }
     final handle = hLookup.value;
-    const bufSize = 4096; // one device per Next; ample for the set + its strings
+    const bufSize =
+        4096; // one device per Next; ample for the set + its strings
     final buf = calloc<ffi.Uint8>(bufSize);
     final lenPtr = calloc<ffi.Uint32>();
     final results = buf.cast<WsaQuerySet>();

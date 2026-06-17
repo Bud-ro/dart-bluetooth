@@ -39,8 +39,9 @@ void main(List<String> args) async {
     // Ad-hoc sign on macOS so the signed `dart` executable can load the dylib
     // under Library Validation.
     if (os == OS.macOS) {
-      final dylib =
-          input.outputDirectory.resolve('lib$_libName.dylib').toFilePath();
+      final dylib = input.outputDirectory
+          .resolve('lib$_libName.dylib')
+          .toFilePath();
       if (File(dylib).existsSync()) {
         final r = await Process.run('codesign', ['-f', '-s', '-', dylib]);
         if (r.exitCode != 0) {
