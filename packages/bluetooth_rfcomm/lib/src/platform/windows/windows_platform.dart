@@ -17,13 +17,17 @@ import '../../models/uuid.dart';
 import '../platform_interface.dart';
 import 'windows_ffi.dart';
 
-/// Windows backend over Winsock Bluetooth (`AF_BTH` / `BTHPROTO_RFCOMM`) plus
-/// the `BluetoothAPIs` device-enumeration functions.
+/// Windows backend over Winsock Bluetooth (`AF_BTH` / `BTHPROTO_RFCOMM`).
 ///
-/// Pure Dart via `dart:ffi` to system DLLs (`ws2_32.dll`, `bthprops.cpl`) — no
-/// native component to build, so this is identical from `dart run` and a Flutter
-/// Windows app. Blocking socket I/O and inquiries run on worker isolates so the
-/// calling isolate never stalls.
+/// Pure Dart via `dart:ffi` to system DLLs (`ws2_32.dll`, `bthprops.cpl` for the
+/// radio check, `advapi32.dll` for the registry) — no native component to build,
+/// so this is identical from `dart run` and a Flutter Windows app. Blocking
+/// socket I/O runs on worker isolates so the calling isolate never stalls.
+///
+/// The paired-device list comes from the registry (radio-silent, instant).
+/// Active inquiry is intentionally NOT performed: a classic-Bluetooth inquiry
+/// monopolizes the radio for seconds, can't be aborted, and blocks connections —
+/// so [startDiscovery] is a paired-list shim here (see its doc).
 class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
   WindowsBluetoothRfcomm();
 
@@ -93,33 +97,21 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() async* {
-    // Discover via the Winsock NS_BTH inquiry (LUP_FLUSHCACHE): it returns ONLY
-    // devices that actually answered the inquiry — i.e. genuinely nearby — so a
-    // paired but absent device does NOT show up. This blocks for the inquiry
-    // window, so it runs on a worker isolate.
-    logDiscovery.fine('inquiry starting (~10s window)');
-    final start = DateTime.now();
-    final List<_RawDevice> raw;
-    try {
-      raw = await Isolate.run(_inquireViaWsaLookup);
-    } on BluetoothException {
-      rethrow;
-    } catch (e) {
-      throw BluetoothDiscoveryException('inquiry failed', cause: e);
-    }
+    // Windows intentionally performs NO active inquiry. A classic-Bluetooth
+    // inquiry holds the radio for ~1.28s per response (several seconds total),
+    // can't be aborted once started, and blocks connections for its whole
+    // duration — and for a paired-device workflow it adds nothing. So
+    // "discovery" here is a transparent shim that just lists the PAIRED devices
+    // (a radio-silent registry read); it does NOT find nearby/non-paired devices
+    // and never touches the radio. Re-introduce a real inquiry here only if
+    // non-paired discovery is actually needed (and budget for the radio cost).
     final now = DateTime.now();
+    final raw = _enumeratePairedFromRegistry();
     logDiscovery.fine(
-      () =>
-          'inquiry returned ${raw.length} device(s) in '
-          '${now.difference(start).inMilliseconds}ms',
+      () => 'discovery (paired-list shim): ${raw.length} device(s), no inquiry',
     );
     for (final r in raw) {
       final device = _toDevice(r);
-      logDiscovery.finer(
-        () =>
-            'device "${device.name ?? '(unnamed)'}" ${device.id.address} '
-            'remembered=${r.remembered} connected=${r.connected}',
-      );
       yield BluetoothDiscoveryResult(
         device: device,
         rssi: device.rssi,
@@ -489,88 +481,6 @@ int? _parseRegistryMac(String name) {
   final v = int.tryParse(name, radix: 16);
   if (v == null) return null;
   return v;
-}
-
-/// Thrown by [_inquireViaWsaLookup] when the Winsock inquiry can't even be
-/// started (`WSALookupServiceBegin` failed). Carries the WSA error for the
-/// surfaced exception. Sendable across the `Isolate.run` boundary (plain fields).
-class _WsaLookupUnavailable implements Exception {
-  _WsaLookupUnavailable(this.code);
-  final int code;
-  @override
-  String toString() => 'WSALookupServiceBegin failed (WSA $code)';
-}
-
-/// Discovers devices via the Winsock NS_BTH inquiry. With `LUP_FLUSHCACHE` this
-/// performs a live inquiry and returns ONLY devices that actually responded —
-/// i.e. genuinely nearby. Runs in a worker isolate (blocks for the inquiry
-/// window). Throws [_WsaLookupUnavailable] if the inquiry can't be started.
-List<_RawDevice> _inquireViaWsaLookup() {
-  final ws = WinsockBindings();
-  ws.startup();
-  final out = <_RawDevice>[];
-  final restrictions = calloc<WsaQuerySet>();
-  final hLookup = calloc<ffi.IntPtr>();
-  try {
-    restrictions.ref
-      ..dwSize = ffi.sizeOf<WsaQuerySet>()
-      ..dwNameSpace = nsBth;
-    final begin = ws.wsaLookupServiceBegin(
-      restrictions,
-      lupContainers | lupFlushCache,
-      hLookup,
-    );
-    if (begin != 0) {
-      throw _WsaLookupUnavailable(ws.wsaGetLastError());
-    }
-    final handle = hLookup.value;
-    const bufSize =
-        4096; // one device per Next; ample for the set + its strings
-    final buf = calloc<ffi.Uint8>(bufSize);
-    final lenPtr = calloc<ffi.Uint32>();
-    final results = buf.cast<WsaQuerySet>();
-    try {
-      while (true) {
-        lenPtr.value = bufSize;
-        final rc = ws.wsaLookupServiceNext(
-          handle,
-          lupReturnName | lupReturnAddr | lupReturnType,
-          lenPtr,
-          results,
-        );
-        if (rc != 0) break; // WSA_E_NO_MORE / WSAEFAULT / any error -> stop
-        final qs = results.ref;
-        if (qs.dwNumberOfCsAddrs == 0 || qs.lpcsaBuffer == ffi.nullptr) {
-          continue; // no address -> can't identify the device, skip
-        }
-        final remote = qs.lpcsaBuffer.ref.remoteAddr;
-        if (remote.lpSockaddr == ffi.nullptr) continue;
-        final addr = remote.lpSockaddr.cast<SockaddrBth>().ref.btAddr;
-        final name = qs.lpszServiceInstanceName == ffi.nullptr
-            ? ''
-            : qs.lpszServiceInstanceName.cast<Utf16>().toDartString();
-        out.add(
-          _RawDevice(
-            addr,
-            name,
-            0, // class-of-device not requested here
-            false, // connection state isn't reported by the inquiry
-            false, // remembered/authenticated unknown from an inquiry result;
-            false, // the stream intersects with the bonded set for those flags
-          ),
-        );
-      }
-    } finally {
-      ws.wsaLookupServiceEnd(handle);
-      calloc.free(buf);
-      calloc.free(lenPtr);
-    }
-    return out;
-  } finally {
-    calloc.free(restrictions);
-    calloc.free(hLookup);
-    ws.wsaCleanup();
-  }
 }
 
 /// A WSA error code, or -1 when the call failed but `WSAGetLastError()` was 0.

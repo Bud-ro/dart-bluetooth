@@ -104,6 +104,12 @@ class BluetoothRfcomm {
   /// One-shot snapshot of paired devices seen in a single inquiry — i.e. bonded
   /// AND in range during the [timeout] window. For an always-on list prefer
   /// [bondedAndDiscoveredStream], which keeps scanning and accumulates sightings.
+  ///
+  /// Returns as soon as discovery completes; [timeout] only caps platforms whose
+  /// discovery streams continuously (Linux) or run a long inquiry. On platforms
+  /// where discovery completes immediately (e.g. Windows, which lists the paired
+  /// set without a radio inquiry — see [startDiscovery] there) this returns right
+  /// away rather than waiting out the full [timeout].
   Future<List<BluetoothDevice>> bondedAndDiscovered({
     Duration timeout = const Duration(seconds: 8),
   }) async {
@@ -113,6 +119,7 @@ class BluetoothRfcomm {
     final seen = <DeviceId, BluetoothDevice>{};
 
     Object? discoveryError;
+    final done = Completer<void>();
     final sub = startDiscovery().listen(
       (r) {
         final base = byId[r.device.id];
@@ -123,10 +130,16 @@ class BluetoothRfcomm {
       // Without this, a discovery error becomes an unhandled zone error and the
       // caller silently gets partial results. Capture it and surface it below.
       onError: (Object e) => discoveryError ??= e,
+      // Complete as soon as the inquiry finishes so we don't wait out the whole
+      // timeout when discovery is fast (or instant, like the Windows shim).
+      onDone: () {
+        if (!done.isCompleted) done.complete();
+      },
       cancelOnError: false,
     );
     try {
-      await Future<void>.delayed(timeout);
+      // Whichever comes first: discovery finishing, or the timeout elapsing.
+      await Future.any([done.future, Future<void>.delayed(timeout)]);
     } finally {
       // Cancelling the subscription stops this inquiry via the stream's onCancel
       // (which calls the native stop). Don't also call the public stopDiscovery()
