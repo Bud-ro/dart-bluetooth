@@ -78,7 +78,7 @@ class BluetoothConnection {
   Stream<Uint8List> get input => _inputController.stream;
 
   /// Connection-state transitions for this connection. A [BluetoothConnection]
-  /// only exists once [connect] has resolved, so the stream starts at
+  /// only exists once [BluetoothRfcomm.connect] has resolved, so the stream starts at
   /// [ConnectionState.connected]; in practice the only transition it emits is
   /// the terminal [ConnectionState.disconnected] (followed by close).
   Stream<ConnectionState> get stateChanges => _stateController.stream;

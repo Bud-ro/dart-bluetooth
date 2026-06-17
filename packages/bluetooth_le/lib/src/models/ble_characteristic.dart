@@ -21,11 +21,20 @@ class BleCharacteristic {
   /// The operations this characteristic supports.
   final Set<CharacteristicProperty> properties;
 
+  /// Whether this characteristic supports reads.
   bool get canRead => properties.contains(CharacteristicProperty.read);
+
+  /// Whether this characteristic supports acknowledged writes.
   bool get canWrite => properties.contains(CharacteristicProperty.write);
+
+  /// Whether this characteristic supports unacknowledged writes.
   bool get canWriteWithoutResponse =>
       properties.contains(CharacteristicProperty.writeWithoutResponse);
+
+  /// Whether the peripheral can push values via notifications.
   bool get canNotify => properties.contains(CharacteristicProperty.notify);
+
+  /// Whether the peripheral can push values via indications.
   bool get canIndicate => properties.contains(CharacteristicProperty.indicate);
 
   /// Whether the peripheral can push values on this characteristic (notify or

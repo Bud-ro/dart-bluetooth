@@ -71,7 +71,7 @@ enum BluetoothAdapterState {
 
 /// Lifecycle state of a single [BluetoothConnection].
 ///
-/// A [BluetoothConnection] only exists after [connect] resolves, so it starts at
+/// A [BluetoothConnection] only exists after [BluetoothRfcomm.connect] resolves, so it starts at
 /// [connected]; [connecting] is part of the model but not emitted by a live
 /// connection's `stateChanges` (which in practice emits only the terminal
 /// [disconnected]).

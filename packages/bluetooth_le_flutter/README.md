@@ -51,7 +51,7 @@ The full API, the GATT-as-serial channel, platform setup (Android runtime
 permissions, iOS `Info.plist` keys), logging control, and the test fake are
 documented in the
 [`bluetooth_le` README](https://pub.dev/packages/bluetooth_le). A runnable Flutter
-demo is in [`example/`](example).
+demo is in [`example/`](https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_le_flutter/example).
 
 ## License
 

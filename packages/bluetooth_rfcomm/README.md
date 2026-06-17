@@ -206,7 +206,7 @@ triggered manually (the **Integration** workflow), or locally with
 
 ## Examples
 
-- [`example/`](example) — pure-Dart CLI: `list`, `scan`, `connect`.
+- [`example/`](https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_rfcomm/example) — pure-Dart CLI: `list`, `scan`, `connect`.
 - A Flutter demo ships with the companion plugin.
 
 ## Status

@@ -1,12 +1,12 @@
 name: bluetooth_le
 description: >-
   Cross-platform Bluetooth Low Energy (GATT) for Dart and Flutter, with a
-  GATT-as-serial channel. Pure-Dart CLI and Flutter on macOS, Linux, Android,
-  iOS, and Windows (Windows is paired-devices-only: no unpaired scan or
-  notifications).
+  GATT-as-serial channel. Pure-Dart CLI plus Flutter on macOS, Linux, Android,
+  iOS, and Windows.
 version: 0.1.0
 repository: https://github.com/Bud-ro/dart-bluetooth
 homepage: https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_le
+documentation: https://github.com/Bud-ro/dart-bluetooth/blob/master/packages/bluetooth_le/README.md
 issue_tracker: https://github.com/Bud-ro/dart-bluetooth/issues
 topics:
   - bluetooth

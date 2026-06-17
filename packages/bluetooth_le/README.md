@@ -157,6 +157,20 @@ For per-subsystem levels, set `hierarchicalLoggingEnabled = true` and configure
 individual loggers (e.g. silence `BleLoggers.data` to drop raw bytes). Raw-byte
 messages are built lazily, so leaving that logger off costs nothing.
 
+## Example
+
+A pure-Dart CLI demo (`doctor` / `scan` / `connect`) lives in
+[`example/`](https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_le/example):
+
+```sh
+cd example
+dart run bin/ble.dart scan
+dart run bin/ble.dart connect <DEVICE-ID>   # opens a Nordic-UART serial link
+```
+
+A Flutter demo app ships with the companion plugin
+[`bluetooth_le_flutter`](https://pub.dev/packages/bluetooth_le_flutter).
+
 ## Testing without hardware
 
 `package:bluetooth_le/testing.dart` ships `FakeBleCentralPlatform`:
@@ -166,12 +180,12 @@ final fake = FakeBleCentralPlatform();
 final ble = BleCentral(platform: fake);
 ```
 
-Real-backend integration tests (`integration/headless_test.dart` for desktop and
-the example's `integration_test/headless_behavior_test.dart` for mobile) drive
-the actual OS APIs with no hardware present, asserting that calls return cleanly
-or throw domain exceptions rather than crashing. They run live system services,
-so they are triggered manually (the **Integration** workflow), or locally with
-`dart test integration`.
+Real-backend integration tests drive the actual OS APIs with no hardware
+present, asserting that calls return cleanly or throw domain exceptions rather
+than crashing — `integration/headless_test.dart` here (desktop), and a mobile
+counterpart in the `bluetooth_le_flutter` example. They run live system
+services, so they are triggered manually (the **Integration** workflow), or
+locally with `dart test integration`.
 
 ## Status
 

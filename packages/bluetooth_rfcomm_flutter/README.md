@@ -51,7 +51,7 @@ The full API, the connection model, platform setup (Android runtime permissions,
 iOS `Info.plist` keys and the MFi caveat), logging control, and the test fake are
 documented in the
 [`bluetooth_rfcomm` README](https://pub.dev/packages/bluetooth_rfcomm). A runnable
-Flutter demo is in [`example/`](example).
+Flutter demo is in [`example/`](https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_rfcomm_flutter/example).
 
 ## License
 

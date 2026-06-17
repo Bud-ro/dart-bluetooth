@@ -18,3 +18,6 @@ pubspec.lock
 .vscode/
 *.swp
 .DS_Store
+
+# Generated API docs (dart doc)
+doc/api/
