@@ -25,14 +25,12 @@ directly.
 In the capability columns: ✅ supported · ⚠️ partial · ❌ not supported.
 
 **Manually verified** — whether the author has exercised this backend on real
-hardware: ⚠️ = yes (works well enough for the author, but **not guaranteed to be
-perfect**); ❌ = **not yet hardware-verified**.
+hardware: ❌ = **not yet hardware-verified**.
 
-> ⚠️ Neither the Android nor the iOS backend has been manually verified on a
-> device yet — treat both as best-effort for now. Of the `bluetooth_le` backends,
-> only **macOS** and **Windows** (from the pure-Dart core, used on desktop)
-> currently carry any manual verification. Every backend will be verified on
-> hardware over time.
+> ⚠️ **No `bluetooth_le` backend has been manually verified on real hardware
+> yet** (neither these Flutter platforms nor the core's desktop backends). Every
+> backend is implemented but unverified — treat it all as best-effort for now.
+> The backends will be verified on hardware over time.
 
 (Linux, macOS and Windows are handled by the `bluetooth_le` core directly.)
 

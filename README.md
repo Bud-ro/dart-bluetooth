@@ -36,11 +36,11 @@ effectiveness has not been confirmed by the author).
 > Note: ⚠️ means **"partial"** in the capability columns but **"author-verified"**
 > in the Manually verified column — the two are unrelated.
 
-> ⚠️ Only **macOS** and **Windows** have had any manual verification against real
-> devices so far (and most thoroughly for Classic/RFCOMM). Every other platform is
-> implemented but unverified — best-effort for now. All backends will be verified
-> on hardware over time; until then, only the platforms marked ⚠️ carry any manual
-> verification of these packages' effectiveness.
+> ⚠️ The only manual hardware verification so far is **Classic/RFCOMM on macOS
+> and Windows** (works well enough for the author, not guaranteed perfect). Every
+> other platform for Classic, and **all of Bluetooth LE on every platform**, is
+> implemented but **not yet hardware-verified** — best-effort for now. The
+> remaining backends will be verified on hardware over time.
 
 Notes:
 
