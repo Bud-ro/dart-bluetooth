@@ -79,8 +79,10 @@ class BluetoothRfcomm {
   /// Starts an inquiry and streams sightings. Stop by cancelling the
   /// subscription or calling [stopDiscovery].
   ///
-  /// On Windows the inquiry instead runs to completion (~10s) and delivers all
-  /// sightings in one batch when it finishes; it cannot be cancelled early.
+  /// **Windows does not run a radio inquiry**: a Bluetooth Classic inquiry
+  /// monopolizes the radio for seconds and can't be aborted, which starves
+  /// connections — so here `startDiscovery` returns the **paired** devices only
+  /// (a fast, radio-silent registry read) and finds no nearby unpaired devices.
   /// RSSI is reported during discovery on Linux and Android only (null
   /// elsewhere).
   Stream<BluetoothDiscoveryResult> startDiscovery() {

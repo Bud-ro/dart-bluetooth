@@ -12,6 +12,17 @@ topics:
   - serial
   - rfcomm
   - ffi
+  - flutter
+
+# Declared explicitly so pub.dev shows the full badge set. The pure-Dart code
+# (dart:ffi + dart:io + dbus) runs on every native platform; iOS/Android get
+# their native build from the companion bluetooth_rfcomm_flutter plugin.
+platforms:
+  android:
+  ios:
+  linux:
+  macos:
+  windows:
 
 # Pure-Dart, Flutter-free package — publishable to pub.dev. Windows (FFI), Linux
 # (D-Bus) and macOS (IOBluetooth via the native-assets `hook/build.dart`) all

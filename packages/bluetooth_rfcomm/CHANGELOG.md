@@ -20,8 +20,11 @@ Initial release.
   (`bluetooth_rfcomm.{connection,data,discovery,adapter,native}`), with raw bytes
   at FINEST and lifecycle at FINE. No handler is installed by default; see the
   README "Logging" section for per-namespace level control.
-- All five backends implemented (incl. Linux RFCOMM `Profile1` fd stream); the
-  native paths are pending broader on-device validation.
-- Removed `connectionState(device)` — it was only implementable on Linux and was
-  a silent no-op elsewhere. Use `BluetoothConnection.stateChanges` (all
-  platforms) or `bondedDevices().isConnected`.
+- All five backends implemented (incl. Linux RFCOMM `Profile1` fd stream).
+  **Only macOS and Windows have been manually verified against real hardware so
+  far** (works well enough for the author, not guaranteed perfect); the other
+  backends are implemented but unverified and will be verified on hardware over
+  time. See the README support table.
+- Does not expose `connectionState(device)` — it is only implementable on Linux
+  and would be a silent no-op elsewhere. Use `BluetoothConnection.stateChanges`
+  (all platforms) or `bondedDevices().isConnected`.

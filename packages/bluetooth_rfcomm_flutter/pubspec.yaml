@@ -15,7 +15,9 @@ topics:
 
 environment:
   sdk: ^3.10.0
-  flutter: ">=3.44.0"
+  # Floor chosen for Swift Package Manager support on Apple (the macOS/iOS native
+  # assets ship as an SPM package); 3.41.x is a verified-working SPM-capable SDK.
+  flutter: ">=3.41.5"
 
 dependencies:
   flutter:

@@ -24,13 +24,17 @@ Flutter plugin — see [Why the split](#why-the-split)):
 | Android | ✅ | ✅ | ❌ |
 | iOS | ⚠️ | ✅ | ❌ |
 
-In the capability columns: ✅ supported · ⚠️ partial · ❌ not supported.
+In the capability columns (Classic / Low Energy): ✅ supported · ⚠️ partial · ❌
+not supported.
 
-**Manually verified** — whether the author has actually exercised these backends
-on real hardware: ⚠️ = yes, they work well enough for the author, but correctness
-is **not guaranteed to be perfect**; ❌ = **not yet hardware-verified** (the
-capabilities shown are implemented, but their effectiveness has not been confirmed
-by the author).
+**Manually verified** is a *separate* axis — whether the author has actually
+exercised these backends on real hardware: ⚠️ = yes, they work well enough for the
+author, but correctness is **not guaranteed to be perfect**; ❌ = **not yet
+hardware-verified** (the capabilities shown are implemented, but their
+effectiveness has not been confirmed by the author).
+
+> Note: ⚠️ means **"partial"** in the capability columns but **"author-verified"**
+> in the Manually verified column — the two are unrelated.
 
 > ⚠️ Only **macOS** and **Windows** have had any manual verification against real
 > devices so far (and most thoroughly for Classic/RFCOMM). Every other platform is

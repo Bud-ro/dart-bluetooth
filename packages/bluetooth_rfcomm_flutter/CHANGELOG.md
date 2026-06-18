@@ -10,3 +10,7 @@ Initial release.
 - iOS/macOS native code is built from `bluetooth_rfcomm`'s native-assets hook;
   Windows/Linux need no native build.
 - Re-exports the `bluetooth_rfcomm` API; there is no separate Dart surface.
+- Note: the Android and iOS backends have **not** been manually verified on a
+  device yet — treat them as best-effort. Of the underlying `bluetooth_rfcomm`
+  backends, only macOS and Windows currently carry manual verification. See the
+  README support table.

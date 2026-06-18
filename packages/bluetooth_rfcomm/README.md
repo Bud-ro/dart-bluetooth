@@ -33,17 +33,22 @@ await conn.finish();                              // flush, then close
 | --- | --- | --- | --- | --- |
 | Linux | ✅ | ✅ | ✅ | ❌ |
 | macOS | ✅ | ✅ | ⚠️ | ⚠️ |
-| Windows | ✅ | ✅ | ⚠️ | ⚠️ |
+| Windows | ⚠️ | ✅ | ⚠️ | ⚠️ |
 | Android | ✅ | ✅ | ⚠️ | ❌ |
 | iOS | ⚠️ | ⚠️ | ⚠️ | ❌ |
 
-In the capability columns: ✅ supported · ⚠️ partial · ❌ not supported.
+In the capability columns (Discover / Connect / Pairing): ✅ supported · ⚠️ partial
+· ❌ not supported.
 
-**Manually verified** — whether the author has actually exercised this backend
-against real hardware: ⚠️ = yes, it works well enough for the author, but
-correctness is **not guaranteed to be perfect**; ❌ = **not yet hardware-verified**
-(the capability shown in the other columns is implemented, but its effectiveness
-has not been confirmed by the author).
+**Manually verified** is a *separate* axis — whether the author has actually
+exercised this backend against real hardware: ⚠️ = yes, it works well enough for
+the author, but correctness is **not guaranteed to be perfect**; ❌ = **not yet
+hardware-verified** (the capability shown in the other columns is implemented, but
+its effectiveness has not been confirmed by the author).
+
+> Note: ⚠️ means **"partial"** in the capability columns but **"author-verified"**
+> in the Manually verified column — they are unrelated. (E.g. Windows is ⚠️ partial
+> for Discover *and* ⚠️ author-verified.)
 
 > ⚠️ Only **macOS** and **Windows** have been manually verified against real
 > devices so far. Every other backend is implemented but unverified — treat it as
@@ -53,6 +58,12 @@ has not been confirmed by the author).
 
 Notes:
 
+- **Windows discovery** does **not** run a live radio inquiry. A Bluetooth
+  Classic inquiry monopolizes the radio for seconds and can't be aborted, which
+  starves connections — so on Windows `startDiscovery` is a fast, radio-silent
+  shim that returns the **paired** devices only (it does not find nearby unpaired
+  devices). For a paired-device picker this is what you want; for discovering
+  *new* devices, pair them in Windows settings first.
 - **Pairing** is programmatic on Linux; elsewhere pair through the OS settings
   (the API throws `BluetoothUnsupportedException` for `pair`/`unpair`).
 - **iOS** reaches only MFi accessories (devices with Apple's authentication

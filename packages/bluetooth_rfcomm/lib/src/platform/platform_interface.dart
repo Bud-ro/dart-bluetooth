@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'package:meta/meta.dart';
+
 import '../models/bluetooth_device.dart';
 import '../models/bluetooth_service.dart';
 import '../models/device_id.dart';
@@ -60,6 +62,7 @@ abstract class BluetoothRfcommPlatform {
   static set instance(BluetoothRfcommPlatform value) => _instance = value;
 
   /// Resets to the auto-selected backend (used by tests).
+  @visibleForTesting
   static void resetInstance() => _instance = null;
 
   static BluetoothRfcommPlatform _defaultInstance() {

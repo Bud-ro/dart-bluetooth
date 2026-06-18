@@ -2,17 +2,19 @@
 
 [![CI](https://github.com/Bud-ro/dart-bluetooth/actions/workflows/ci.yml/badge.svg)](https://github.com/Bud-ro/dart-bluetooth/actions/workflows/ci.yml)
 
-The Flutter plugin for **Bluetooth Classic (RFCOMM serial)**. It adds the native
-build that Android and iOS need and re-exports the
+The Flutter plugin for **Bluetooth Classic (RFCOMM serial)**. It adds the
+**Android** native build and re-exports the
 [`bluetooth_rfcomm`](https://pub.dev/packages/bluetooth_rfcomm) API, so there is
 no separate Dart surface to learn.
 
-[`bluetooth_rfcomm`](https://pub.dev/packages/bluetooth_rfcomm) is pure Dart and
-works on its own for Linux, macOS and Windows (command-line and Flutter desktop).
 Android needs a JVM + Gradle build for its Kotlin/JNI bridge, which can't ship as
 a Dart-only package — this plugin provides it and bundles the native library into
-your app. Add this plugin to any Flutter app that targets **Android or iOS**;
-desktop-only Flutter apps can depend on `bluetooth_rfcomm` directly.
+your app. Everything else is handled by the
+[`bluetooth_rfcomm`](https://pub.dev/packages/bluetooth_rfcomm) core directly:
+Linux and Windows are pure Dart, and **iOS and macOS** are compiled by the core's
+native-assets build hook (for both CLI and Flutter — there is no separate iOS
+plugin here). Add this plugin to a Flutter app that targets **Android**; an
+iOS-only or desktop-only Flutter app can depend on `bluetooth_rfcomm` directly.
 
 ## Support
 
@@ -34,9 +36,12 @@ has not been confirmed by the author).
 > on desktop) currently carry any manual verification. Every backend will be
 > verified on hardware over time.
 
+This plugin builds only the Android native library. The iOS backend (and the
+macOS, Linux and Windows backends) all come from the `bluetooth_rfcomm` core —
+iOS and macOS via its native-assets build hook, Linux and Windows as pure Dart.
+
 iOS reaches only MFi accessories; a non-MFi device throws
-`BluetoothUnsupportedException`. (Linux, macOS and Windows are handled by the
-`bluetooth_rfcomm` core directly.)
+`BluetoothUnsupportedException`.
 
 ## Install
 
