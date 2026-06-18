@@ -604,6 +604,13 @@ void _recvEntry(List<Object?> args) {
   ws.setsockopt(socket, solSocket, soRcvTimeo, timeout, 4);
   calloc.free(timeout);
   final buf = calloc<ffi.Uint8>(_recvBufSize);
+  // DIAGNOSTICS: capture how/why the read loop exits so the main isolate can log
+  // it (worker isolates can't reach the app's package:logging handler). `exitN`
+  // is the recv() return that ended the loop; `exitErr` is WSAGetLastError() for
+  // the non-timeout error path — this is the exact code we need to tell a real
+  // disconnect from a transient error treated as EOF.
+  int exitN = 0;
+  int exitErr = 0;
   try {
     while (true) {
       final n = ws.recv(socket, buf, _recvBufSize, 0);
@@ -612,17 +619,25 @@ void _recvEntry(List<Object?> args) {
         sendPort.send(TransferableTypedData.fromList([bytes]));
         continue;
       }
-      if (n == 0) break; // peer closed the connection (clean EOF)
+      if (n == 0) {
+        exitN = 0; // peer closed the connection (clean EOF)
+        break;
+      }
       // n < 0 (SOCKET_ERROR): a recv timeout just means "no data yet" — keep
       // waiting. Any other error (socket closed by close(), reset, …) is EOF.
-      if (ws.wsaGetLastError() == wsaeTimedOut) continue;
+      final err = ws.wsaGetLastError();
+      if (err == wsaeTimedOut) continue;
+      exitN = n;
+      exitErr = err;
       break;
     }
-  } catch (_) {
-    // fall through to EOF
+  } catch (e) {
+    exitErr = -1; // unexpected Dart-side error; fall through to EOF
   } finally {
     calloc.free(buf);
     ws.wsaCleanup(); // balance this isolate's WSAStartup
+    // Report the exit reason (a Map, distinct from data/null), then signal close.
+    sendPort.send(<String, int>{'n': exitN, 'wsa': exitErr});
     sendPort.send(null); // signal closed
   }
 }
@@ -645,13 +660,29 @@ void _writeEntry(List<Object?> args) {
     final data = rec[0] as TransferableTypedData?;
     final ack = rec[1] as SendPort?;
     if (data != null) {
-      _sendAll(ws, socket, data.materialize().asUint8List());
+      final bytes = data.materialize().asUint8List();
+      // DIAGNOSTICS: time the blocking send() and capture any error code. A slow
+      // send is the signature of the link waking from sniff (low-power) mode; an
+      // error code is the writer-side view of the rare disconnect. Report back to
+      // the main isolate only when notable (slow or failed) to limit noise.
+      final sw = Stopwatch()..start();
+      final err = _sendAll(ws, socket, bytes);
+      sw.stop();
+      if (err != 0 || sw.elapsedMilliseconds > 50) {
+        mainPort.send(<String, int>{
+          'bytes': bytes.length,
+          'ms': sw.elapsedMilliseconds,
+          'wsa': err,
+        });
+      }
     }
     ack?.send(true);
   });
 }
 
-void _sendAll(WinsockBindings ws, int socket, Uint8List bytes) {
+/// Sends [bytes] fully. Returns 0 on success, or the WSA error code (or -1 if
+/// `WSAGetLastError()` was 0) when `send` failed before all bytes went out.
+int _sendAll(WinsockBindings ws, int socket, Uint8List bytes) {
   final ptr = calloc<ffi.Uint8>(bytes.length);
   try {
     ptr.asTypedList(bytes.length).setAll(0, bytes);
@@ -663,9 +694,12 @@ void _sendAll(WinsockBindings ws, int socket, Uint8List bytes) {
         bytes.length - offset,
         _sendChunkFlags,
       );
-      if (n == socketError || n <= 0) break; // peer gone
+      if (n == socketError || n <= 0) {
+        return _wsaError(ws.wsaGetLastError()); // peer gone / error
+      }
       offset += n;
     }
+    return 0;
   } finally {
     calloc.free(ptr);
   }
@@ -700,16 +734,35 @@ class _WindowsRfcommTransport implements RfcommTransport {
   final List<List<Object?>> _pendingWrites = [];
   final Completer<void> _done = Completer<void>();
 
+  // DIAGNOSTICS: time since the previous outbound send, to flag sends that follow
+  // a long idle (the case where the link has dropped into sniff mode).
+  final Stopwatch _txGap = Stopwatch()..start();
+
   void _start() {
     final readerPort = ReceivePort();
     _readerPort = readerPort;
+    // DIAGNOSTICS: time between inbound chunks. A large gap before a chunk is the
+    // link sitting idle (and likely in sniff/low-power mode); correlate the gap
+    // with how slow the first post-idle exchange feels.
+    final rxGap = Stopwatch()..start();
     readerPort.listen((msg) {
       if (msg == null) {
         _onClosedByPeer();
+      } else if (msg is Map) {
+        // Reader-loop exit reason: recv() return value + WSA error code. wsa=0
+        // with n=0 is a clean peer close; a non-zero wsa is the exact code that
+        // tells a real disconnect from a transient error treated as EOF.
+        logConnection.fine(
+          () => 'reader exit: recv n=${msg['n']} wsa=${msg['wsa']}',
+        );
       } else if (msg is TransferableTypedData &&
           !_closed &&
           !_incoming.isClosed) {
-        _incoming.add(msg.materialize().asUint8List());
+        final gapMs = rxGap.elapsedMilliseconds;
+        rxGap.reset();
+        final bytes = msg.materialize().asUint8List();
+        logConnection.fine(() => 'rx ${bytes.length}B (idle gap ${gapMs}ms)');
+        _incoming.add(bytes);
       }
     });
     // If close() wins the spawn race, kill the isolate as soon as it exists.
@@ -730,6 +783,13 @@ class _WindowsRfcommTransport implements RfcommTransport {
           msg.send(w);
         }
         _pendingWrites.clear();
+      } else if (msg is Map) {
+        // Notable send from the writer isolate: slow (ms) = link waking from
+        // sniff mode; wsa != 0 = the send failed (writer-side disconnect view).
+        logConnection.fine(
+          () =>
+              'tx send ${msg['bytes']}B took ${msg['ms']}ms wsa=${msg['wsa']}',
+        );
       }
     });
     Isolate.spawn(_writeEntry, [_socket, control.sendPort]).then((i) {
@@ -755,6 +815,9 @@ class _WindowsRfcommTransport implements RfcommTransport {
   @override
   void send(Uint8List data) {
     if (_closed) throw const BluetoothWriteException('transport closed');
+    final gapMs = _txGap.elapsedMilliseconds;
+    _txGap.reset();
+    logConnection.fine(() => 'tx ${data.length}B (idle gap ${gapMs}ms)');
     final msg = <Object?>[
       TransferableTypedData.fromList([data]),
       null,
