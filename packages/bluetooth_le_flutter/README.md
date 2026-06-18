@@ -17,12 +17,22 @@ directly.
 
 ## Support
 
-| Platform | Scan | Connect + read/write | Notifications |
-| --- | --- | --- | --- |
-| Android | ✅ | ✅ | ✅ |
-| iOS | ✅ | ✅ | ✅ |
+| Platform | Scan | Connect + read/write | Notifications | Manually verified |
+| --- | --- | --- | --- | --- |
+| Android | ✅ | ✅ | ✅ | ❌ |
+| iOS | ✅ | ✅ | ✅ | ❌ |
 
-✅ supported · ⚠️ partial · ❌ not supported
+In the capability columns: ✅ supported · ⚠️ partial · ❌ not supported.
+
+**Manually verified** — whether the author has exercised this backend on real
+hardware: ⚠️ = yes (works well enough for the author, but **not guaranteed to be
+perfect**); ❌ = **not yet hardware-verified**.
+
+> ⚠️ Neither the Android nor the iOS backend has been manually verified on a
+> device yet — treat both as best-effort for now. Of the `bluetooth_le` backends,
+> only **macOS** and **Windows** (from the pure-Dart core, used on desktop)
+> currently carry any manual verification. Every backend will be verified on
+> hardware over time.
 
 (Linux, macOS and Windows are handled by the `bluetooth_le` core directly.)
 

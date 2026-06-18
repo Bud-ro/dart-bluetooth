@@ -29,15 +29,27 @@ await serial.write(Uint8List.fromList('AT\r\n'.codeUnits));
 
 ## Support
 
-| Platform | Scan | Connect + read/write | Notifications |
-| --- | --- | --- | --- |
-| Linux | ✅ | ✅ | ✅ |
-| macOS | ✅ | ✅ | ✅ |
-| Android | ✅ | ✅ | ✅ |
-| iOS | ✅ | ✅ | ✅ |
-| Windows | ❌ | ✅ | ❌ |
+| Platform | Scan | Connect + read/write | Notifications | Manually verified |
+| --- | --- | --- | --- | --- |
+| Linux | ✅ | ✅ | ✅ | ❌ |
+| macOS | ✅ | ✅ | ✅ | ⚠️ |
+| Android | ✅ | ✅ | ✅ | ❌ |
+| iOS | ✅ | ✅ | ✅ | ❌ |
+| Windows | ❌ | ✅ | ❌ | ⚠️ |
 
-✅ supported · ⚠️ partial · ❌ not supported
+In the capability columns: ✅ supported · ⚠️ partial · ❌ not supported.
+
+**Manually verified** — whether the author has actually exercised this backend on
+real hardware: ⚠️ = yes, it works well enough for the author, but correctness is
+**not guaranteed to be perfect**; ❌ = **not yet hardware-verified** (the
+capabilities shown are implemented, but their effectiveness has not been confirmed
+by the author).
+
+> ⚠️ Only **macOS** and **Windows** have had any manual verification against real
+> devices so far. Every other backend is implemented but unverified — best-effort
+> for now. All backends will be verified on hardware over time; until then, only
+> the platforms marked ⚠️ carry any manual verification of this package's
+> effectiveness.
 
 Notes:
 

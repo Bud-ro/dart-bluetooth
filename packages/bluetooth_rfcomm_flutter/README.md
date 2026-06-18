@@ -16,12 +16,23 @@ desktop-only Flutter apps can depend on `bluetooth_rfcomm` directly.
 
 ## Support
 
-| Platform | RFCOMM serial |
-| --- | --- |
-| Android | ✅ |
-| iOS | ⚠️ |
+| Platform | RFCOMM serial | Manually verified |
+| --- | --- | --- |
+| Android | ✅ | ❌ |
+| iOS | ⚠️ | ❌ |
 
-✅ supported · ⚠️ partial · ❌ not supported
+In the capability column: ✅ supported · ⚠️ partial · ❌ not supported.
+
+**Manually verified** — whether the author has exercised this backend on real
+hardware: ⚠️ = yes (works well enough for the author, but **not guaranteed to be
+perfect**); ❌ = **not yet hardware-verified** (implemented, but its effectiveness
+has not been confirmed by the author).
+
+> ⚠️ Neither the Android nor the iOS backend has been manually verified on a
+> device yet — treat both as best-effort for now. Of the `bluetooth_rfcomm`
+> backends, only **macOS** and **Windows** (provided by the pure-Dart core, used
+> on desktop) currently carry any manual verification. Every backend will be
+> verified on hardware over time.
 
 iOS reaches only MFi accessories; a non-MFi device throws
 `BluetoothUnsupportedException`. (Linux, macOS and Windows are handled by the

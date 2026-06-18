@@ -16,15 +16,27 @@ Flutter plugin — see [Why the split](#why-the-split)):
 
 ## Support
 
-| Platform | Classic (RFCOMM) | Low Energy (GATT) |
-| --- | --- | --- |
-| Linux | ✅ | ✅ |
-| macOS | ✅ | ✅ |
-| Windows | ✅ | ⚠️ |
-| Android | ✅ | ✅ |
-| iOS | ⚠️ | ✅ |
+| Platform | Classic (RFCOMM) | Low Energy (GATT) | Manually verified |
+| --- | --- | --- | --- |
+| Linux | ✅ | ✅ | ❌ |
+| macOS | ✅ | ✅ | ⚠️ |
+| Windows | ✅ | ⚠️ | ⚠️ |
+| Android | ✅ | ✅ | ❌ |
+| iOS | ⚠️ | ✅ | ❌ |
 
-✅ supported · ⚠️ partial · ❌ not supported
+In the capability columns: ✅ supported · ⚠️ partial · ❌ not supported.
+
+**Manually verified** — whether the author has actually exercised these backends
+on real hardware: ⚠️ = yes, they work well enough for the author, but correctness
+is **not guaranteed to be perfect**; ❌ = **not yet hardware-verified** (the
+capabilities shown are implemented, but their effectiveness has not been confirmed
+by the author).
+
+> ⚠️ Only **macOS** and **Windows** have had any manual verification against real
+> devices so far (and most thoroughly for Classic/RFCOMM). Every other platform is
+> implemented but unverified — best-effort for now. All backends will be verified
+> on hardware over time; until then, only the platforms marked ⚠️ carry any manual
+> verification of these packages' effectiveness.
 
 Notes:
 

@@ -29,15 +29,27 @@ await conn.finish();                              // flush, then close
 
 ## Support
 
-| Platform | Discover | Connect + serial I/O | Pairing |
-| --- | --- | --- | --- |
-| Linux | ✅ | ✅ | ✅ |
-| macOS | ✅ | ✅ | ⚠️ |
-| Windows | ✅ | ✅ | ⚠️ |
-| Android | ✅ | ✅ | ⚠️ |
-| iOS | ⚠️ | ⚠️ | ⚠️ |
+| Platform | Discover | Connect + serial I/O | Pairing | Manually verified |
+| --- | --- | --- | --- | --- |
+| Linux | ✅ | ✅ | ✅ | ❌ |
+| macOS | ✅ | ✅ | ⚠️ | ⚠️ |
+| Windows | ✅ | ✅ | ⚠️ | ⚠️ |
+| Android | ✅ | ✅ | ⚠️ | ❌ |
+| iOS | ⚠️ | ⚠️ | ⚠️ | ❌ |
 
-✅ supported · ⚠️ partial · ❌ not supported
+In the capability columns: ✅ supported · ⚠️ partial · ❌ not supported.
+
+**Manually verified** — whether the author has actually exercised this backend
+against real hardware: ⚠️ = yes, it works well enough for the author, but
+correctness is **not guaranteed to be perfect**; ❌ = **not yet hardware-verified**
+(the capability shown in the other columns is implemented, but its effectiveness
+has not been confirmed by the author).
+
+> ⚠️ Only **macOS** and **Windows** have been manually verified against real
+> devices so far. Every other backend is implemented but unverified — treat it as
+> best-effort for now. The remaining platforms will be verified on hardware over
+> time; until then, only the platforms marked ⚠️ above carry any manual
+> verification of this package's effectiveness.
 
 Notes:
 
