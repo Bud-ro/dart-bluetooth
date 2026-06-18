@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
+import 'dart:io' show sleep;
 import 'dart:isolate';
 import 'dart:typed_data';
 
@@ -587,6 +588,10 @@ int _wsaError(int err) => err == 0 ? -1 : err;
 const int _recvBufSize = 8192;
 const int _sendChunkFlags = 0;
 
+// Diagnostic-message tags sent from the reader isolate to the main isolate.
+const String _evtExit = 'reader-exit'; // the read loop ended (n + wsa code)
+const String _evtSpurious = 'reader-spurious'; // tolerated SOCKET_ERROR/wsa=0
+
 void _recvEntry(List<Object?> args) {
   final socket = args[0] as int;
   final sendPort = args[1] as SendPort;
@@ -611,10 +616,21 @@ void _recvEntry(List<Object?> args) {
   // disconnect from a transient error treated as EOF.
   int exitN = 0;
   int exitErr = 0;
+  // recv() can intermittently return SOCKET_ERROR with WSAGetLastError()==0 — a
+  // transient quirk of the Bluetooth RFCOMM provider (and the last-error value
+  // can also be lost crossing the dart:ffi boundary). It carries NO evidence of a
+  // real disconnect, so tearing the link down on it drops a live connection
+  // (observed: a fast send-after-receive burst triggers it). Tolerate a bounded
+  // burst of these — a genuinely dead socket re-surfaces as a clean EOF (n==0) or
+  // a real error code, and a healthy one resumes blocking — only giving up if it
+  // never clears (guards against a busy-spin on a truly broken socket).
+  var spurious = 0;
+  const maxSpurious = 20;
   try {
     while (true) {
       final n = ws.recv(socket, buf, _recvBufSize, 0);
       if (n > 0) {
+        spurious = 0;
         final bytes = Uint8List.fromList(buf.asTypedList(n));
         sendPort.send(TransferableTypedData.fromList([bytes]));
         continue;
@@ -624,20 +640,44 @@ void _recvEntry(List<Object?> args) {
         break;
       }
       // n < 0 (SOCKET_ERROR): a recv timeout just means "no data yet" — keep
-      // waiting. Any other error (socket closed by close(), reset, …) is EOF.
+      // waiting.
       final err = ws.wsaGetLastError();
-      if (err == wsaeTimedOut) continue;
+      if (err == wsaeTimedOut) {
+        spurious = 0;
+        continue;
+      }
+      if (err == 0) {
+        // SOCKET_ERROR with no error code — see the note above. Tolerate it.
+        if (++spurious <= maxSpurious) {
+          sendPort.send(<String, Object>{
+            'event': _evtSpurious,
+            'n': n,
+            'wsa': 0,
+            'count': spurious,
+          });
+          sleep(const Duration(milliseconds: 10)); // avoid a busy-spin
+          continue;
+        }
+        exitN = n; // never cleared — treat as gone
+        exitErr = 0;
+        break;
+      }
+      // A real WSA error code (reset, socket closed by close(), …) — real EOF.
       exitN = n;
       exitErr = err;
       break;
     }
   } catch (e) {
-    exitErr = -1; // unexpected Dart-side error; fall through to EOF
+    exitErr = -2; // unexpected Dart-side error; fall through to EOF
   } finally {
     calloc.free(buf);
     ws.wsaCleanup(); // balance this isolate's WSAStartup
     // Report the exit reason (a Map, distinct from data/null), then signal close.
-    sendPort.send(<String, int>{'n': exitN, 'wsa': exitErr});
+    sendPort.send(<String, Object>{
+      'event': _evtExit,
+      'n': exitN,
+      'wsa': exitErr,
+    });
     sendPort.send(null); // signal closed
   }
 }
@@ -749,12 +789,22 @@ class _WindowsRfcommTransport implements RfcommTransport {
       if (msg == null) {
         _onClosedByPeer();
       } else if (msg is Map) {
-        // Reader-loop exit reason: recv() return value + WSA error code. wsa=0
-        // with n=0 is a clean peer close; a non-zero wsa is the exact code that
-        // tells a real disconnect from a transient error treated as EOF.
-        logConnection.fine(
-          () => 'reader exit: recv n=${msg['n']} wsa=${msg['wsa']}',
-        );
+        if (msg['event'] == _evtSpurious) {
+          // A SOCKET_ERROR with no error code that we tolerated (kept the link
+          // alive). Logging it shows how often the provider quirk fires.
+          logConnection.fine(
+            () =>
+                'recv SOCKET_ERROR with wsa=0 tolerated (#${msg['count']}) — '
+                'link kept alive',
+          );
+        } else {
+          // Reader-loop exit reason: recv() return value + WSA error code. wsa=0
+          // with n=0 is a clean peer close; a non-zero wsa is the exact code that
+          // tells a real disconnect from a transient error treated as EOF.
+          logConnection.fine(
+            () => 'reader exit: recv n=${msg['n']} wsa=${msg['wsa']}',
+          );
+        }
       } else if (msg is TransferableTypedData &&
           !_closed &&
           !_incoming.isClosed) {
