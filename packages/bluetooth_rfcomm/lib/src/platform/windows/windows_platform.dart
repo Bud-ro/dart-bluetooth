@@ -616,14 +616,27 @@ void _recvEntry(List<Object?> args) {
   // disconnect from a transient error treated as EOF.
   int exitN = 0;
   int exitErr = 0;
-  // recv() can intermittently return SOCKET_ERROR with WSAGetLastError()==0 — a
-  // transient quirk of the Bluetooth RFCOMM provider (and the last-error value
-  // can also be lost crossing the dart:ffi boundary). It carries NO evidence of a
-  // real disconnect, so tearing the link down on it drops a live connection
-  // (observed: a fast send-after-receive burst triggers it). Tolerate a bounded
-  // burst of these — a genuinely dead socket re-surfaces as a clean EOF (n==0) or
-  // a real error code, and a healthy one resumes blocking — only giving up if it
-  // never clears (guards against a busy-spin on a truly broken socket).
+  // Disconnect classification is FAIL-CLOSED on the one value we can read
+  // reliably — recv()'s return — because WSAGetLastError() is only a HINT here:
+  // it's a second, separate FFI call, and the Dart VM's safepoint/GC can run
+  // between the recv() call and it, clobbering the thread's last-error to 0
+  // (dart-lang/sdk#38832 — there's no native build to capture it inline, and the
+  // blocking recv() can't be an `isLeaf` call). That's why a fast send/receive
+  // burst (more allocation → more GC) intermittently surfaced as
+  // `recv=-1, wsa=0` and tore down a live link: the -1 was almost always just a
+  // benign SO_RCVTIMEO timeout whose code got clobbered.
+  //
+  //   n  > 0            -> data
+  //   n == 0            -> REAL disconnect (graceful close; return-value based,
+  //                        immune to the clobber — the unmissable backstop)
+  //   n  < 0 + benign   -> keep reading (timeout / wouldblock / interrupted)
+  //   n  < 0 + wsa == 0 -> clobbered code: keep reading, but BOUNDED so a real
+  //                        reset clobbered to 0 can't be swallowed forever
+  //   n  < 0 + any other code -> REAL disconnect (reset/abort/etc.)
+  //
+  // A spurious clobber self-corrects (the next recv yields data or a real
+  // timeout, resetting the bound); a genuinely dead socket keeps returning -1
+  // with no progress and trips the bound within ~200ms.
   var spurious = 0;
   const maxSpurious = 20;
   try {
@@ -639,15 +652,16 @@ void _recvEntry(List<Object?> args) {
         exitN = 0; // peer closed the connection (clean EOF)
         break;
       }
-      // n < 0 (SOCKET_ERROR): a recv timeout just means "no data yet" — keep
-      // waiting.
+      // n < 0 (SOCKET_ERROR). Whitelist the benign, non-fatal outcomes.
       final err = ws.wsaGetLastError();
-      if (err == wsaeTimedOut) {
-        spurious = 0;
+      if (err == wsaeTimedOut || err == wsaeWouldBlock || err == wsaeIntr) {
+        spurious = 0; // socket is alive, just no data this window
         continue;
       }
       if (err == 0) {
-        // SOCKET_ERROR with no error code — see the note above. Tolerate it.
+        // Clobbered last-error (see note above). No evidence of a real error, so
+        // keep reading — but bounded, so a real reset whose code was clobbered to
+        // 0 still exits instead of spinning forever.
         if (++spurious <= maxSpurious) {
           sendPort.send(<String, Object>{
             'event': _evtSpurious,
@@ -662,7 +676,7 @@ void _recvEntry(List<Object?> args) {
         exitErr = 0;
         break;
       }
-      // A real WSA error code (reset, socket closed by close(), …) — real EOF.
+      // Any other WSA code (reset, abort, socket closed by close(), …) — real EOF.
       exitN = n;
       exitErr = err;
       break;
@@ -790,17 +804,17 @@ class _WindowsRfcommTransport implements RfcommTransport {
         _onClosedByPeer();
       } else if (msg is Map) {
         if (msg['event'] == _evtSpurious) {
-          // A SOCKET_ERROR with no error code that we tolerated (kept the link
-          // alive). Logging it shows how often the provider quirk fires.
-          logConnection.fine(
+          // A clobbered-last-error recv we tolerated (kept the link alive).
+          // Per-event detail -> FINER.
+          logConnection.finer(
             () =>
-                'recv SOCKET_ERROR with wsa=0 tolerated (#${msg['count']}) — '
-                'link kept alive',
+                'recv SOCKET_ERROR with wsa=0 (clobbered last-error) tolerated '
+                '(#${msg['count']}) — link kept alive',
           );
         } else {
-          // Reader-loop exit reason: recv() return value + WSA error code. wsa=0
-          // with n=0 is a clean peer close; a non-zero wsa is the exact code that
-          // tells a real disconnect from a transient error treated as EOF.
+          // Reader-loop exit reason: recv() return value + WSA error code. This
+          // is a lifecycle event (the disconnect) -> FINE. wsa=0 with n=0 is a
+          // clean peer close; a non-zero wsa is the real disconnect code.
           logConnection.fine(
             () => 'reader exit: recv n=${msg['n']} wsa=${msg['wsa']}',
           );
@@ -811,7 +825,7 @@ class _WindowsRfcommTransport implements RfcommTransport {
         final gapMs = rxGap.elapsedMilliseconds;
         rxGap.reset();
         final bytes = msg.materialize().asUint8List();
-        logConnection.fine(() => 'rx ${bytes.length}B (idle gap ${gapMs}ms)');
+        logConnection.finer(() => 'rx ${bytes.length}B (idle gap ${gapMs}ms)');
         _incoming.add(bytes);
       }
     });
@@ -835,8 +849,8 @@ class _WindowsRfcommTransport implements RfcommTransport {
         _pendingWrites.clear();
       } else if (msg is Map) {
         // Notable send from the writer isolate: slow (ms) = link waking from
-        // sniff mode; wsa != 0 = the send failed (writer-side disconnect view).
-        logConnection.fine(
+        // sniff mode; wsa != 0 = the send failed. Per-event detail -> FINER.
+        logConnection.finer(
           () =>
               'tx send ${msg['bytes']}B took ${msg['ms']}ms wsa=${msg['wsa']}',
         );
@@ -867,7 +881,7 @@ class _WindowsRfcommTransport implements RfcommTransport {
     if (_closed) throw const BluetoothWriteException('transport closed');
     final gapMs = _txGap.elapsedMilliseconds;
     _txGap.reset();
-    logConnection.fine(() => 'tx ${data.length}B (idle gap ${gapMs}ms)');
+    logConnection.finer(() => 'tx ${data.length}B (idle gap ${gapMs}ms)');
     final msg = <Object?>[
       TransferableTypedData.fromList([data]),
       null,
