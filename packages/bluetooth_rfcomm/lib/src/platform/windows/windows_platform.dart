@@ -634,9 +634,11 @@ void _recvEntry(List<Object?> args) {
   //                        reset clobbered to 0 can't be swallowed forever
   //   n  < 0 + any other code -> REAL disconnect (reset/abort/etc.)
   //
-  // A spurious clobber self-corrects (the next recv yields data or a real
-  // timeout, resetting the bound); a genuinely dead socket keeps returning -1
-  // with no progress and trips the bound within ~200ms.
+  // A spurious clobber self-corrects: on a healthy socket the next recv() blocks
+  // (returning data or a real timeout), which resets the bound. A genuinely dead
+  // socket returns -1 immediately, so the count bound (maxSpurious) trips quickly
+  // and the link closes — the count bound guarantees termination regardless of
+  // per-call timing.
   var spurious = 0;
   const maxSpurious = 20;
   try {
@@ -848,12 +850,17 @@ class _WindowsRfcommTransport implements RfcommTransport {
         }
         _pendingWrites.clear();
       } else if (msg is Map) {
-        // Notable send from the writer isolate: slow (ms) = link waking from
-        // sniff mode; wsa != 0 = the send failed. Per-event detail -> FINER.
-        logConnection.finer(
-          () =>
-              'tx send ${msg['bytes']}B took ${msg['ms']}ms wsa=${msg['wsa']}',
-        );
+        final wsa = msg['wsa'] as int;
+        if (wsa != 0) {
+          // A failed send is a recoverable problem -> WARNING.
+          logConnection.warning(() => 'send failed: ${msg['bytes']}B wsa=$wsa');
+        } else {
+          // A slow (but successful) send — link waking from sniff mode. Per-event
+          // diagnostic detail -> FINER.
+          logConnection.finer(
+            () => 'tx send ${msg['bytes']}B took ${msg['ms']}ms',
+          );
+        }
       }
     });
     Isolate.spawn(_writeEntry, [_socket, control.sendPort]).then((i) {
