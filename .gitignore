@@ -21,3 +21,6 @@ pubspec.lock
 
 # Generated API docs (dart doc)
 doc/api/
+
+# Local Claude Code config / skills (not part of the published repo)
+.claude/
