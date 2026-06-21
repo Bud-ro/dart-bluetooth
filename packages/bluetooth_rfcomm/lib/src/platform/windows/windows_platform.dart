@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
+import 'dart:io' show sleep;
 import 'dart:isolate';
 import 'dart:typed_data';
 
@@ -587,6 +588,10 @@ int _wsaError(int err) => err == 0 ? -1 : err;
 const int _recvBufSize = 8192;
 const int _sendChunkFlags = 0;
 
+// Diagnostic-message tags sent from the reader isolate to the main isolate.
+const String _evtExit = 'reader-exit'; // the read loop ended (n + wsa code)
+const String _evtSpurious = 'reader-spurious'; // tolerated SOCKET_ERROR/wsa=0
+
 void _recvEntry(List<Object?> args) {
   final socket = args[0] as int;
   final sendPort = args[1] as SendPort;
@@ -604,25 +609,91 @@ void _recvEntry(List<Object?> args) {
   ws.setsockopt(socket, solSocket, soRcvTimeo, timeout, 4);
   calloc.free(timeout);
   final buf = calloc<ffi.Uint8>(_recvBufSize);
+  // DIAGNOSTICS: capture how/why the read loop exits so the main isolate can log
+  // it (worker isolates can't reach the app's package:logging handler). `exitN`
+  // is the recv() return that ended the loop; `exitErr` is WSAGetLastError() for
+  // the non-timeout error path — this is the exact code we need to tell a real
+  // disconnect from a transient error treated as EOF.
+  int exitN = 0;
+  int exitErr = 0;
+  // Disconnect classification is FAIL-CLOSED on the one value we can read
+  // reliably — recv()'s return — because WSAGetLastError() is only a HINT here:
+  // it's a second, separate FFI call, and the Dart VM's safepoint/GC can run
+  // between the recv() call and it, clobbering the thread's last-error to 0
+  // (dart-lang/sdk#38832 — there's no native build to capture it inline, and the
+  // blocking recv() can't be an `isLeaf` call). That's why a fast send/receive
+  // burst (more allocation → more GC) intermittently surfaced as
+  // `recv=-1, wsa=0` and tore down a live link: the -1 was almost always just a
+  // benign SO_RCVTIMEO timeout whose code got clobbered.
+  //
+  //   n  > 0            -> data
+  //   n == 0            -> REAL disconnect (graceful close; return-value based,
+  //                        immune to the clobber — the unmissable backstop)
+  //   n  < 0 + benign   -> keep reading (timeout / wouldblock / interrupted)
+  //   n  < 0 + wsa == 0 -> clobbered code: keep reading, but BOUNDED so a real
+  //                        reset clobbered to 0 can't be swallowed forever
+  //   n  < 0 + any other code -> REAL disconnect (reset/abort/etc.)
+  //
+  // A spurious clobber self-corrects: on a healthy socket the next recv() blocks
+  // (returning data or a real timeout), which resets the bound. A genuinely dead
+  // socket returns -1 immediately, so the count bound (maxSpurious) trips quickly
+  // and the link closes — the count bound guarantees termination regardless of
+  // per-call timing.
+  var spurious = 0;
+  const maxSpurious = 20;
   try {
     while (true) {
       final n = ws.recv(socket, buf, _recvBufSize, 0);
       if (n > 0) {
+        spurious = 0;
         final bytes = Uint8List.fromList(buf.asTypedList(n));
         sendPort.send(TransferableTypedData.fromList([bytes]));
         continue;
       }
-      if (n == 0) break; // peer closed the connection (clean EOF)
-      // n < 0 (SOCKET_ERROR): a recv timeout just means "no data yet" — keep
-      // waiting. Any other error (socket closed by close(), reset, …) is EOF.
-      if (ws.wsaGetLastError() == wsaeTimedOut) continue;
+      if (n == 0) {
+        exitN = 0; // peer closed the connection (clean EOF)
+        break;
+      }
+      // n < 0 (SOCKET_ERROR). Whitelist the benign, non-fatal outcomes.
+      final err = ws.wsaGetLastError();
+      if (err == wsaeTimedOut || err == wsaeWouldBlock || err == wsaeIntr) {
+        spurious = 0; // socket is alive, just no data this window
+        continue;
+      }
+      if (err == 0) {
+        // Clobbered last-error (see note above). No evidence of a real error, so
+        // keep reading — but bounded, so a real reset whose code was clobbered to
+        // 0 still exits instead of spinning forever.
+        if (++spurious <= maxSpurious) {
+          sendPort.send(<String, Object>{
+            'event': _evtSpurious,
+            'n': n,
+            'wsa': 0,
+            'count': spurious,
+          });
+          sleep(const Duration(milliseconds: 10)); // avoid a busy-spin
+          continue;
+        }
+        exitN = n; // never cleared — treat as gone
+        exitErr = 0;
+        break;
+      }
+      // Any other WSA code (reset, abort, socket closed by close(), …) — real EOF.
+      exitN = n;
+      exitErr = err;
       break;
     }
-  } catch (_) {
-    // fall through to EOF
+  } catch (e) {
+    exitErr = -2; // unexpected Dart-side error; fall through to EOF
   } finally {
     calloc.free(buf);
     ws.wsaCleanup(); // balance this isolate's WSAStartup
+    // Report the exit reason (a Map, distinct from data/null), then signal close.
+    sendPort.send(<String, Object>{
+      'event': _evtExit,
+      'n': exitN,
+      'wsa': exitErr,
+    });
     sendPort.send(null); // signal closed
   }
 }
@@ -645,13 +716,29 @@ void _writeEntry(List<Object?> args) {
     final data = rec[0] as TransferableTypedData?;
     final ack = rec[1] as SendPort?;
     if (data != null) {
-      _sendAll(ws, socket, data.materialize().asUint8List());
+      final bytes = data.materialize().asUint8List();
+      // DIAGNOSTICS: time the blocking send() and capture any error code. A slow
+      // send is the signature of the link waking from sniff (low-power) mode; an
+      // error code is the writer-side view of the rare disconnect. Report back to
+      // the main isolate only when notable (slow or failed) to limit noise.
+      final sw = Stopwatch()..start();
+      final err = _sendAll(ws, socket, bytes);
+      sw.stop();
+      if (err != 0 || sw.elapsedMilliseconds > 50) {
+        mainPort.send(<String, int>{
+          'bytes': bytes.length,
+          'ms': sw.elapsedMilliseconds,
+          'wsa': err,
+        });
+      }
     }
     ack?.send(true);
   });
 }
 
-void _sendAll(WinsockBindings ws, int socket, Uint8List bytes) {
+/// Sends [bytes] fully. Returns 0 on success, or the WSA error code (or -1 if
+/// `WSAGetLastError()` was 0) when `send` failed before all bytes went out.
+int _sendAll(WinsockBindings ws, int socket, Uint8List bytes) {
   final ptr = calloc<ffi.Uint8>(bytes.length);
   try {
     ptr.asTypedList(bytes.length).setAll(0, bytes);
@@ -663,9 +750,12 @@ void _sendAll(WinsockBindings ws, int socket, Uint8List bytes) {
         bytes.length - offset,
         _sendChunkFlags,
       );
-      if (n == socketError || n <= 0) break; // peer gone
+      if (n == socketError || n <= 0) {
+        return _wsaError(ws.wsaGetLastError()); // peer gone / error
+      }
       offset += n;
     }
+    return 0;
   } finally {
     calloc.free(ptr);
   }
@@ -700,16 +790,45 @@ class _WindowsRfcommTransport implements RfcommTransport {
   final List<List<Object?>> _pendingWrites = [];
   final Completer<void> _done = Completer<void>();
 
+  // DIAGNOSTICS: time since the previous outbound send, to flag sends that follow
+  // a long idle (the case where the link has dropped into sniff mode).
+  final Stopwatch _txGap = Stopwatch()..start();
+
   void _start() {
     final readerPort = ReceivePort();
     _readerPort = readerPort;
+    // DIAGNOSTICS: time between inbound chunks. A large gap before a chunk is the
+    // link sitting idle (and likely in sniff/low-power mode); correlate the gap
+    // with how slow the first post-idle exchange feels.
+    final rxGap = Stopwatch()..start();
     readerPort.listen((msg) {
       if (msg == null) {
         _onClosedByPeer();
+      } else if (msg is Map) {
+        if (msg['event'] == _evtSpurious) {
+          // A clobbered-last-error recv we tolerated (kept the link alive).
+          // Per-event detail -> FINER.
+          logConnection.finer(
+            () =>
+                'recv SOCKET_ERROR with wsa=0 (clobbered last-error) tolerated '
+                '(#${msg['count']}) — link kept alive',
+          );
+        } else {
+          // Reader-loop exit reason: recv() return value + WSA error code. This
+          // is a lifecycle event (the disconnect) -> FINE. wsa=0 with n=0 is a
+          // clean peer close; a non-zero wsa is the real disconnect code.
+          logConnection.fine(
+            () => 'reader exit: recv n=${msg['n']} wsa=${msg['wsa']}',
+          );
+        }
       } else if (msg is TransferableTypedData &&
           !_closed &&
           !_incoming.isClosed) {
-        _incoming.add(msg.materialize().asUint8List());
+        final gapMs = rxGap.elapsedMilliseconds;
+        rxGap.reset();
+        final bytes = msg.materialize().asUint8List();
+        logConnection.finer(() => 'rx ${bytes.length}B (idle gap ${gapMs}ms)');
+        _incoming.add(bytes);
       }
     });
     // If close() wins the spawn race, kill the isolate as soon as it exists.
@@ -730,6 +849,18 @@ class _WindowsRfcommTransport implements RfcommTransport {
           msg.send(w);
         }
         _pendingWrites.clear();
+      } else if (msg is Map) {
+        final wsa = msg['wsa'] as int;
+        if (wsa != 0) {
+          // A failed send is a recoverable problem -> WARNING.
+          logConnection.warning(() => 'send failed: ${msg['bytes']}B wsa=$wsa');
+        } else {
+          // A slow (but successful) send — link waking from sniff mode. Per-event
+          // diagnostic detail -> FINER.
+          logConnection.finer(
+            () => 'tx send ${msg['bytes']}B took ${msg['ms']}ms',
+          );
+        }
       }
     });
     Isolate.spawn(_writeEntry, [_socket, control.sendPort]).then((i) {
@@ -755,6 +886,9 @@ class _WindowsRfcommTransport implements RfcommTransport {
   @override
   void send(Uint8List data) {
     if (_closed) throw const BluetoothWriteException('transport closed');
+    final gapMs = _txGap.elapsedMilliseconds;
+    _txGap.reset();
+    logConnection.finer(() => 'tx ${data.length}B (idle gap ${gapMs}ms)');
     final msg = <Object?>[
       TransferableTypedData.fromList([data]),
       null,

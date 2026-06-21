@@ -17,6 +17,7 @@ const int afBth = 32; // AF_BTH
 const int sockStream = 1; // SOCK_STREAM
 const int bthprotoRfcomm = 3; // BTHPROTO_RFCOMM
 const int socketError = -1; // SOCKET_ERROR
+const int wsaeIntr = 10004; // WSAEINTR (interrupted call)
 const int wsaeWouldBlock = 10035;
 const int wsaeTimedOut = 10060; // WSAETIMEDOUT (a recv() SO_RCVTIMEO expiry)
 
