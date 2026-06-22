@@ -112,6 +112,11 @@ jobs:
         working-directory: ${{ env.PKG_LE }}
         run: dart test
 
+      - name: publish dry-run (pure-Dart package is pub.dev-publishable)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: ${{ env.PKG_LE }}
+        run: dart pub publish --dry-run
+
   # Flutter plugin package: analyze the plugin + its example.
   flutter-package:
     timeout-minutes: 20
@@ -130,6 +135,9 @@ jobs:
           flutter pub get
           dart format --output=none --set-exit-if-changed .
           flutter analyze
+      - name: publish dry-run (plugin; dependency_overrides hint is expected)
+        working-directory: ${{ env.PKGF }}
+        run: dart pub publish --dry-run
       - name: analyze example
         working-directory: ${{ env.EXAMPLE }}
         run: |
@@ -183,6 +191,9 @@ jobs:
           flutter pub get
           dart format --output=none --set-exit-if-changed .
           flutter analyze
+      - name: publish dry-run (plugin; dependency_overrides hint is expected)
+        working-directory: ${{ env.PKG_LE_F }}
+        run: dart pub publish --dry-run
       - name: analyze example
         working-directory: ${{ env.EXAMPLE_LE }}
         run: |
