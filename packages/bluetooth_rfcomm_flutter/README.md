@@ -47,7 +47,7 @@ iOS reaches only MFi accessories; a non-MFi device throws
 
 ```yaml
 dependencies:
-  bluetooth_rfcomm: ^0.1.0
+  bluetooth_rfcomm: ^0.1.1
   bluetooth_rfcomm_flutter: ^0.1.0
 ```
 

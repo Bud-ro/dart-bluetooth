@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.1
+
+- Windows: fix rare RFCOMM disconnects under fast send/receive bursts. A blocking
+  `recv()` can return `SOCKET_ERROR` while `WSAGetLastError()` reads back 0 — the
+  thread's last-error gets clobbered by the Dart VM's safepoint/GC between the two
+  separate FFI calls (dart-lang/sdk#38832), not a real error. The reader now
+  classifies fail-closed on `recv()`'s return value (graceful close `n==0` and
+  real error codes still disconnect immediately; a clobbered `wsa==0` is tolerated
+  but bounded), so a live link is no longer torn down by a benign timeout whose
+  code was lost. A failed send is surfaced at the `WARNING` log level.
+- Windows: added connection diagnostics under the `bluetooth_rfcomm.connection`
+  logger (FINE = disconnect reason with the WSA code; FINER = per-message rx/tx
+  idle gaps and send timing) to make link-level behaviour observable.
+
 ## 0.1.0
 
 Initial release.

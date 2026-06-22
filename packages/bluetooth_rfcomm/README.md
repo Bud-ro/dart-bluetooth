@@ -83,14 +83,14 @@ Command-line or Flutter desktop:
 
 ```yaml
 dependencies:
-  bluetooth_rfcomm: ^0.1.0
+  bluetooth_rfcomm: ^0.1.1
 ```
 
 Flutter app targeting Android/iOS — add the companion plugin too:
 
 ```yaml
 dependencies:
-  bluetooth_rfcomm: ^0.1.0
+  bluetooth_rfcomm: ^0.1.1
   bluetooth_rfcomm_flutter: ^0.1.0
 ```
 

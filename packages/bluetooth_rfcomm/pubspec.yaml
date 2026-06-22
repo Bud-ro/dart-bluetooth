@@ -2,7 +2,7 @@ name: bluetooth_rfcomm
 description: >-
   Cross-platform Bluetooth Classic RFCOMM serial for Dart and Flutter — one
   package for CLI and Flutter on Windows, macOS, Linux, Android and iOS.
-version: 0.1.0
+version: 0.1.1
 repository: https://github.com/Bud-ro/dart-bluetooth
 homepage: https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_rfcomm
 issue_tracker: https://github.com/Bud-ro/dart-bluetooth/issues
