@@ -112,11 +112,18 @@ class AndroidBindings {
         .lookupFunction<
           ffi.Void Function(
             ffi.Int64,
+            ffi.Int64,
             ffi.Pointer<ffi.Char>,
             ffi.Pointer<ffi.Char>,
             ffi.Int32,
           ),
-          void Function(int, ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Char>, int)
+          void Function(
+            int,
+            int,
+            ffi.Pointer<ffi.Char>,
+            ffi.Pointer<ffi.Char>,
+            int,
+          )
         >('ble_and_subscribe');
     requestMtu = _lib
         .lookupFunction<
@@ -165,6 +172,7 @@ class AndroidBindings {
   )
   write;
   late final void Function(
+    int,
     int,
     ffi.Pointer<ffi.Char>,
     ffi.Pointer<ffi.Char>,

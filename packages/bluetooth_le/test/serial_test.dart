@@ -38,6 +38,33 @@ void main() {
     expect(received, [1, 2, 3, 4, 5]);
   });
 
+  test('input disables notifications when the last listener cancels', () async {
+    final (_, gatt, serial) = await openSerial();
+    final sub = serial.input.listen((_) {});
+    await Future<void>.delayed(Duration.zero);
+    expect(gatt.notifyEnabled[Uuid.nordicUartTx], isTrue);
+    await sub.cancel();
+    await Future<void>.delayed(Duration.zero);
+    expect(gatt.notifyEnabled[Uuid.nordicUartTx], isFalse);
+  });
+
+  test('input can be re-listened after a full cancel (re-enables '
+      'notifications)', () async {
+    final (_, gatt, serial) = await openSerial();
+    final first = serial.input.listen((_) {});
+    await Future<void>.delayed(Duration.zero);
+    await first.cancel();
+    await Future<void>.delayed(Duration.zero);
+
+    final received = <int>[];
+    serial.input.listen(received.addAll);
+    await Future<void>.delayed(Duration.zero);
+    expect(gatt.notifyEnabled[Uuid.nordicUartTx], isTrue);
+    gatt.deliver(Uuid.nordicUartTx, [9, 8]);
+    await Future<void>.delayed(Duration.zero);
+    expect(received, [9, 8]);
+  });
+
   test('write targets the RX characteristic, without response', () async {
     final (_, gatt, serial) = await openSerial();
     await serial.write(Uint8List.fromList([10, 11, 12]));

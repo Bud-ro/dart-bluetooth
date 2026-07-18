@@ -90,6 +90,10 @@ class AppleBleCentral extends BleCentralPlatform {
           controller.addError(
             const BleScanException('a scan is already in progress'),
           );
+          // A scan that never started produces no results and no done on its
+          // own — close so error-tolerant listeners see a terminal event, not
+          // a hang.
+          unawaited(controller.close());
           return;
         }
         _scanController = controller;
@@ -459,9 +463,11 @@ class AppleGattConnection implements GattConnection {
         },
         onCancel: () {
           _setNotify(service, characteristic, enable: false);
-          // Drop the (now listener-less) controller so a later subscribe starts
-          // a fresh one; teardown closes any that remain.
+          // Drop AND close the (now listener-less) controller so a later
+          // subscribe starts a fresh one and a re-listen on the old stream gets
+          // a terminal done instead of silently-lost events.
           _notifyControllers.remove(key);
+          unawaited(c.close());
         },
       );
       return c;

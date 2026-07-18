@@ -104,6 +104,10 @@ class AndroidBleCentral extends BleCentralPlatform {
           controller.addError(
             const BleScanException('a scan is already in progress'),
           );
+          // A scan that never started produces no results and no done on its
+          // own — close so error-tolerant listeners see a terminal event, not
+          // a hang.
+          unawaited(controller.close());
           return;
         }
         _scanController = controller;
@@ -115,6 +119,8 @@ class AndroidBleCentral extends BleCentralPlatform {
         try {
           if (_lib.startScan(token, ptr.cast()) != 0) {
             controller.addError(const BleScanException('startScan failed'));
+            _scanController = null;
+            unawaited(controller.close());
           } else {
             logScan.fine('scan started');
           }
@@ -468,12 +474,29 @@ class AndroidGattConnection implements GattConnection {
       late StreamController<Uint8List> c;
       c = StreamController<Uint8List>.broadcast(
         onListen: () {
-          _setNotify(service, characteristic, enable: true);
+          // Surface a failed enable on the stream — subscribers otherwise wait
+          // forever on notifications that were never switched on.
+          unawaited(
+            _setNotify(service, characteristic, enable: true).catchError((
+              Object e,
+            ) {
+              if (!c.isClosed) c.addError(e);
+            }),
+          );
           logGatt.fine(() => 'subscribe ${characteristic.value} conn $_token');
         },
         onCancel: () {
-          _setNotify(service, characteristic, enable: false);
+          // Disable is best-effort — the link may already be gone.
+          unawaited(
+            _setNotify(service, characteristic, enable: false).catchError(
+              (Object e) => logGatt.fine(() => 'notify disable failed: $e'),
+            ),
+          );
+          // Drop AND close the (now listener-less) controller so a later
+          // subscribe starts a fresh one and a re-listen on the old stream gets
+          // a terminal done instead of silently-lost events.
           _notifyControllers.remove(key);
+          unawaited(c.close());
         },
       );
       return c;
@@ -481,22 +504,39 @@ class AndroidGattConnection implements GattConnection {
     return controller.stream;
   }
 
-  void _setNotify(Uuid service, Uuid characteristic, {required bool enable}) {
-    // Route the CCCD write through the op chain: Android allows only one
-    // outstanding GATT op, so issuing it directly could collide with an
-    // in-flight read/write/discover and silently never start notifications.
-    unawaited(
-      _enqueue(() async {
+  Future<void> _setNotify(
+    Uuid service,
+    Uuid characteristic, {
+    required bool enable,
+  }) {
+    // Route the CCCD write through the op chain AND await its completion
+    // (onDescriptorWrite -> nativeOnOp): Android allows only one outstanding
+    // GATT op, so the next chained op must not be issued while the descriptor
+    // write is still in flight — it would fail with device-busy.
+    return _enqueue(() async {
+      final r = await _runOp((reqId) {
         final sPtr = service.value.toNativeUtf8();
         final cPtr = characteristic.value.toNativeUtf8();
         try {
-          _lib.subscribe(_token, sPtr.cast(), cPtr.cast(), enable ? 1 : 0);
+          _lib.subscribe(
+            reqId,
+            _token,
+            sPtr.cast(),
+            cPtr.cast(),
+            enable ? 1 : 0,
+          );
         } finally {
           calloc.free(sPtr);
           calloc.free(cPtr);
         }
-      }),
-    );
+      });
+      if (r.status != 0) {
+        throw BleGattException(
+          '${enable ? 'enable' : 'disable'} notify failed',
+          code: r.status,
+        );
+      }
+    });
   }
 
   @override

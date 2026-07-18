@@ -362,16 +362,18 @@ BLE_EXPORT void ble_and_write(int64_t req_id, int64_t conn_token,
   if (arr) (*env)->DeleteLocalRef(env, arr);
 }
 
-BLE_EXPORT void ble_and_subscribe(int64_t conn_token, const char *service,
+BLE_EXPORT void ble_and_subscribe(int64_t req_id, int64_t conn_token,
+                                  const char *service,
                                   const char *characteristic, int32_t enable) {
   JNIEnv *env = get_env();
   if (!env) return;
   jmethodID m = static_method(
-      env, "subscribe", "(JLjava/lang/String;Ljava/lang/String;Z)V");
+      env, "subscribe", "(JJLjava/lang/String;Ljava/lang/String;Z)V");
   if (!m) return;
   jstring jsvc = (*env)->NewStringUTF(env, service);
   jstring jchr = (*env)->NewStringUTF(env, characteristic);
-  (*env)->CallStaticVoidMethod(env, g_class, m, (jlong)conn_token, jsvc, jchr,
+  (*env)->CallStaticVoidMethod(env, g_class, m, (jlong)req_id,
+                               (jlong)conn_token, jsvc, jchr,
                                (jboolean)(enable ? JNI_TRUE : JNI_FALSE));
   clear_pending(env);
   (*env)->DeleteLocalRef(env, jsvc);

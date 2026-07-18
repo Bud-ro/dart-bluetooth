@@ -53,6 +53,7 @@ object BluetoothLeAndroid {
         @Volatile var readReq: Long = 0
         @Volatile var writeReq: Long = 0
         @Volatile var mtuReq: Long = 0
+        @Volatile var subscribeReq: Long = 0
     }
 
     @JvmStatic
@@ -259,27 +260,52 @@ object BluetoothLeAndroid {
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
     @JvmStatic
-    fun subscribe(connToken: Long, service: String, characteristic: String, enable: Boolean) {
+    fun subscribe(
+        reqId: Long,
+        connToken: Long,
+        service: String,
+        characteristic: String,
+        enable: Boolean,
+    ) {
         val conn = connections[connToken]
         val ch = findChar(conn, service, characteristic)
-        val gatt = conn?.gatt ?: return
-        if (ch == null) return
+        val gatt = conn?.gatt
+        if (conn == null || ch == null || gatt == null) {
+            nativeOnOp(reqId, GATT_FAILURE, null, null)
+            return
+        }
         try {
             gatt.setCharacteristicNotification(ch, enable)
-            val cccd: BluetoothGattDescriptor = ch.getDescriptor(CCCD) ?: return
+            val cccd: BluetoothGattDescriptor? = ch.getDescriptor(CCCD)
+            if (cccd == null) {
+                // No CCCD to write — local routing is set and nothing stays in
+                // flight, so the op is complete.
+                nativeOnOp(reqId, 0, null, null)
+                return
+            }
             val value = when {
                 !enable -> BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
                 (ch.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 ->
                     BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 else -> BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeDescriptor(cccd, value)
+            // Completed by onDescriptorWrite; Android allows only one
+            // outstanding GATT op, so Dart must not issue the next op until
+            // this CCCD write finishes.
+            conn.subscribeReq = reqId
+            val ok: Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(cccd, value) == BluetoothGatt.GATT_SUCCESS
             } else {
                 cccd.value = value
                 gatt.writeDescriptor(cccd)
             }
-        } catch (_: Throwable) {
+            if (!ok) {
+                conn.subscribeReq = 0
+                nativeOnOp(reqId, GATT_FAILURE, null, null)
+            }
+        } catch (t: Throwable) {
+            conn.subscribeReq = 0
+            nativeOnOp(reqId, GATT_FAILURE, null, null)
         }
     }
 
@@ -371,6 +397,17 @@ object BluetoothLeAndroid {
                         characteristic.value ?: ByteArray(0),
                     )
                 }
+            }
+
+            override fun onDescriptorWrite(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int,
+            ) {
+                val conn = connections[connToken] ?: return
+                val reqId = conn.subscribeReq
+                conn.subscribeReq = 0
+                if (reqId != 0L) nativeOnOp(reqId, status, null, null)
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {

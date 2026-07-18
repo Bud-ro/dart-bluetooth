@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.1
+
+Reliability fixes from a deep code review (no API changes).
+
+- Android: notification enable/disable (the CCCD descriptor write) now runs as
+  a tracked GATT op that completes on `onDescriptorWrite`, so the next queued
+  op no longer collides with the in-flight write and fails with device-busy
+  (the mainline "listen then write" serial flow). Requires
+  `bluetooth_le_flutter` >= 0.1.1 — the native `ble_and_subscribe` ABI gained a
+  request id. A failed enable now surfaces on the subscribe stream.
+- `BleSerial.input`: cancelling the last listener now really unsubscribes from
+  the platform (disabling notifications on the peripheral, as documented), and
+  listening again re-enables them.
+- Linux: BlueZ StartDiscovery/StopDiscovery is now reference-counted and
+  serialized across scan streams — cancelling one scan no longer kills a
+  concurrent one, a second concurrent `startScan` no longer errors with
+  `org.bluez.Error.InProgress`, and `stopScan()` closes live scan streams
+  (matching Apple/Android). Cancelling a scan during startup can no longer
+  leave the adapter discovering forever.
+- Linux: `adapterStateChanges()` and `GattConnection.subscribe()` streams can
+  be re-listened after all listeners cancelled (previously a one-way latch left
+  them permanently silent).
+- Apple/Android: a scan stream that fails to start now closes after the error,
+  and notify controllers are closed (not just dropped) when their last listener
+  cancels, so error-tolerant consumers and stale stream references see a
+  terminal event instead of hanging.
+
 ## 0.1.0
 
 Initial release.

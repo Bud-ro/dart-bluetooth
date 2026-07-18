@@ -48,16 +48,38 @@ class BleSerial {
   /// raise it with [negotiateMtu].
   int chunkSize;
 
-  Stream<Uint8List>? _input;
+  StreamController<Uint8List>? _inputCtrl;
+  StreamSubscription<Uint8List>? _inputSub;
   Future<void> _chain = Future<void>.value();
   bool _closed = false;
 
   /// Bytes received from the peripheral (broadcast). Listening enables
   /// notifications on [notifyCharacteristic]; cancelling all listeners disables
-  /// them.
-  Stream<Uint8List> get input => _input ??= _conn
-      .subscribe(service, notifyCharacteristic)
-      .asBroadcastStream();
+  /// them, and listening again re-enables them.
+  Stream<Uint8List> get input {
+    // An explicit forwarding controller (not asBroadcastStream, whose default
+    // onCancel keeps the source subscription — and therefore notifications —
+    // alive forever): the platform subscription is held only while there is at
+    // least one listener, so last-listener cancel really disables notifications
+    // and a fresh first listener re-enables them.
+    final existing = _inputCtrl;
+    if (existing != null) return existing.stream;
+    late StreamController<Uint8List> ctrl;
+    ctrl = StreamController<Uint8List>.broadcast(
+      onListen: () {
+        _inputSub = _conn
+            .subscribe(service, notifyCharacteristic)
+            .listen(ctrl.add, onError: ctrl.addError, onDone: ctrl.close);
+      },
+      onCancel: () async {
+        final sub = _inputSub;
+        _inputSub = null;
+        await sub?.cancel();
+      },
+    );
+    _inputCtrl = ctrl;
+    return ctrl.stream;
+  }
 
   /// Updates [chunkSize] from the connection's usable ATT MTU (header is 3
   /// bytes) and returns that MTU. Most platforms negotiate the MTU automatically

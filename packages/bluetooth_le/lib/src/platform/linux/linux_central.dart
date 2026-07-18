@@ -79,11 +79,16 @@ class LinuxBleCentral extends BleCentralPlatform {
   Stream<BluetoothAdapterState> adapterStateChanges() {
     late StreamController<BluetoothAdapterState> controller;
     StreamSubscription<DBusPropertiesChangedSignal>? sub;
-    var cancelled = false;
+    // Bumped on every listen AND cancel, so an in-flight onListen can detect it
+    // was superseded mid-await (and not wire up a dead subscription) without a
+    // one-way `cancelled` latch that would leave a re-listened stream (broadcast
+    // onListen re-fires on 0 -> 1) permanently silent.
+    var epoch = 0;
     controller = StreamController<BluetoothAdapterState>.broadcast(
       onListen: () async {
+        final myEpoch = ++epoch;
         final initial = await adapterState();
-        if (cancelled) return;
+        if (epoch != myEpoch) return;
         controller.add(initial);
         final created = _obj(_adapterPath).propertiesChanged.listen((
           sig,
@@ -93,15 +98,16 @@ class LinuxBleCentral extends BleCentralPlatform {
             controller.add(await adapterState());
           }
         });
-        if (cancelled) {
+        if (epoch != myEpoch) {
           await created.cancel();
         } else {
           sub = created;
         }
       },
       onCancel: () async {
-        cancelled = true;
+        epoch++;
         await sub?.cancel();
+        sub = null;
       },
     );
     return controller.stream;
@@ -119,6 +125,27 @@ class LinuxBleCentral extends BleCentralPlatform {
   }
 
   // --- Scanning ------------------------------------------------------------
+
+  /// Live scan streams, so [stopScan] can close them (matching the
+  /// Apple/Android backends) and so BlueZ StartDiscovery/StopDiscovery can be
+  /// reference-counted: discovery is scoped to the D-Bus client, and this
+  /// backend shares ONE client, so a stream tearing down must only ask BlueZ to
+  /// stop when it is the last local scan — otherwise cancelling one scan stream
+  /// would kill a concurrent one's inquiry.
+  final Set<StreamController<BleScanResult>> _scanControllers = {};
+  int _scanRefs = 0;
+
+  /// Serializes StartDiscovery/StopDiscovery calls so a stop issued by a
+  /// just-cancelled stream can't land after — and silently kill — the
+  /// StartDiscovery of a stream that began a moment later.
+  Future<void> _scanOps = Future<void>.value();
+
+  Future<void> _enqueueScanOp(Future<void> Function() op) {
+    final result = _scanOps.then((_) => op());
+    // Keep the chain alive past failures; the caller sees the error.
+    _scanOps = result.then((_) {}, onError: (_) {});
+    return result;
+  }
 
   @override
   Stream<BleScanResult> startScan({List<Uuid>? withServices}) {
@@ -169,37 +196,73 @@ class LinuxBleCentral extends BleCentralPlatform {
             }
           });
 
-      // Restrict to LE and (optionally) the requested services so we don't
-      // surface Classic-only devices on a dual-mode adapter.
-      final filter = <String, DBusValue>{'Transport': const DBusString('le')};
-      if (withServices != null && withServices.isNotEmpty) {
-        filter['UUIDs'] = DBusArray.string(
-          withServices.map((u) => u.value).toList(),
-        );
-      }
-      await _obj(_adapterPath)
-          .callMethod(_adapterIface, 'SetDiscoveryFilter', [
-            DBusDict.stringVariant(filter),
-          ], replySignature: DBusSignature(''))
-          .timeout(_busTimeout);
-      await _obj(
-        _adapterPath,
-      ).callMethod(_adapterIface, 'StartDiscovery', []).timeout(_busTimeout);
-      logScan.fine('scan started');
+      // Only the FIRST local scan configures and starts the BlueZ inquiry; a
+      // concurrent scan rides the one already running (with its filter — one
+      // shared client has one filter).
+      if (_scanRefs != 1) return;
+      await _enqueueScanOp(() async {
+        // Cancels that landed while this op was queued — or during the filter
+        // call below — must not let StartDiscovery run after StopDiscovery, or
+        // nothing would ever stop the adapter again. Checked against the live
+        // refcount (not a per-stream flag) so cancelling this stream doesn't
+        // starve a concurrent scan that is riding this StartDiscovery.
+        if (_scanRefs <= 0) return;
+        // Restrict to LE and (optionally) the requested services so we don't
+        // surface Classic-only devices on a dual-mode adapter.
+        final filter = <String, DBusValue>{'Transport': const DBusString('le')};
+        if (withServices != null && withServices.isNotEmpty) {
+          filter['UUIDs'] = DBusArray.string(
+            withServices.map((u) => u.value).toList(),
+          );
+        }
+        await _obj(_adapterPath)
+            .callMethod(_adapterIface, 'SetDiscoveryFilter', [
+              DBusDict.stringVariant(filter),
+            ], replySignature: DBusSignature(''))
+            .timeout(_busTimeout);
+        if (_scanRefs <= 0) return;
+        try {
+          await _obj(_adapterPath)
+              .callMethod(_adapterIface, 'StartDiscovery', [])
+              .timeout(_busTimeout);
+        } on DBusMethodResponseException catch (e) {
+          // A discovery already running on this client (a race with a stop
+          // still in flight) reports InProgress — the radio is already doing
+          // what we want, so that's success, not an error.
+          if (e.errorName != 'org.bluez.Error.InProgress') rethrow;
+        }
+        logScan.fine('scan started');
+      });
     }
 
     controller = StreamController<BleScanResult>.broadcast(
       onListen: () {
+        // Broadcast onListen re-fires on 0 -> 1, so a re-listen after a full
+        // cancel re-runs begin() and re-arms the stream.
+        _scanControllers.add(controller);
+        _scanRefs++;
         begin().catchError((Object e) {
           controller.addError(
             BleScanException('StartDiscovery failed', cause: e),
           );
+          // A scan that failed to start will never produce results or complete
+          // on its own — close it so listeners see a terminal event, not a
+          // hung stream.
+          if (!controller.isClosed) unawaited(controller.close());
         });
       },
       onCancel: () async {
+        _scanControllers.remove(controller);
+        _scanRefs--;
         await addedSub?.cancel();
         await changedSub?.cancel();
-        await stopScan();
+        addedSub = null;
+        changedSub = null;
+        // Only the LAST local scan stops the radio inquiry.
+        if (_scanRefs <= 0) {
+          _scanRefs = 0;
+          await _enqueueScanOp(_stopBluezDiscovery);
+        }
       },
     );
     return controller.stream;
@@ -207,6 +270,24 @@ class LinuxBleCentral extends BleCentralPlatform {
 
   @override
   Future<void> stopScan() async {
+    // Close live scan streams (mirrors Apple/Android, whose stopScan closes
+    // the active scan controller) so their listeners get a terminal done
+    // instead of a silently-dead stream; each close drains the refcount via
+    // its onCancel, and the last one stops the BlueZ inquiry.
+    for (final c in _scanControllers.toList()) {
+      if (!c.isClosed) unawaited(c.close());
+    }
+    // Backstop for an inquiry with no live stream to drain (e.g. one left
+    // running by an external orchestration quirk). Checked at execution time —
+    // after the queued closes above — so a scan started right after stopScan()
+    // (whose refcount is live again) is never starved of its inquiry.
+    await _enqueueScanOp(() async {
+      if (_scanRefs > 0) return;
+      await _stopBluezDiscovery();
+    });
+  }
+
+  Future<void> _stopBluezDiscovery() async {
     try {
       await _obj(
         _adapterPath,
@@ -590,13 +671,17 @@ class LinuxGattConnection implements GattConnection {
   Stream<Uint8List> subscribe(Uuid service, Uuid characteristic) {
     late StreamController<Uint8List> controller;
     StreamSubscription<DBusPropertiesChangedSignal>? sub;
-    var cancelled = false;
+    // Bumped on every listen AND cancel (see adapterStateChanges): guards the
+    // in-flight onListen against a cancel mid-await without latching a
+    // re-listened stream (broadcast onListen re-fires on 0 -> 1) dead.
+    var epoch = 0;
     controller = StreamController<Uint8List>.broadcast(
       onListen: () async {
+        final myEpoch = ++epoch;
         _notifyCtrls.add(controller);
         try {
           final path = await _charPath(service, characteristic);
-          if (cancelled) return;
+          if (epoch != myEpoch) return;
           sub = _obj(path).propertiesChanged.listen((sig) {
             if (sig.propertiesInterface != _charIface) return;
             final value = sig.changedProperties['Value'];
@@ -623,10 +708,11 @@ class LinuxGattConnection implements GattConnection {
         }
       },
       onCancel: () async {
-        cancelled = true;
+        epoch++;
         if (sub != null) {
           _notifySubs.remove(sub);
           await sub!.cancel();
+          sub = null;
         }
         _notifyCtrls.remove(controller);
         try {
