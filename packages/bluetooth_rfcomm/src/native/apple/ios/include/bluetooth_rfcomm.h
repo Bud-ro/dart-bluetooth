@@ -33,7 +33,8 @@ char *btc_ea_accessories_json(void);
 int64_t btc_ea_open(int64_t token, const char *accessory_id,
                     const char *protocol, btc_data_cb data, btc_state_cb state);
 
-// Queues bytes for transmission. Returns 0 on success.
+// Queues bytes for transmission. Returns 0 on success, -1 on failure (unknown
+// handle, or the buffered backlog cap — 1 MiB — would be exceeded).
 int32_t btc_ea_write(int64_t handle, const uint8_t *data, int32_t len);
 
 // Closes the session. Returns 0 on success.

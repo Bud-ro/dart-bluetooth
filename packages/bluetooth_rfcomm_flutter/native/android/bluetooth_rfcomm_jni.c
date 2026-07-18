@@ -30,6 +30,7 @@ typedef void (*btc_state_cb)(int64_t token, int32_t state);
 
 static JavaVM *g_vm = NULL;
 static jclass g_class = NULL; // global ref to BluetoothRfcommAndroid
+static int g_natives_registered = 0;
 
 static btc_found_cb g_found = NULL;
 static btc_inquiry_done_cb g_done = NULL;
@@ -37,6 +38,10 @@ static btc_data_cb g_data = NULL;
 static btc_state_cb g_state = NULL;
 
 static const char *kClassName = "lol/carson/bluetooth_rfcomm/BluetoothRfcommAndroid";
+// Dotted form for ClassLoader.loadClass (which takes binary names, not the
+// slash-separated JNI descriptors FindClass takes).
+static const char *kClassNameDotted =
+    "lol.carson.bluetooth_rfcomm.BluetoothRfcommAndroid";
 
 // Marshals a Java String to a malloc'd, NUL-terminated *standard* UTF-8 buffer
 // (caller frees). GetStringUTFChars returns JNI modified UTF-8 — astral chars
@@ -49,6 +54,21 @@ static char *jstring_to_utf8(JNIEnv *env, jstring s);
 
 jint JNI_OnLoad(JavaVM *vm, void *reserved) {
   g_vm = vm;
+  // If the library was loaded via System.loadLibrary (rather than Dart's
+  // dlopen), this thread has managed frames from the app classloader, so a
+  // plain FindClass resolves the Kotlin class. Cache it now — btc_and_init on
+  // a natively-attached Dart thread could otherwise only see the boot
+  // classloader (see find_app_class).
+  JNIEnv *env = NULL;
+  if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) == JNI_OK && env) {
+    jclass local = (*env)->FindClass(env, kClassName);
+    if (local) {
+      g_class = (jclass)(*env)->NewGlobalRef(env, local);
+      (*env)->DeleteLocalRef(env, local);
+    } else if ((*env)->ExceptionCheck(env)) {
+      (*env)->ExceptionClear(env);
+    }
+  }
   return JNI_VERSION_1_6;
 }
 
@@ -100,6 +120,13 @@ static JNIEnv *get_env(void) {
 }
 
 // --- callbacks invoked from Kotlin (RegisterNatives targets) -----------------
+//
+// These run on JVM-attached Kotlin threads (BroadcastReceiver, read loop), so
+// no AttachCurrentThread is involved. Local-ref hygiene: the jstring/jbyteArray
+// arguments are JVM-managed local refs, freed automatically when each native
+// call returns to Java — even when Kotlin fires these in a loop (one native
+// invocation per event) — so no explicit DeleteLocalRef is needed here.
+// jstring_to_utf8 deletes every local it creates itself.
 
 static void nOnFound(JNIEnv *env, jclass clazz, jlong token, jstring json) {
   if (!g_found || !json) return;
@@ -148,6 +175,77 @@ static jmethodID static_method(JNIEnv *env, const char *name, const char *sig) {
 // so a stray pending exception can never abort the VM on the next JNI call.
 static void clear_pending(JNIEnv *env) {
   if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
+
+// Resolves the Kotlin class, returning a LOCAL ref (caller makes it global).
+//
+// FindClass on a natively-attached thread with no managed frames (the Dart
+// mutator that dlopen'd us) resolves against the system/boot classloader on
+// ART, which cannot see app-APK classes — so when it fails we go through the
+// application classloader instead: ActivityThread.currentApplication() (a
+// framework class, always findable) -> getClassLoader() -> loadClass(name).
+static jclass find_app_class(JNIEnv *env) {
+  jclass local = (*env)->FindClass(env, kClassName);
+  if (local) return local;
+  clear_pending(env);
+
+  jclass activityThread = (*env)->FindClass(env, "android/app/ActivityThread");
+  if (!activityThread) {
+    clear_pending(env);
+    return NULL;
+  }
+  jmethodID currentApplication = (*env)->GetStaticMethodID(
+      env, activityThread, "currentApplication", "()Landroid/app/Application;");
+  if (!currentApplication) {
+    clear_pending(env);
+    (*env)->DeleteLocalRef(env, activityThread);
+    return NULL;
+  }
+  jobject app =
+      (*env)->CallStaticObjectMethod(env, activityThread, currentApplication);
+  (*env)->DeleteLocalRef(env, activityThread);
+  clear_pending(env);
+  if (!app) return NULL;
+
+  jclass appCls = (*env)->GetObjectClass(env, app);
+  jmethodID getClassLoader = (*env)->GetMethodID(
+      env, appCls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+  (*env)->DeleteLocalRef(env, appCls);
+  if (!getClassLoader) {
+    clear_pending(env);
+    (*env)->DeleteLocalRef(env, app);
+    return NULL;
+  }
+  jobject loader = (*env)->CallObjectMethod(env, app, getClassLoader);
+  (*env)->DeleteLocalRef(env, app);
+  clear_pending(env);
+  if (!loader) return NULL;
+
+  jclass loaderCls = (*env)->GetObjectClass(env, loader);
+  jmethodID loadClass = (*env)->GetMethodID(
+      env, loaderCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+  (*env)->DeleteLocalRef(env, loaderCls);
+  if (!loadClass) {
+    clear_pending(env);
+    (*env)->DeleteLocalRef(env, loader);
+    return NULL;
+  }
+  jstring name = (*env)->NewStringUTF(env, kClassNameDotted);
+  if (!name) {
+    clear_pending(env);
+    (*env)->DeleteLocalRef(env, loader);
+    return NULL;
+  }
+  jclass result =
+      (jclass)(*env)->CallObjectMethod(env, loader, loadClass, name);
+  (*env)->DeleteLocalRef(env, name);
+  (*env)->DeleteLocalRef(env, loader);
+  if ((*env)->ExceptionCheck(env)) {
+    (*env)->ExceptionClear(env);
+    if (result) (*env)->DeleteLocalRef(env, result);
+    return NULL;
+  }
+  return result;
 }
 
 static char *jstring_to_utf8(JNIEnv *env, jstring s) {
@@ -208,14 +306,14 @@ BTC_EXPORT int32_t btc_and_init(void) {
   JNIEnv *env = get_env();
   if (!env) return 1; // unavailable
   if (!g_class) {
-    jclass local = (*env)->FindClass(env, kClassName);
-    if (!local) {
-      (*env)->ExceptionClear(env);
-      return 1;
-    }
+    jclass local = find_app_class(env);
+    if (!local) return 1;
     g_class = (jclass)(*env)->NewGlobalRef(env, local);
     (*env)->DeleteLocalRef(env, local);
-
+  }
+  // Registered separately from class caching: g_class may already have been
+  // cached by JNI_OnLoad (System.loadLibrary path) with no natives bound yet.
+  if (!g_natives_registered) {
     static const JNINativeMethod methods[] = {
         {"nativeOnFound", "(JLjava/lang/String;)V", (void *)nOnFound},
         {"nativeOnInquiryDone", "(JI)V", (void *)nOnInquiryDone},
@@ -226,6 +324,7 @@ BTC_EXPORT int32_t btc_and_init(void) {
       (*env)->ExceptionClear(env);
       return 1;
     }
+    g_natives_registered = 1;
   }
   jmethodID m = static_method(env, "initialize", "()I");
   if (!m) return 1;
@@ -309,6 +408,17 @@ BTC_EXPORT int32_t btc_and_write(int64_t handle, const uint8_t *data, int32_t le
   clear_pending(env);
   (*env)->DeleteLocalRef(env, arr);
   return (int32_t)rc;
+}
+
+BTC_EXPORT int32_t btc_and_flush(int64_t handle) {
+  JNIEnv *env = get_env();
+  if (!env) return -1;
+  jmethodID m = static_method(env, "flush", "(J)I");
+  if (!m) return -1;
+  int32_t r =
+      (int32_t)(*env)->CallStaticIntMethod(env, g_class, m, (jlong)handle);
+  clear_pending(env);
+  return r;
 }
 
 BTC_EXPORT int32_t btc_and_close(int64_t handle) {

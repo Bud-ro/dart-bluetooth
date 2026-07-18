@@ -117,6 +117,7 @@ static NSDictionary *btc_device_dict(IOBluetoothDevice *d) {
     @"name" : ([d name] ?: [NSNull null]),
     @"classOfDevice" : @([d classOfDevice]),
     @"connected" : @([d isConnected]),
+    @"paired" : @([d isPaired]),
   };
 }
 
@@ -138,11 +139,38 @@ static char *btc_json(id obj) {
 @property(nonatomic) btc_found_cb found;
 @property(nonatomic) btc_inquiry_done_cb done;
 @property(nonatomic, strong) IOBluetoothDeviceInquiry *inquiry;
+- (void)inquiryFinished:(BOOL)aborted;
 @end
 
+static BTCInquiry *g_inquiry = nil;
+
 @implementation BTCInquiry
+// Single funnel for "this inquiry is over": releases the global slot (so a
+// later start doesn't re-signal a stale token) and fires the done callback.
+// Runs on the worker thread only.
+- (void)inquiryFinished:(BOOL)aborted {
+  if (g_inquiry == self) g_inquiry = nil;
+  if (self.done) self.done(self.token, aborted ? 1 : 0);
+  // IOBluetoothDeviceInquiry retains its delegate, so self <-> self.inquiry is
+  // a retain cycle once g_inquiry lets go. Break it on the next worker-loop
+  // pass so the framework callback that got us here has fully unwound first.
+  [[BTCWorker shared] runAsync:^{
+    [self.inquiry setDelegate:nil];
+    self.inquiry = nil;
+  }];
+}
 - (void)deviceInquiryDeviceFound:(IOBluetoothDeviceInquiry *)sender
                           device:(IOBluetoothDevice *)device {
+  if (self.found) {
+    char *json = btc_json(btc_device_dict(device));
+    if (json) self.found(self.token, json);
+  }
+}
+- (void)deviceInquiryDeviceNameUpdated:(IOBluetoothDeviceInquiry *)sender
+                                device:(IOBluetoothDevice *)device
+                      devicesRemaining:(uint32_t)devicesRemaining {
+  // Names often resolve only during the inquiry's name-update phase; re-forward
+  // the sighting so the Dart side refreshes the (previously nameless) entry.
   if (self.found) {
     char *json = btc_json(btc_device_dict(device));
     if (json) self.found(self.token, json);
@@ -151,11 +179,40 @@ static char *btc_json(id obj) {
 - (void)deviceInquiryComplete:(IOBluetoothDeviceInquiry *)sender
                         error:(IOReturn)error
                       aborted:(BOOL)aborted {
-  if (self.done) self.done(self.token, aborted ? 1 : 0);
+  [self inquiryFinished:aborted];
 }
 @end
 
-static BTCInquiry *g_inquiry = nil;
+// Stops and releases the active inquiry, ALWAYS firing its done callback:
+// [IOBluetoothDeviceInquiry stop] does not deliver deviceInquiryComplete, so
+// without this a discovery stream whose inquiry was stopped (or replaced by a
+// newer one) never closes on the Dart side — callers then hang until their own
+// timeout and see no devices. Runs on the worker thread only.
+static void btc_finish_inquiry(BOOL aborted) {
+  BTCInquiry *old = g_inquiry;
+  if (!old) return;
+  [old.inquiry stop];
+  [old inquiryFinished:aborted];
+}
+
+#pragma mark - SDP query target
+
+@interface BTCSDPQuery : NSObject
+@property(nonatomic) BOOL complete;
+@end
+
+// Outstanding performSDPQuery: target. Non-nil while a query is in flight; it
+// doubles as a re-entrancy guard for the nested run-loop pump in
+// btc_sdp_channel and keeps the target alive past the pump deadline so a late
+// sdpQueryComplete does not message a deallocated object. Worker thread only.
+static BTCSDPQuery *g_sdp_query = nil;
+
+@implementation BTCSDPQuery
+- (void)sdpQueryComplete:(IOBluetoothDevice *)device status:(IOReturn)status {
+  self.complete = YES;
+  if (g_sdp_query == self) g_sdp_query = nil;
+}
+@end
 
 #pragma mark - RFCOMM channel delegate
 
@@ -165,11 +222,72 @@ static BTCInquiry *g_inquiry = nil;
 @property(nonatomic) btc_data_cb data;
 @property(nonatomic) btc_state_cb state;
 @property(nonatomic, strong) IOBluetoothRFCOMMChannel *channel;
+// Outbound FIFO of MTU-sized chunks. writeAsync does NOT copy, so each chunk's
+// NSData stays queued (alive) until its rfcommChannelWriteComplete fires.
+@property(nonatomic, strong) NSMutableArray<NSData *> *writeQueue;
+@property(nonatomic) BOOL writeInFlight;
+- (void)enqueueWrite:(NSData *)data;
 @end
 
 static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
 
 @implementation BTCChannel
+// Splits data into MTU-sized chunks and starts draining the queue via
+// writeAsync, so the worker run loop never blocks on a stalled peer — a
+// blocking writeSync here would freeze every runSync C-ABI call behind it.
+// Ordering is preserved: one chunk in flight at a time, next sent from the
+// write-complete callback. Worker thread only.
+- (void)enqueueWrite:(NSData *)data {
+  if (!self.channel) return;
+  if (!self.writeQueue) self.writeQueue = [NSMutableArray new];
+  BluetoothRFCOMMMTU mtu = [self.channel getMTU];
+  if (mtu == 0) mtu = 0xFFFF;
+  for (NSUInteger offset = 0; offset < data.length; offset += mtu) {
+    NSUInteger chunk = data.length - offset;
+    if (chunk > mtu) chunk = mtu;
+    [self.writeQueue
+        addObject:[data subdataWithRange:NSMakeRange(offset, chunk)]];
+  }
+  [self _sendNextChunk];
+}
+- (void)_sendNextChunk {
+  if (self.writeInFlight || self.writeQueue.count == 0 || !self.channel) return;
+  NSData *chunk = self.writeQueue.firstObject; // stays queued until complete
+  self.writeInFlight = YES;
+  IOReturn rc = [self.channel writeAsync:(void *)chunk.bytes
+                                  length:(UInt16)chunk.length
+                                  refcon:NULL];
+  if (rc != kIOReturnSuccess) {
+    self.writeInFlight = NO;
+    [self _writeFailed];
+  }
+}
+// A failed write means the link is gone; surface it as a disconnect instead of
+// silently truncating the byte stream, and tear the channel down so the open
+// IOBluetoothRFCOMMChannel is not orphaned with a dangling delegate.
+- (void)_writeFailed {
+  // Removing the g_channels entry may drop the last strong reference; keep
+  // self alive until this method (and its caller) has fully unwound.
+  BTCChannel *keepAlive = self;
+  (void)keepAlive;
+  [self.writeQueue removeAllObjects];
+  if (self.state) self.state(self.token, BTC_CONN_DISCONNECTED);
+  [self.channel closeChannel];
+  [self.channel setDelegate:nil];
+  if (self.handle != 0) [g_channels() removeObjectForKey:@(self.handle)];
+}
+- (void)rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel
+                            refcon:(void *)refcon
+                            status:(IOReturn)error {
+  self.writeInFlight = NO;
+  if (error != kIOReturnSuccess) {
+    [self _writeFailed];
+    return;
+  }
+  // Chunk delivered; its NSData may be released now. Send the next one.
+  if (self.writeQueue.count > 0) [self.writeQueue removeObjectAtIndex:0];
+  [self _sendNextChunk];
+}
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)rfcommChannel
                      data:(void *)dataPointer
                    length:(size_t)dataLength {
@@ -262,6 +380,29 @@ int32_t btc_sdp_channel(const char *address, const char *uuid) {
     IOBluetoothSDPUUID *sdpUuid = [IOBluetoothSDPUUID uuidWithBytes:bytes
                                                             length:16];
     IOBluetoothSDPServiceRecord *record = [d getServiceRecordForUUID:sdpUuid];
+    if (!record && !g_sdp_query) {
+      // getServiceRecordForUUID only consults cached SDP records; a device that
+      // was never queried has none. Run a fresh query — its completion is
+      // delivered on this run loop, and we're already on the worker thread
+      // (inside runSync), so pump the loop in bounded slices until the target
+      // fires or the deadline passes, then retry the cached lookup. g_sdp_query
+      // being non-nil skips this for any re-entrant call the pump dispatches.
+      BTCSDPQuery *q = [BTCSDPQuery new];
+      g_sdp_query = q;
+      if ([d performSDPQuery:q] == kIOReturnSuccess) {
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:12.0];
+        while (!q.complete && [deadline timeIntervalSinceNow] > 0) {
+          [[NSRunLoop currentRunLoop]
+                runMode:NSDefaultRunLoopMode
+             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+        }
+        // On timeout g_sdp_query stays set (sdpQueryComplete clears it) so a
+        // late completion still finds a live target.
+        record = [d getServiceRecordForUUID:sdpUuid];
+      } else {
+        g_sdp_query = nil; // query never started; no completion is coming
+      }
+    }
     if (!record) return;
     BluetoothRFCOMMChannelID channelID = 0;
     if ([record getRFCOMMChannelID:&channelID] == kIOReturnSuccess) {
@@ -275,10 +416,7 @@ int32_t btc_start_discovery(int64_t token, btc_found_cb found,
                             btc_inquiry_done_cb done) {
   __block int32_t result = -1;
   [[BTCWorker shared] runSync:^{
-    if (g_inquiry) {
-      [g_inquiry.inquiry stop];
-      g_inquiry = nil;
-    }
+    btc_finish_inquiry(YES);
     BTCInquiry *inq = [BTCInquiry new];
     inq.token = token;
     inq.found = found;
@@ -292,10 +430,7 @@ int32_t btc_start_discovery(int64_t token, btc_found_cb found,
 
 int32_t btc_stop_discovery(void) {
   [[BTCWorker shared] runSync:^{
-    if (g_inquiry) {
-      [g_inquiry.inquiry stop];
-      g_inquiry = nil;
-    }
+    btc_finish_inquiry(YES);
   }];
   return 0;
 }
@@ -337,33 +472,10 @@ int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
 int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len) {
   if (len <= 0) return 0;
   // Copy now; the caller's buffer may be freed before the async block runs.
-  uint8_t *copy = malloc((size_t)len);
-  if (!copy) return -1;
-  memcpy(copy, data, (size_t)len);
+  // (NSData copies here — same contract as the previous malloc'd copy.)
+  NSData *bytes = [NSData dataWithBytes:data length:(NSUInteger)len];
   [[BTCWorker shared] runAsync:^{
-    BTCChannel *ch = g_channels()[@(handle)];
-    if (ch && ch.channel) {
-      // writeSync blocks on the worker thread (never the caller) until the data
-      // is sent, so freeing afterwards is safe — unlike writeAsync, which does
-      // not copy and would otherwise transmit from freed memory. Chunk by MTU.
-      BluetoothRFCOMMMTU mtu = [ch.channel getMTU];
-      if (mtu == 0) mtu = 0xFFFF;
-      size_t offset = 0;
-      while (offset < (size_t)len) {
-        size_t chunk = (size_t)len - offset;
-        if (chunk > mtu) chunk = mtu;
-        IOReturn rc = [ch.channel writeSync:copy + offset length:(UInt16)chunk];
-        if (rc != kIOReturnSuccess) {
-          // A mid-stream write failure means the link is gone; surface it as a
-          // disconnect instead of silently truncating the byte stream.
-          if (ch.state) ch.state(ch.token, BTC_CONN_DISCONNECTED);
-          if (ch.handle != 0) [g_channels() removeObjectForKey:@(ch.handle)];
-          break;
-        }
-        offset += chunk;
-      }
-    }
-    free(copy);
+    [g_channels()[@(handle)] enqueueWrite:bytes];
   }];
   return 0;
 }

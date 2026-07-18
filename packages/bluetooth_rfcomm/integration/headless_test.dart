@@ -58,6 +58,55 @@ void main() {
   );
 
   test(
+    'background scan starts, accumulates, and stops without crashing',
+    () async {
+      final errors = <Object>[];
+      final sub = bt.scannedDevicesStream.listen(
+        (_) {},
+        // Scan failures (no adapter, permission) must arrive HERE as errors,
+        // never as unhandled async errors.
+        onError: errors.add,
+      );
+      await bt.startScan(rescanDelay: const Duration(seconds: 1));
+      expect(bt.isScanning, isTrue);
+      await Future<void>.delayed(const Duration(seconds: 4));
+      expect(bt.scannedDevices, isA<List<BluetoothDevice>>());
+      await bt.stopScan();
+      expect(bt.isScanning, isFalse);
+      bt.forgetScannedDevices();
+      expect(bt.scannedDevices, isEmpty);
+      await sub.cancel();
+      // Whether errors arrived depends on the runner's adapter; either way the
+      // process must still be alive and the API responsive — re-start/stop once.
+      await bt.startScan();
+      await bt.stopScan();
+    },
+    timeout: const Timeout(Duration(seconds: 60)),
+  );
+
+  test(
+    'the three list APIs return lists, or a BluetoothException',
+    () async {
+      try {
+        expect(
+          await bt.listScannedDevices(scanDuration: const Duration(seconds: 2)),
+          isA<List<BluetoothDevice>>(),
+        );
+        expect(await bt.listPairedDevices(), isA<List<BluetoothDevice>>());
+        expect(
+          await bt.listPairedAndScannedDevices(),
+          isA<List<BluetoothDevice>>(),
+        );
+      } on BluetoothException {
+        // Tolerated: no adapter / BlueZ absent on a headless runner. Either
+        // way any scan a list call started must not be left running.
+      }
+      expect(bt.isScanning, isFalse);
+    },
+    timeout: const Timeout(Duration(seconds: 30)),
+  );
+
+  test(
     'connect() to an absent device fails with a BluetoothException (not a crash)',
     () async {
       await expectLater(

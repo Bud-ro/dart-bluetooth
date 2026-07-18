@@ -85,6 +85,13 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
   }
 
+  /// Whether a native inquiry is currently running on our behalf. IOBluetooth
+  /// has ONE inquiry slot, so concurrent discovery streams SHARE it: only the
+  /// first stream starts the radio, later streams piggyback on its sightings,
+  /// and only the last stream cancelling stops it — one stream tearing down no
+  /// longer kills another's inquiry.
+  static bool _nativeInquiryRunning = false;
+
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() {
     final token = _nextToken++;
@@ -92,6 +99,7 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
     controller = StreamController<BluetoothDiscoveryResult>.broadcast(
       onListen: () {
         _discoveries[token] = controller;
+        if (_nativeInquiryRunning) return; // share the running inquiry
         final rc = btcStartDiscovery(
           token,
           _foundCb.nativeFunction,
@@ -102,11 +110,19 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
             const BluetoothDiscoveryException('Failed to start inquiry'),
           );
           _discoveries.remove(token);
+          // A discovery that failed to start never produces results or a done
+          // callback — close so listeners see a terminal event, not a hang.
+          unawaited(controller.close());
+          return;
         }
+        _nativeInquiryRunning = true;
       },
       onCancel: () async {
         _discoveries.remove(token);
-        btcStopDiscovery();
+        if (_discoveries.isEmpty && _nativeInquiryRunning) {
+          _nativeInquiryRunning = false;
+          btcStopDiscovery();
+        }
       },
     );
     return controller.stream;
@@ -114,7 +130,10 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> stopDiscovery() async {
-    btcStopDiscovery();
+    if (_nativeInquiryRunning) {
+      _nativeInquiryRunning = false;
+      btcStopDiscovery();
+    }
     // [inquiry stop] does not deliver deviceInquiryComplete, so close the
     // discovery streams here or they (and their controllers) leak forever.
     for (final controller in _discoveries.values.toList()) {
@@ -227,20 +246,22 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 
   static void _onFound(int token, ffi.Pointer<ffi.Char> json) {
-    final controller = _discoveries[token];
     try {
-      if (controller != null && !controller.isClosed) {
+      if (_discoveries.isNotEmpty) {
         final map =
             (jsonDecode(json.cast<Utf8>().toDartString())
                 as Map<String, dynamic>);
         final device = _deviceFromJson(map);
-        controller.add(
-          BluetoothDiscoveryResult(
-            device: device,
-            rssi: device.rssi,
-            timestamp: DateTime.now(),
-          ),
+        final result = BluetoothDiscoveryResult(
+          device: device,
+          rssi: device.rssi,
+          timestamp: DateTime.now(),
         );
+        // The single native inquiry is shared: deliver to EVERY live stream,
+        // not just the one whose token started the radio.
+        for (final controller in _discoveries.values.toList()) {
+          if (!controller.isClosed) controller.add(result);
+        }
       }
     } catch (e) {
       // Skip a malformed sighting (e.g. a device with a withheld address or a
@@ -252,10 +273,12 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 
   static void _onInquiryDone(int token, int aborted) {
-    final controller = _discoveries.remove(token);
-    if (controller != null && !controller.isClosed) {
-      unawaited(controller.close());
+    // The shared inquiry is over: every piggybacked stream completes with it.
+    _nativeInquiryRunning = false;
+    for (final controller in _discoveries.values.toList()) {
+      if (!controller.isClosed) unawaited(controller.close());
     }
+    _discoveries.clear();
   }
 
   static int _sdpChannel(String address, Uuid uuid) {
@@ -280,6 +303,11 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
     final connected = j['connected'] as bool? ?? false;
     final addr = j['address'] as String?;
     final name = j['name'] as String?;
+    // The native layer reports IOBluetoothDevice.isPaired; sightings of
+    // strangers must NOT claim to be bonded (that would poison the
+    // paired∩scanned intersections). Missing field (older native lib) defaults
+    // to unknown rather than a false claim either way.
+    final paired = j['paired'] as bool?;
     return BluetoothDevice(
       // Recent macOS can withhold the address; fall back to an opaque id.
       id: (addr != null && addr.isNotEmpty)
@@ -287,7 +315,11 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
           : DeviceId.opaque(name ?? 'macos-device'),
       name: name,
       type: BluetoothDeviceType.classic,
-      bondState: BluetoothBondState.bonded,
+      bondState: switch (paired) {
+        true => BluetoothBondState.bonded,
+        false => BluetoothBondState.none,
+        null => BluetoothBondState.unknown,
+      },
       isConnected: connected,
       deviceClass: (j['classOfDevice'] as num?)?.toInt(),
     );

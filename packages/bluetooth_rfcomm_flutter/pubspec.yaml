@@ -3,7 +3,7 @@ description: >-
   Flutter plugin that adds the Android native build for bluetooth_rfcomm
   (Bluetooth Classic RFCOMM serial). Add it to a Flutter app and use the
   bluetooth_rfcomm API.
-version: 0.1.0
+version: 0.2.0
 repository: https://github.com/Bud-ro/dart-bluetooth
 homepage: https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_rfcomm_flutter
 issue_tracker: https://github.com/Bud-ro/dart-bluetooth/issues
@@ -22,7 +22,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  bluetooth_rfcomm: ^0.1.0
+  bluetooth_rfcomm: ^0.2.0
 
 # Develop against the in-repo package; stripped on publish.
 dependency_overrides:

@@ -6,6 +6,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+import 'package:meta/meta.dart';
 
 import '../../exceptions.dart';
 import '../../logging.dart';
@@ -26,9 +27,11 @@ import 'windows_ffi.dart';
 /// socket I/O runs on worker isolates so the calling isolate never stalls.
 ///
 /// The paired-device list comes from the registry (radio-silent, instant).
-/// Active inquiry is intentionally NOT performed: a classic-Bluetooth inquiry
-/// monopolizes the radio for seconds, can't be aborted, and blocks connections —
-/// so [startDiscovery] is a paired-list shim here (see its doc).
+/// [startDiscovery] runs a real `WSALookupService` inquiry (LUP_FLUSHCACHE,
+/// ~10s) on a worker isolate, finding nearby devices whether or not they're
+/// paired; it is abortable via `WSALookupServiceEnd`. The facade keeps its
+/// BACKGROUND scan's inquiries paused while a connect is in flight; a caller's
+/// one-shot discovery is the caller's to cancel before connecting.
 class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
   WindowsBluetoothRfcomm();
 
@@ -110,38 +113,173 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
   }
 
+  /// Live inquiries: controller → lookup handle (null until the worker's
+  /// Begin completes), so [stopDiscovery] can abort and close all of them.
+  final Map<StreamController<BluetoothDiscoveryResult>, int?> _inquiries = {};
+
   @override
-  Stream<BluetoothDiscoveryResult> startDiscovery() async* {
-    // Windows intentionally performs NO active inquiry. A classic-Bluetooth
-    // inquiry holds the radio for ~1.28s per response (several seconds total),
-    // can't be aborted once started, and blocks connections for its whole
-    // duration — and for a paired-device workflow it adds nothing. So
-    // "discovery" here is a transparent shim that just lists the PAIRED devices
-    // (a radio-silent registry read); it does NOT find nearby/non-paired devices
-    // and never touches the radio. Re-introduce a real inquiry here only if
-    // non-paired discovery is actually needed (and budget for the radio cost).
-    final now = DateTime.now();
-    final sw = Stopwatch()..start();
-    final raw = _enumeratePairedFromRegistry();
-    sw.stop();
-    logDiscovery.fine(
-      () =>
-          'discovery (paired-list shim): ${raw.length} device(s) in '
-          '${sw.elapsedMilliseconds}ms, no inquiry',
-    );
-    for (final r in raw) {
-      final device = _toDevice(r);
-      yield BluetoothDiscoveryResult(
-        device: device,
-        rssi: device.rssi,
-        timestamp: now,
-      );
+  Stream<BluetoothDiscoveryResult> startDiscovery() {
+    // A REAL radio inquiry (WSALookupService with LUP_FLUSHCACHE, ~10s per
+    // run) that finds nearby devices whether or not they're paired. It holds
+    // the radio while it runs — the facade keeps it away from connects — and
+    // it IS abortable: cancelling the subscription (or stopDiscovery) calls
+    // WSALookupServiceEnd, which unblocks the worker's WSALookupServiceNext.
+    late StreamController<BluetoothDiscoveryResult> controller;
+    var cancelled = false;
+
+    void endThisLookup() {
+      final handle = _inquiries.remove(controller);
+      _endLookup(handle);
     }
+
+    controller = StreamController<BluetoothDiscoveryResult>.broadcast(
+      onListen: () {
+        // Fresh activation (broadcast onListen refires when listeners return
+        // after dropping to zero): reset the cancel latch or the new inquiry
+        // would be aborted the moment its handle arrives. The handle slot in
+        // _inquiries is likewise reset by the re-registration below.
+        cancelled = false;
+        _inquiries[controller] = null;
+        // Paired set (instant registry read) so sightings of bonded devices
+        // carry the right bond state and a name even before the inquiry's
+        // remote-name request resolves.
+        Map<int, _RawDevice> paired;
+        try {
+          paired = {for (final r in _enumeratePairedFromRegistry()) r.addr: r};
+        } catch (_) {
+          paired = const {};
+        }
+        final rp = ReceivePort();
+        rp.listen((msg) {
+          if (msg == null) {
+            // Worker's terminal null, or its onExit notification (whichever
+            // arrives first) — either way the inquiry is over.
+            rp.close();
+            _inquiries.remove(controller);
+            if (!controller.isClosed) unawaited(controller.close());
+            return;
+          }
+          if (msg is List) {
+            // Uncaught error in the worker isolate (delivered via onError).
+            // Surface it; the paired onExit null closes the stream right after.
+            logDiscovery.warning(() => 'inquiry isolate error: ${msg[0]}');
+            if (!controller.isClosed) {
+              controller.addError(
+                BluetoothDiscoveryException(
+                  'Windows inquiry failed',
+                  cause: msg[0],
+                ),
+              );
+            }
+            return;
+          }
+          final m = msg as Map;
+          if (m.containsKey('handle')) {
+            final handle = m['handle'] as int;
+            if (cancelled) {
+              // Cancel won the race with the worker's Begin: abort now.
+              _endLookup(handle);
+            } else if (_inquiries.containsKey(controller)) {
+              _inquiries[controller] = handle;
+            } else {
+              // stopDiscovery() removed us before the handle arrived.
+              _endLookup(handle);
+            }
+          } else if (m.containsKey('error')) {
+            logDiscovery.warning(() => 'inquiry failed: wsa=${m['error']}');
+            if (!controller.isClosed) {
+              controller.addError(
+                BluetoothDiscoveryException(
+                  'Windows inquiry failed',
+                  code: m['error'],
+                ),
+              );
+            }
+          } else {
+            final addr = m['addr'] as int;
+            final inquiryName = m['name'] as String?;
+            final known = paired[addr];
+            final freshName = (inquiryName != null && inquiryName.isNotEmpty)
+                ? inquiryName
+                : null;
+            // A paired sighting reuses the registry mapping (name, bond state,
+            // class) with the inquiry's fresher name layered on top.
+            final device = known != null
+                ? _toDevice(known).copyWith(name: freshName)
+                : BluetoothDevice(
+                    id: DeviceId.address(formatBthAddr(addr)),
+                    name: freshName,
+                    type: BluetoothDeviceType.classic,
+                    bondState: BluetoothBondState.none,
+                  );
+            logDiscovery.finer(() => 'inquiry sighting: ${device.id}');
+            if (!controller.isClosed) {
+              controller.add(
+                BluetoothDiscoveryResult(
+                  device: device,
+                  rssi: null,
+                  timestamp: DateTime.now(),
+                ),
+              );
+            }
+          }
+        });
+        // Never kill this isolate: it must run its cleanup path (End +
+        // WSACleanup + the final null that closes rp) or the open ReceivePort
+        // would keep the main isolate alive. Cancellation is delivered by
+        // aborting the lookup handle instead. onExit/onError guarantee the
+        // terminal null (and the error) still arrive if the worker dies on an
+        // uncaught throw before its own cleanup runs — without them rp would
+        // stay open and the facade's scan cycle would hang forever.
+        Isolate.spawn(
+          _inquiryEntry,
+          [rp.sendPort],
+          onExit: rp.sendPort,
+          onError: rp.sendPort,
+        ).then(
+          (_) {},
+          onError: (Object e) {
+            rp.close();
+            if (!controller.isClosed) {
+              controller.addError(
+                BluetoothDiscoveryException('inquiry spawn failed', cause: e),
+              );
+              unawaited(controller.close());
+            }
+          },
+        );
+      },
+      onCancel: () {
+        cancelled = true;
+        // Aborts the blocked WSALookupServiceNext; the worker then runs its
+        // cleanup path (End + WSACleanup) and sends the final null itself.
+        endThisLookup();
+      },
+    );
+    return controller.stream;
   }
 
   @override
   Future<void> stopDiscovery() async {
-    // The inquiry runs to completion on its worker isolate; nothing to cancel.
+    // Abort every in-flight inquiry and close its stream (matching the other
+    // backends). The workers notice the ended lookup and exit on their own.
+    for (final entry in _inquiries.entries.toList()) {
+      _endLookup(entry.value);
+      if (!entry.key.isClosed) unawaited(entry.key.close());
+    }
+    _inquiries.clear();
+  }
+
+  /// Aborts an in-flight inquiry: `WSALookupServiceEnd` from this isolate
+  /// unblocks the worker's `WSALookupServiceNext` — the documented
+  /// cross-thread cancel mechanism.
+  void _endLookup(int? handle) {
+    if (handle == null) return;
+    try {
+      _ws.lookupServiceEnd(handle);
+    } catch (e) {
+      logDiscovery.warning(() => 'WSALookupServiceEnd failed: $e');
+    }
   }
 
   @override
@@ -269,7 +407,9 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
         ? BluetoothBondState.bonded
         : BluetoothBondState.none,
     isConnected: r.connected,
-    deviceClass: r.classOfDevice,
+    // The registry view doesn't carry a class of device; report "unknown" the
+    // same way every other platform does (null), never a fake 0.
+    deviceClass: r.classOfDevice == 0 ? null : r.classOfDevice,
   );
 }
 
@@ -301,14 +441,12 @@ class _RawDevice {
     this.name,
     this.classOfDevice,
     this.connected,
-    this.remembered,
     this.authenticated,
   );
   final int addr;
   final String name;
   final int classOfDevice;
   final bool connected;
-  final bool remembered;
   final bool authenticated;
 }
 
@@ -391,8 +529,7 @@ List<_RawDevice> _enumeratePairedFromRegistry() {
             name ?? '',
             0, // classOfDevice unknown from this view
             false, // connected unknown; live state via the connection stream
-            true, // listed here => remembered
-            true, // and authenticated/paired
+            true, // listed here => authenticated/paired
           ),
         );
       }
@@ -559,13 +696,16 @@ int _wsaError(int err) => err == 0 ? -1 : err;
   // that the reader/writer/main isolates go on to use.
   final ws = WinsockBindings();
   ws.startup();
+  // Parse before socket(): a malformed address must throw BEFORE a SOCKET
+  // exists, or the FormatException path would leak the handle.
+  final btAddr = parseBthAddr(address);
   final sock = ws.socket(afBth, sockStream, bthprotoRfcomm);
   if (sock == invalidSocket) return (0, _wsaError(ws.wsaGetLastError()));
 
   final addr = calloc<SockaddrBth>();
   try {
     addr.ref.addressFamily = afBth;
-    addr.ref.btAddr = parseBthAddr(address);
+    addr.ref.btAddr = btAddr;
     if (channel != null && channel > 0) {
       addr.ref.port = channel;
     } else {
@@ -585,8 +725,139 @@ int _wsaError(int err) => err == 0 ? -1 : err;
   }
 }
 
+/// Runs one full Bluetooth device inquiry (`WSALookupService*` with
+/// LUP_FLUSHCACHE, ~10s) and streams sightings back as
+/// `{'addr': int, 'name': String?}` maps, then a final `null`.
+///
+/// First sends `{'handle': int}` so the main isolate can abort the inquiry with
+/// `WSALookupServiceEnd` (the documented cross-thread cancel); on Begin failure
+/// sends `{'error': int}` instead. The final `null` is sent on EVERY exit path —
+/// the main isolate's ReceivePort stays open until it arrives.
+void _inquiryEntry(List<Object?> args) {
+  final sendPort = args[0] as SendPort;
+  final ws = WinsockBindings()..startup();
+  final hLookup = calloc<ffi.IntPtr>();
+  final qs = calloc<WsaQuerySetW>();
+  int handle;
+  try {
+    qs.ref.dwSize = ffi.sizeOf<WsaQuerySetW>();
+    qs.ref.dwNameSpace = nsBth;
+    final rc = ws.lookupServiceBegin(
+      qs,
+      lupContainers | lupFlushCache,
+      hLookup,
+    );
+    if (rc != 0) {
+      sendPort.send(<String, int>{'error': _wsaError(ws.wsaGetLastError())});
+      sendPort.send(null);
+      ws.wsaCleanup();
+      return;
+    }
+    handle = hLookup.value;
+  } finally {
+    calloc.free(qs);
+    calloc.free(hLookup);
+  }
+  sendPort.send(<String, int>{'handle': handle});
+
+  var bufSize = 4096;
+  var buf = calloc<ffi.Uint8>(bufSize);
+  final size = calloc<ffi.Uint32>();
+  // Whether the main isolate already ended this lookup (cancel/stopDiscovery).
+  // If so we must NOT End it again here: lookup handle values are recycled, so
+  // a second End could kill a brand-new unrelated inquiry that reused it.
+  var endedExternally = false;
+  try {
+    while (true) {
+      size.value = bufSize;
+      final rc = ws.lookupServiceNext(
+        handle,
+        lupReturnName | lupReturnAddr,
+        size,
+        buf.cast(),
+      );
+      if (rc != 0) {
+        final err = ws.wsaGetLastError();
+        if (err == wsaEFault) {
+          // Result didn't fit; `size` now holds the required byte count.
+          final needed = size.value;
+          calloc.free(buf);
+          bufSize = needed > bufSize ? needed : bufSize * 2;
+          buf = calloc<ffi.Uint8>(bufSize);
+          continue;
+        }
+        // WSA_E_CANCELLED (blocked Next aborted by a cross-thread End) and
+        // WSA_INVALID_HANDLE (End completed before this Next) both mean the
+        // main isolate owns the End for this handle.
+        endedExternally = err == wsaECancelled || err == wsaInvalidHandle;
+        // Everything else (WSA_E_NO_MORE / WSAENOMORE / real errors) ends the
+        // scan with the handle still ours to close.
+        break;
+      }
+      final result = buf.cast<WsaQuerySetW>().ref;
+      int? addr;
+      if (result.dwNumberOfCsAddrs > 0 && result.lpcsaBuffer != ffi.nullptr) {
+        final remote = result.lpcsaBuffer.ref.remoteAddr;
+        if (remote.lpSockaddr != ffi.nullptr) {
+          addr = remote.lpSockaddr.cast<SockaddrBth>().ref.btAddr;
+        }
+      }
+      if (addr == null) continue;
+      String? name;
+      final namePtr = result.lpszServiceInstanceName;
+      if (namePtr != ffi.nullptr) {
+        name = namePtr.cast<Utf16>().toDartString();
+      }
+      sendPort.send(<String, Object?>{'addr': addr, 'name': name});
+    }
+  } catch (_) {
+    // Fall through to cleanup; the main isolate treats early null as "done".
+  } finally {
+    calloc.free(buf);
+    calloc.free(size);
+    if (!endedExternally) ws.lookupServiceEnd(handle);
+    ws.wsaCleanup();
+    sendPort.send(null);
+  }
+}
+
 const int _recvBufSize = 8192;
 const int _sendChunkFlags = 0;
+
+/// What the reader loop should do with one `recv()` return.
+enum RecvOutcome { deliver, keepReading, tolerateSpurious, disconnect }
+
+/// Pure classification of a `recv()` return — the 0.1.1 clobbered-last-error
+/// rules, extracted so they are unit-testable on any host:
+///
+///   n  > 0                     -> deliver
+///   n == 0                     -> disconnect (clean EOF; return-value based,
+///                                 immune to the last-error clobber)
+///   n  < 0 + benign wsa        -> keepReading (timeout/wouldblock/interrupted)
+///   n  < 0 + wsa == 0          -> tolerateSpurious while under [maxSpurious]
+///                                 (clobbered code, dart-lang/sdk#38832), then
+///                                 disconnect so a clobbered real reset can't
+///                                 be swallowed forever
+///   n  < 0 + any other wsa     -> disconnect
+@visibleForTesting
+RecvOutcome classifyRecv(
+  int n,
+  int wsa,
+  int spuriousCount, {
+  int maxSpurious = 20,
+}) {
+  if (n > 0) return RecvOutcome.deliver;
+  if (n == 0) return RecvOutcome.disconnect;
+  if (wsa == wsaeTimedOut || wsa == wsaeWouldBlock || wsa == wsaeIntr) {
+    return RecvOutcome.keepReading;
+  }
+  if (wsa == 0) {
+    return spuriousCount < maxSpurious
+        ? RecvOutcome.tolerateSpurious
+        : RecvOutcome.disconnect;
+  }
+  return RecvOutcome.disconnect;
+}
 
 // Diagnostic-message tags sent from the reader isolate to the main isolate.
 const String _evtExit = 'reader-exit'; // the read loop ended (n + wsa code)
@@ -640,31 +911,20 @@ void _recvEntry(List<Object?> args) {
   // and the link closes — the count bound guarantees termination regardless of
   // per-call timing.
   var spurious = 0;
-  const maxSpurious = 20;
   try {
-    while (true) {
+    var reading = true;
+    while (reading) {
       final n = ws.recv(socket, buf, _recvBufSize, 0);
-      if (n > 0) {
-        spurious = 0;
-        final bytes = Uint8List.fromList(buf.asTypedList(n));
-        sendPort.send(TransferableTypedData.fromList([bytes]));
-        continue;
-      }
-      if (n == 0) {
-        exitN = 0; // peer closed the connection (clean EOF)
-        break;
-      }
-      // n < 0 (SOCKET_ERROR). Whitelist the benign, non-fatal outcomes.
-      final err = ws.wsaGetLastError();
-      if (err == wsaeTimedOut || err == wsaeWouldBlock || err == wsaeIntr) {
-        spurious = 0; // socket is alive, just no data this window
-        continue;
-      }
-      if (err == 0) {
-        // Clobbered last-error (see note above). No evidence of a real error, so
-        // keep reading — but bounded, so a real reset whose code was clobbered to
-        // 0 still exits instead of spinning forever.
-        if (++spurious <= maxSpurious) {
+      final err = n < 0 ? ws.wsaGetLastError() : 0;
+      switch (classifyRecv(n, err, spurious)) {
+        case RecvOutcome.deliver:
+          spurious = 0;
+          final bytes = Uint8List.fromList(buf.asTypedList(n));
+          sendPort.send(TransferableTypedData.fromList([bytes]));
+        case RecvOutcome.keepReading:
+          spurious = 0; // socket is alive, just no data this window
+        case RecvOutcome.tolerateSpurious:
+          spurious++;
           sendPort.send(<String, Object>{
             'event': _evtSpurious,
             'n': n,
@@ -672,16 +932,11 @@ void _recvEntry(List<Object?> args) {
             'count': spurious,
           });
           sleep(const Duration(milliseconds: 10)); // avoid a busy-spin
-          continue;
-        }
-        exitN = n; // never cleared — treat as gone
-        exitErr = 0;
-        break;
+        case RecvOutcome.disconnect:
+          exitN = n;
+          exitErr = n < 0 ? err : 0;
+          reading = false;
       }
-      // Any other WSA code (reset, abort, socket closed by close(), …) — real EOF.
-      exitN = n;
-      exitErr = err;
-      break;
     }
   } catch (e) {
     exitErr = -2; // unexpected Dart-side error; fall through to EOF
@@ -698,6 +953,10 @@ void _recvEntry(List<Object?> args) {
   }
 }
 
+// Writer-isolate exit notification (sent before wsaCleanup so close() knows
+// the writer will never touch the socket again).
+const String _evtWriterExit = 'writer-exit';
+
 void _writeEntry(List<Object?> args) {
   final socket = args[0] as int;
   final mainPort = args[1] as SendPort;
@@ -706,8 +965,14 @@ void _writeEntry(List<Object?> args) {
   final ws = WinsockBindings()..startup();
   final rp = ReceivePort();
   mainPort.send(rp.sendPort);
+  // First FATAL send error seen; acked back on flush so flush()/write() can
+  // fail honestly instead of resolving on a dead link (Linux parity).
+  var fatalWsa = 0;
   rp.listen((msg) {
     if (msg == null) {
+      // Announce exit BEFORE cleanup: after this message the writer will never
+      // touch the socket again, so close() may safely closesocket.
+      mainPort.send(<String, Object>{'event': _evtWriterExit});
       rp.close();
       ws.wsaCleanup(); // balance this isolate's WSAStartup on shutdown
       return;
@@ -724,6 +989,9 @@ void _writeEntry(List<Object?> args) {
       final sw = Stopwatch()..start();
       final err = _sendAll(ws, socket, bytes);
       sw.stop();
+      if (err != 0 && fatalWsa == 0 && isFatalWsaSendError(err)) {
+        fatalWsa = err;
+      }
       if (err != 0 || sw.elapsedMilliseconds > 50) {
         mainPort.send(<String, int>{
           'bytes': bytes.length,
@@ -732,7 +1000,9 @@ void _writeEntry(List<Object?> args) {
         });
       }
     }
-    ack?.send(true);
+    // The flush ack carries the first fatal error (0 = all bytes handed to the
+    // OS), so a flush after a failed send reports the loss.
+    ack?.send(fatalWsa);
   });
 }
 
@@ -790,6 +1060,16 @@ class _WindowsRfcommTransport implements RfcommTransport {
   final List<List<Object?>> _pendingWrites = [];
   final Completer<void> _done = Completer<void>();
 
+  /// Completed once the respective isolate has reported it will never touch
+  /// the socket again — close() waits for BOTH before closesocket, so a
+  /// recycled SOCKET value can never be read/written by a stale isolate.
+  final Completer<void> _readerExited = Completer<void>();
+  final Completer<void> _writerExited = Completer<void>();
+
+  /// First fatal writer-side send error (writer ack / control message), so
+  /// flush() can fail honestly instead of resolving on a dead link.
+  int? _fatalSendWsa;
+
   // DIAGNOSTICS: time since the previous outbound send, to flag sends that follow
   // a long idle (the case where the link has dropped into sniff mode).
   final Stopwatch _txGap = Stopwatch()..start();
@@ -803,6 +1083,7 @@ class _WindowsRfcommTransport implements RfcommTransport {
     final rxGap = Stopwatch()..start();
     readerPort.listen((msg) {
       if (msg == null) {
+        if (!_readerExited.isCompleted) _readerExited.complete();
         _onClosedByPeer();
       } else if (msg is Map) {
         if (msg['event'] == _evtSpurious) {
@@ -832,13 +1113,21 @@ class _WindowsRfcommTransport implements RfcommTransport {
       }
     });
     // If close() wins the spawn race, kill the isolate as soon as it exists.
-    Isolate.spawn(_recvEntry, [_socket, readerPort.sendPort]).then((i) {
-      if (_closed) {
-        i.kill(priority: Isolate.beforeNextEvent);
-      } else {
-        _reader = i;
-      }
-    });
+    // A failed spawn is a dead transport, not an unhandled async error.
+    Isolate.spawn(_recvEntry, [_socket, readerPort.sendPort]).then(
+      (i) {
+        if (_closed) {
+          i.kill(priority: Isolate.beforeNextEvent);
+        } else {
+          _reader = i;
+        }
+      },
+      onError: (Object e) {
+        logConnection.warning(() => 'reader isolate spawn failed: $e');
+        if (!_readerExited.isCompleted) _readerExited.complete();
+        _onClosedByPeer();
+      },
+    );
 
     final control = ReceivePort();
     _writerControlPort = control;
@@ -850,10 +1139,23 @@ class _WindowsRfcommTransport implements RfcommTransport {
         }
         _pendingWrites.clear();
       } else if (msg is Map) {
+        if (msg['event'] == _evtWriterExit) {
+          if (!_writerExited.isCompleted) _writerExited.complete();
+          return;
+        }
         final wsa = msg['wsa'] as int;
         if (wsa != 0) {
           // A failed send is a recoverable problem -> WARNING.
           logConnection.warning(() => 'send failed: ${msg['bytes']}B wsa=$wsa');
+          // A connection-level failure code means the link is gone. Don't wait
+          // for the reader's recv() to notice (that can take the full link-
+          // supervision timeout, ~20s, when the peer just powered off) — bubble
+          // the disconnect up now. Other codes (e.g. WSAENOBUFS) may be
+          // transient, so those only log; the reader remains the backstop.
+          if (isFatalWsaSendError(wsa)) {
+            _fatalSendWsa ??= wsa;
+            _onClosedByPeer();
+          }
         } else {
           // A slow (but successful) send — link waking from sniff mode. Per-event
           // diagnostic detail -> FINER.
@@ -863,13 +1165,20 @@ class _WindowsRfcommTransport implements RfcommTransport {
         }
       }
     });
-    Isolate.spawn(_writeEntry, [_socket, control.sendPort]).then((i) {
-      if (_closed) {
-        i.kill(priority: Isolate.beforeNextEvent);
-      } else {
-        _writer = i;
-      }
-    });
+    Isolate.spawn(_writeEntry, [_socket, control.sendPort]).then(
+      (i) {
+        if (_closed) {
+          i.kill(priority: Isolate.beforeNextEvent);
+        } else {
+          _writer = i;
+        }
+      },
+      onError: (Object e) {
+        logConnection.warning(() => 'writer isolate spawn failed: $e');
+        if (!_writerExited.isCompleted) _writerExited.complete();
+        _onClosedByPeer();
+      },
+    );
 
     _state.add(ConnectionState.connected);
   }
@@ -913,11 +1222,19 @@ class _WindowsRfcommTransport implements RfcommTransport {
       _pendingWrites.add(msg);
     }
     // Race the writer's ack against close(): if the peer drops and the writer
-    // isolate is killed, the ack never arrives — don't hang forever.
+    // isolate exits, the ack never arrives — don't hang forever.
+    final Object? result;
     try {
-      await Future.any([ack.first, _done.future]);
+      result = await Future.any<Object?>([ack.first, _done.future]);
     } finally {
       ack.close();
+    }
+    // The ack carries the writer's first fatal send error (0 = every byte was
+    // handed to the OS). Failing here — instead of resolving successfully on a
+    // dead link — matches the Linux backend's flush semantics.
+    final fatal = result is int && result != 0 ? result : _fatalSendWsa;
+    if (fatal != null && fatal != 0) {
+      throw BluetoothWriteException('flush failed — link lost', code: fatal);
     }
   }
 
@@ -934,11 +1251,29 @@ class _WindowsRfcommTransport implements RfcommTransport {
     _current = ConnectionState.disconnected;
     // Release any flush() waiting on a writer ack that will never arrive.
     if (!_done.isCompleted) _done.complete();
-    // Unblock recv and break the connection. Log the closesocket result: if it
-    // fails the socket stays open and holds the device's RFCOMM channel, which is
-    // the prime suspect for "the next connect fails until the app restarts".
+    // Teardown ORDER matters: SOCKET handle values are recycled by Winsock, so
+    // closesocket must not run until the reader/writer isolates have stopped
+    // touching this handle — otherwise a stale isolate could recv/send on a
+    // brand-new connection that reused the value.
+    //  1. shutdown(SD_BOTH): queued/future sends fail (close() discards
+    //     unflushed bytes by contract) and the reader's recv returns promptly.
     try {
       _ws.shutdown(_socket, 2); // SD_BOTH
+    } catch (e) {
+      logConnection.warning(() => 'socket shutdown error: $e');
+    }
+    //  2. Tell the writer to exit; it announces _evtWriterExit when done. The
+    //     reader notices the shutdown within its SO_RCVTIMEO slice and exits.
+    _writerSend?.send(null);
+    //  3. Wait (bounded — a wedged isolate must not hang close forever).
+    await Future.any<Object?>([
+      Future.wait([_readerExited.future, _writerExited.future]),
+      Future<void>.delayed(const Duration(seconds: 2)),
+    ]);
+    //  4. Now the handle is safe to free. Log the result: a failed closesocket
+    //     keeps the device's RFCOMM channel busy — the prime suspect for "the
+    //     next connect fails until the app restarts".
+    try {
       final rc = _ws.closesocket(_socket);
       if (rc != 0) {
         logConnection.warning(
@@ -950,7 +1285,6 @@ class _WindowsRfcommTransport implements RfcommTransport {
     } catch (e) {
       logConnection.warning(() => 'socket teardown error: $e');
     }
-    _writerSend?.send(null);
     _writerControlPort?.close();
     _readerPort?.close();
     _writer?.kill(priority: Isolate.beforeNextEvent);

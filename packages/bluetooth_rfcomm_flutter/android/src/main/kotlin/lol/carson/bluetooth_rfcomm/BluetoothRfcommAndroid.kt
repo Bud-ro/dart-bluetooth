@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
@@ -28,6 +29,8 @@ import java.util.concurrent.atomic.AtomicLong
  */
 @Suppress("unused")
 object BluetoothRfcommAndroid {
+    private const val TAG = "BluetoothRfcomm"
+
     private val SPP_FALLBACK: UUID =
         UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
@@ -171,8 +174,14 @@ object BluetoothRfcommAndroid {
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun stopDiscovery(): Int {
+        // Independent try blocks: if cancelDiscovery throws (e.g. a
+        // SecurityException), the receiver must still be unregistered or it
+        // leaks for the lifetime of the process.
         try {
             adapter?.cancelDiscovery()
+        } catch (_: Throwable) {
+        }
+        try {
             discoveryReceiver?.let { context?.unregisterReceiver(it) }
         } catch (_: Throwable) {
         }
@@ -180,6 +189,13 @@ object BluetoothRfcommAndroid {
         return 0
     }
 
+    /**
+     * Returns a socket handle, or 0 on any failure. The JNI ABI has no error
+     * channel, so all failure modes (SecurityException / missing
+     * BLUETOOTH_CONNECT, hidden-API denial of createRfcommSocket, IOException
+     * from connect) collapse into 0; the throwable is logged under [TAG] so
+     * failures are diagnosable via logcat.
+     */
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun openRfcomm(token: Long, address: String, channel: Int, uuid: String): Long {
@@ -207,6 +223,7 @@ object BluetoothRfcommAndroid {
             startReadLoop(token, handle, socket)
             handle
         } catch (t: Throwable) {
+            Log.w(TAG, "openRfcomm failed for $address (channel=$channel)", t)
             0
         }
     }
@@ -253,6 +270,23 @@ object BluetoothRfcommAndroid {
             return -1 // executor already shut down (closed)
         }
         return 0
+    }
+
+    /**
+     * Drains the per-socket write queue: submits a marker task to the write
+     * executor and blocks until it runs, i.e. until every write queued before
+     * this call has been handed to the socket. Returns 0 on success, -1 if the
+     * handle is unknown/closed or the drain doesn't finish within 10 seconds.
+     */
+    @JvmStatic
+    fun flush(handle: Long): Int {
+        val exec = writeExecutors[handle] ?: return -1
+        return try {
+            exec.submit(Runnable {}).get(10, java.util.concurrent.TimeUnit.SECONDS)
+            0
+        } catch (t: Throwable) {
+            -1 // shut down (closed), interrupted, or timed out
+        }
     }
 
     @JvmStatic

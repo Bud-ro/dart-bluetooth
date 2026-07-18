@@ -117,4 +117,55 @@ void main() {
     await conn.finish(); // no throw, no extra flush past the closed transport
     expect(conn.isConnected, isFalse);
   });
+
+  test('disconnect flushes then closes and emits disconnected', () async {
+    final (conn, transport) = await open();
+    final states = <ConnectionState>[];
+    conn.stateChanges.listen(states.add);
+    conn.add(Uint8List.fromList([1]));
+    await conn.disconnect();
+    expect(transport.flushCount, greaterThanOrEqualTo(1));
+    expect(conn.isConnected, isFalse);
+    expect(states, [ConnectionState.disconnected]);
+  });
+
+  test(
+    'teardown after peer drop is safe and keeps state disconnected',
+    () async {
+      final (conn, transport) = await open();
+      transport.dropPeer();
+      await Future<void>.delayed(Duration.zero);
+      // None of these may throw, re-emit, or regress state to `disconnecting`.
+      await conn.disconnect();
+      expect(conn.state, ConnectionState.disconnected);
+      await conn.close();
+      expect(conn.state, ConnectionState.disconnected);
+      await conn.finish();
+      expect(conn.state, ConnectionState.disconnected);
+    },
+  );
+
+  test('every API is crash-free after the peer drops', () async {
+    final (conn, transport) = await open();
+    transport.dropPeer();
+    await Future<void>.delayed(Duration.zero);
+    // Writes fail with the documented domain exception, never anything else.
+    expect(
+      () => conn.add(Uint8List.fromList([1])),
+      throwsA(isA<BluetoothWriteException>()),
+    );
+    expect(
+      () => conn.write(Uint8List.fromList([1])),
+      throwsA(isA<BluetoothWriteException>()),
+    );
+    await conn.flush(); // no throw
+    // Streams have closed cleanly: a late listener just gets done.
+    var inputDone = false;
+    var stateDone = false;
+    conn.input.listen((_) {}, onDone: () => inputDone = true);
+    conn.stateChanges.listen((_) {}, onDone: () => stateDone = true);
+    await Future<void>.delayed(Duration.zero);
+    expect(inputDone, isTrue);
+    expect(stateDone, isTrue);
+  });
 }

@@ -15,8 +15,11 @@ import 'platform/platform_interface.dart';
 /// [add] (fire-and-forget, never blocks) or [write] (awaits the OS accepting the
 /// bytes). [input] closes cleanly when the peer disconnects.
 ///
-/// A connection is **single-use**: once it drops or you [close]/[finish] it, it
-/// can't be reopened — call [BluetoothRfcomm.connect] again for a fresh one. To
+/// A connection is **single-use**: once it drops or you [disconnect]/[close]/
+/// [finish] it, it can't be reopened — call [BluetoothRfcomm.connect] again for
+/// a fresh one. Every method is safe to call after the link has dropped: writes
+/// fail with a [BluetoothWriteException], teardown methods are idempotent
+/// no-ops, and the streams have already closed cleanly. To
 /// reconnect, re-fetch the device (the [DeviceId] may be session-scoped on iOS)
 /// and retry while [BluetoothException.isTransient] is true.
 ///
@@ -111,9 +114,11 @@ class BluetoothConnection {
     }
   }
 
-  /// Waits until all previously [add]ed bytes have been handed to the OS.
-  /// Note: on macOS, iOS and Android this is best-effort — writes are handed to
-  /// the OS synchronously at [add] time, but there is no OS-level drain ack.
+  /// Waits until all previously [add]ed bytes have been handed to the OS, and
+  /// throws [BluetoothWriteException] where the platform can tell that queued
+  /// bytes were lost to a dead link (Windows, Linux, Android). On macOS and
+  /// iOS this is best-effort: bytes are queued to the native layer and there
+  /// is no drain acknowledgement, so flush resolves immediately.
   Future<void> flush() => _transport.flush();
 
   /// Convenience: [add] then [flush].
@@ -123,7 +128,14 @@ class BluetoothConnection {
   }
 
   /// Closes immediately, discarding anything not yet flushed.
+  ///
+  /// Safe to call at any time, including after the connection has already
+  /// dropped or been closed — it then just awaits the (already-run) teardown.
   Future<void> close() async {
+    // Already torn down (peer dropped, or a previous close/finish/disconnect):
+    // don't regress state to `disconnecting`, just await the same teardown.
+    final done = _cleanupFuture;
+    if (done != null) return done;
     logConnection.fine(() => 'close ${device.id}');
     _state = ConnectionState.disconnecting;
     await _transport.close();
@@ -131,16 +143,35 @@ class BluetoothConnection {
   }
 
   /// Flushes pending writes, then closes. Prefer this for graceful shutdown.
+  ///
+  /// Safe to call at any time, including after the connection has already
+  /// dropped or been closed.
   Future<void> finish() async {
+    final done = _cleanupFuture;
+    if (done != null) return done;
     logConnection.fine(() => 'finish ${device.id}');
     _state = ConnectionState.disconnecting;
     try {
       await _transport.flush();
+    } catch (e) {
+      // The link died with bytes still queued (e.g. peer powered off in the
+      // race window before the drop was detected). The disconnect is already
+      // in motion; graceful shutdown still completes — never throw out of a
+      // teardown method. Callers that need delivery confirmation use
+      // write()/flush() directly.
+      logConnection.fine(() => 'flush during finish failed ${device.id}: $e');
     } finally {
       await _transport.close();
       await _cleanup();
     }
   }
+
+  /// Disconnects from the device: flushes pending writes, then closes the link.
+  ///
+  /// Equivalent to [finish]. Idempotent and safe to call at any time — if the
+  /// connection already dropped (e.g. the device was powered off) this simply
+  /// completes once teardown has finished.
+  Future<void> disconnect() => finish();
 
   /// Idempotent teardown — runs once whether triggered by [close]/[finish] or a
   /// peer-initiated disconnect. Emits a single terminal `disconnected`, cancels

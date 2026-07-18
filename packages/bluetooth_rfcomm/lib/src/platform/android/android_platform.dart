@@ -103,6 +103,13 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
   }
 
+  /// Whether a native inquiry is running on our behalf. The Kotlin side has a
+  /// SINGLE receiver slot, so concurrent discovery streams SHARE one inquiry:
+  /// only the first stream starts it, later streams piggyback on its
+  /// sightings, and only the last stream cancelling stops it — a second
+  /// startDiscovery no longer clobbers (and orphans) the first.
+  static bool _nativeInquiryRunning = false;
+
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() {
     _activeLib = _lib;
@@ -111,16 +118,25 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     controller = StreamController<BluetoothDiscoveryResult>.broadcast(
       onListen: () {
         _discoveries[token] = controller;
+        if (_nativeInquiryRunning) return; // share the running inquiry
         if (_lib.startDiscovery(token) != 0) {
           controller.addError(
             const BluetoothDiscoveryException('startDiscovery failed'),
           );
           _discoveries.remove(token);
+          // A discovery that failed to start never produces results or a done
+          // callback — close so listeners see a terminal event, not a hang.
+          unawaited(controller.close());
+          return;
         }
+        _nativeInquiryRunning = true;
       },
       onCancel: () async {
         _discoveries.remove(token);
-        _lib.stopDiscovery();
+        if (_discoveries.isEmpty && _nativeInquiryRunning) {
+          _nativeInquiryRunning = false;
+          _lib.stopDiscovery();
+        }
       },
     );
     return controller.stream;
@@ -128,7 +144,10 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> stopDiscovery() async {
-    _lib.stopDiscovery();
+    if (_nativeInquiryRunning) {
+      _nativeInquiryRunning = false;
+      _lib.stopDiscovery();
+    }
     // Close any discovery streams whose subscribers used stopDiscovery() rather
     // than cancelling, so the controllers don't leak. (The ACTION_DISCOVERY_-
     // FINISHED callback also closes them, but only if it actually fires.)
@@ -253,20 +272,21 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
   // --- static callback dispatch --------------------------------------------
 
   static void _onFound(int token, ffi.Pointer<ffi.Char> json) {
-    final controller = _discoveries[token];
     try {
-      if (controller != null && !controller.isClosed) {
+      if (_discoveries.isNotEmpty) {
         final map =
             jsonDecode(json.cast<Utf8>().toDartString())
                 as Map<String, dynamic>;
         final device = _deviceFromJson(map);
-        controller.add(
-          BluetoothDiscoveryResult(
-            device: device,
-            rssi: device.rssi,
-            timestamp: DateTime.now(),
-          ),
+        final result = BluetoothDiscoveryResult(
+          device: device,
+          rssi: device.rssi,
+          timestamp: DateTime.now(),
         );
+        // The single native inquiry is shared: deliver to EVERY live stream.
+        for (final controller in _discoveries.values.toList()) {
+          if (!controller.isClosed) controller.add(result);
+        }
       }
     } catch (e) {
       // Skip a malformed sighting rather than tearing down discovery.
@@ -277,10 +297,12 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 
   static void _onInquiryDone(int token, int aborted) {
-    final controller = _discoveries.remove(token);
-    if (controller != null && !controller.isClosed) {
-      unawaited(controller.close());
+    // The shared inquiry is over: every piggybacked stream completes with it.
+    _nativeInquiryRunning = false;
+    for (final controller in _discoveries.values.toList()) {
+      if (!controller.isClosed) unawaited(controller.close());
     }
+    _discoveries.clear();
   }
 
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {
@@ -333,6 +355,10 @@ int _androidOpen(int token, String address, int channel, String uuid) {
     calloc.free(uuidPtr);
   }
 }
+
+/// Blocks (up to ~10s in the Kotlin layer) until the per-socket write executor
+/// has drained. Top-level so [Isolate.run] captures only the sendable handle.
+int _androidFlush(int handle) => AndroidBindings.open().flush(handle);
 
 abstract final class _AdapterCode {
   static const int unavailable = 1;
@@ -412,7 +438,17 @@ class _AndroidTransport implements RfcommTransport {
   }
 
   @override
-  Future<void> flush() async {}
+  Future<void> flush() async {
+    if (_closed || _handle == 0) return;
+    // Drains the Kotlin per-socket write executor (a blocking marker-task
+    // wait), run on a helper isolate so the caller never blocks. -1 on a
+    // still-open handle means the executor died with writes queued.
+    final handle = _handle;
+    final rc = await Isolate.run(() => _androidFlush(handle));
+    if (rc != 0 && !_closed) {
+      throw BluetoothWriteException('flush failed — link lost', code: rc);
+    }
+  }
 
   @override
   Future<void> close() async {

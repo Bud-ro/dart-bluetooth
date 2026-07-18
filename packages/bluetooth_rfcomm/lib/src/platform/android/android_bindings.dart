@@ -68,6 +68,10 @@ class AndroidBindings {
           ffi.Int32 Function(ffi.Int64, ffi.Pointer<ffi.Uint8>, ffi.Int32),
           int Function(int, ffi.Pointer<ffi.Uint8>, int)
         >('btc_and_write');
+    flush = _lib
+        .lookupFunction<ffi.Int32 Function(ffi.Int64), int Function(int)>(
+          'btc_and_flush',
+        );
     close = _lib
         .lookupFunction<ffi.Int32 Function(ffi.Int64), int Function(int)>(
           'btc_and_close',
@@ -102,5 +106,10 @@ class AndroidBindings {
   )
   open;
   late final int Function(int, ffi.Pointer<ffi.Uint8>, int) write;
+
+  /// Blocks until every write queued before the call has been handed to the
+  /// socket (bounded at 10s natively). Returns 0 on success, -1 on
+  /// timeout/closed/unknown handle.
+  late final int Function(int) flush;
   late final int Function(int) close;
 }

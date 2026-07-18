@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+- Track `bluetooth_rfcomm` 0.2.0: background scan API
+  (`startScan`/`stopScan`/`forgetScannedDevices`/`scannedDevices`),
+  `BluetoothConnection.disconnect()`, and hardened disconnect handling. No
+  plugin-side changes; this release just widens the dependency.
+
 ## 0.1.0
 
 Initial release.

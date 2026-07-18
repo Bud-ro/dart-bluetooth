@@ -38,6 +38,11 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
   static final ffi.NativeCallable<StateCbNative> _stateCb =
       ffi.NativeCallable<StateCbNative>.listener(_onState);
 
+  // ExternalAccessory exposes NO radio-state API (that would need
+  // CoreBluetooth, which triggers the Bluetooth permission prompt just for a
+  // status read). These therefore report a FIXED optimistic `on` — unlike
+  // every other platform, they say nothing about the actual radio. Callers
+  // find out the truth from connect() failing.
   @override
   Future<bool> isSupported() async => true;
 
@@ -59,12 +64,29 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
   Future<List<BluetoothDevice>> bondedDevices() async => _accessories();
 
   @override
-  Stream<BluetoothDiscoveryResult> startDiscovery() async* {
+  Stream<BluetoothDiscoveryResult> startDiscovery() {
     // EA has no inquiry; surface the currently-connected MFi accessories.
-    final now = DateTime.now();
-    for (final d in await _accessories()) {
-      yield BluetoothDiscoveryResult(device: d, rssi: null, timestamp: now);
-    }
+    // Broadcast, matching every other backend — the facade shares one platform
+    // stream among its listeners and relies on that.
+    late StreamController<BluetoothDiscoveryResult> controller;
+    controller = StreamController<BluetoothDiscoveryResult>.broadcast(
+      onListen: () async {
+        try {
+          final now = DateTime.now();
+          for (final d in await _accessories()) {
+            if (controller.isClosed) return;
+            controller.add(
+              BluetoothDiscoveryResult(device: d, rssi: null, timestamp: now),
+            );
+          }
+        } catch (e) {
+          if (!controller.isClosed) controller.addError(e);
+        } finally {
+          if (!controller.isClosed) unawaited(controller.close());
+        }
+      },
+    );
+    return controller.stream;
   }
 
   @override

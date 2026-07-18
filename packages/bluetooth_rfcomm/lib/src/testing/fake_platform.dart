@@ -35,6 +35,15 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
   /// so tests can exercise error-surfacing paths.
   Object? discoveryError;
 
+  /// Whether a discovery stream closes after emitting [discoveryResults],
+  /// mirroring the real inquiry-completes platforms (Windows/macOS/Android).
+  /// Set false to model Linux, whose discovery streams stay open.
+  bool discoveryCompletes = true;
+
+  /// If set, [openRfcomm] waits this long before returning — lets tests
+  /// observe the facade's connect-in-flight behavior (scan pausing etc.).
+  Duration? connectDelay;
+
   /// SDP services returned by [discoverServices], keyed by device id.
   final Map<DeviceId, List<BluetoothService>> services = {};
 
@@ -109,6 +118,9 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
           controller.add(r);
         }
         if (discoveryError != null) controller.addError(discoveryError!);
+        if (discoveryCompletes && !controller.isClosed) {
+          unawaited(controller.close());
+        }
       },
       onCancel: () {
         discoveryStopped = true;
@@ -139,6 +151,8 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
     required Uuid serviceUuid,
     Duration? timeout,
   }) async {
+    final delay = connectDelay;
+    if (delay != null) await Future<void>.delayed(delay);
     final err = connectError;
     if (err != null) throw err;
     final t = FakeRfcommTransport(
@@ -185,6 +199,10 @@ class FakeRfcommTransport implements RfcommTransport {
   /// Number of times [flush] was awaited.
   int flushCount = 0;
 
+  /// If set, [flush] throws this — models a dead-link flush failure
+  /// (Windows/Linux/Android throw a BluetoothWriteException there).
+  Object? flushError;
+
   // Single-subscription, matching the RfcommTransport contract and every real
   // backend (the facade re-broadcasts via BluetoothConnection.input).
   final StreamController<Uint8List> _incoming = StreamController<Uint8List>();
@@ -228,14 +246,21 @@ class FakeRfcommTransport implements RfcommTransport {
   @override
   Future<void> flush() async {
     flushCount++;
+    final err = flushError;
+    if (err != null && !_closed) throw err;
   }
 
   @override
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
-    if (!_state.isClosed) await _state.close();
+    // Mirror every real transport: emit the terminal state before closing.
+    if (!_state.isClosed) {
+      if (!alreadyDisconnected) _state.add(ConnectionState.disconnected);
+      await _state.close();
+    }
     if (!_incoming.isClosed) await _incoming.close();
   }
 }

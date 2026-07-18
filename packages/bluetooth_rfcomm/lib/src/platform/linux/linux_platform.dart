@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:dbus/dbus.dart';
 
 import '../../exceptions.dart';
+import '../../logging.dart';
 import '../../models/bluetooth_device.dart';
 import '../../models/bluetooth_service.dart';
 import '../../models/device_id.dart';
@@ -21,11 +22,17 @@ import '../platform_interface.dart';
 /// stream is obtained by registering a `Profile1` for the SPP UUID and reading
 /// the file descriptor BlueZ hands back on `NewConnection`.
 class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
+  /// [adapter] selects the BlueZ adapter (default `hci0`); hosts whose only
+  /// adapter has another name (`hci1` after an adapter swap) must pass it —
+  /// there is no automatic enumeration. A caller-supplied [bus] is NOT closed
+  /// by [dispose]; the default client is.
   LinuxBluetoothRfcomm({DBusClient? bus, String adapter = 'hci0'})
     : _bus = bus ?? DBusClient.system(),
+      _ownsBus = bus == null,
       _adapterName = adapter;
 
   final DBusClient _bus;
+  final bool _ownsBus;
   final String _adapterName;
 
   static const String _service = 'org.bluez';
@@ -75,6 +82,9 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
     var cancelled = false;
     controller = StreamController<BluetoothAdapterState>.broadcast(
       onListen: () async {
+        // Broadcast onListen refires when listeners return after dropping to
+        // zero — reset the latch or a re-listened stream stays silent forever.
+        cancelled = false;
         final initial = await adapterState();
         if (cancelled) return; // listener went away during the await
         controller.add(initial);
@@ -94,7 +104,9 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
       },
       onCancel: () async {
         cancelled = true;
-        await sub?.cancel();
+        final s = sub;
+        sub = null;
+        await s?.cancel();
       },
     );
     return controller.stream;
@@ -102,9 +114,13 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> setAdapterEnabled(bool enabled) async {
-    await _obj(
-      _adapterPath,
-    ).setProperty(_adapterIface, 'Powered', DBusBoolean(enabled));
+    try {
+      await _obj(
+        _adapterPath,
+      ).setProperty(_adapterIface, 'Powered', DBusBoolean(enabled));
+    } catch (e) {
+      _mapDbus(e, 'setAdapterEnabled');
+    }
   }
 
   // --- Devices -------------------------------------------------------------
@@ -128,6 +144,35 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
     } catch (e) {
       _mapDbus(e, 'bondedDevices');
     }
+  }
+
+  /// Live discovery streams, so [stopDiscovery] can close them (matching the
+  /// macOS/Android backends) and so BlueZ StartDiscovery/StopDiscovery can be
+  /// reference-counted: discovery is scoped to the D-Bus client, and this
+  /// backend shares ONE client, so a stream tearing down must only ask BlueZ to
+  /// stop when it is the last local discovery — otherwise cancelling the
+  /// background scan would kill a concurrent one-shot discovery's inquiry.
+  final Set<StreamController<BluetoothDiscoveryResult>> _discoveryControllers =
+      {};
+  int _discoveryRefs = 0;
+
+  /// Whether WE have asked BlueZ to discover (and not yet asked it to stop).
+  /// Start/stop decisions are made against THIS flag *inside* the serialized
+  /// ops — never against a refcount snapshot taken at enqueue time, which goes
+  /// stale while stopDiscovery's deferred teardown drains (a new stream would
+  /// then skip StartDiscovery and be silently starved).
+  bool _bluezDiscovering = false;
+
+  /// Serializes StartDiscovery/StopDiscovery calls so a stop issued by a
+  /// just-cancelled stream can't land after — and silently kill — the
+  /// StartDiscovery of a stream that began a moment later.
+  Future<void> _discoveryOps = Future<void>.value();
+
+  Future<void> _enqueueDiscoveryOp(Future<void> Function() op) {
+    final result = _discoveryOps.then((_) => op());
+    // Keep the chain alive past failures; the caller sees the error.
+    _discoveryOps = result.then((_) {}, onError: (_) {});
+    return result;
   }
 
   @override
@@ -193,33 +238,78 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
               /* device vanished mid-update / malformed signal */
             }
           });
-      await _obj(_adapterPath).callMethod(_adapterIface, 'StartDiscovery', []);
+      // Ask BlueZ to start inquiring — the op itself checks (serialized, so
+      // against FRESH state) whether discovery is already running. A
+      // concurrent discovery on this client (race with a stop still in
+      // flight) reports InProgress — the radio is already doing what we want,
+      // so that's success, not an error.
+      await _enqueueDiscoveryOp(() async {
+        if (_bluezDiscovering) return;
+        if (_discoveryRefs <= 0) return; // everyone left while we queued
+        try {
+          await _obj(
+            _adapterPath,
+          ).callMethod(_adapterIface, 'StartDiscovery', []);
+        } on DBusMethodResponseException catch (e) {
+          if (e.errorName != 'org.bluez.Error.InProgress') rethrow;
+        }
+        _bluezDiscovering = true;
+      });
     }
 
     controller = StreamController<BluetoothDiscoveryResult>.broadcast(
       onListen: () {
+        _discoveryControllers.add(controller);
+        _discoveryRefs++;
         begin().catchError((Object e) {
           controller.addError(
             BluetoothDiscoveryException('StartDiscovery failed', cause: e),
           );
+          // A discovery that failed to start will never produce results or
+          // complete on its own — close it so listeners (and the facade's
+          // pause bookkeeping) see a terminal event, not a hung stream.
+          if (!controller.isClosed) unawaited(controller.close());
         });
       },
       onCancel: () async {
+        _discoveryControllers.remove(controller);
+        _discoveryRefs--;
+        if (_discoveryRefs < 0) _discoveryRefs = 0;
         await addedSub?.cancel();
         await changedSub?.cancel();
-        await stopDiscovery();
+        // Only the LAST local discovery stops the radio inquiry — checked
+        // inside the serialized op against fresh state, so a stream that
+        // started while this teardown was queued keeps its inquiry.
+        await _enqueueDiscoveryOp(() async {
+          if (_discoveryRefs > 0 || !_bluezDiscovering) return;
+          await _stopBluezDiscovery();
+        });
       },
     );
     return controller.stream;
   }
 
-  @override
-  Future<void> stopDiscovery() async {
+  Future<void> _stopBluezDiscovery() async {
     try {
       await _obj(_adapterPath).callMethod(_adapterIface, 'StopDiscovery', []);
     } catch (_) {
       // Not discovering — ignore.
     }
+    _bluezDiscovering = false;
+  }
+
+  @override
+  Future<void> stopDiscovery() async {
+    // Close live discovery streams (mirrors macOS/Android, whose stopDiscovery
+    // closes all discovery controllers) so their listeners get a terminal done
+    // instead of a silently-dead stream; each close drains the refcount via
+    // its onCancel.
+    for (final c in _discoveryControllers.toList()) {
+      if (!c.isClosed) unawaited(c.close());
+    }
+    // Unconditional (this is the global stop), still serialized with the
+    // per-stream ops.
+    await _enqueueDiscoveryOp(_stopBluezDiscovery);
   }
 
   @override
@@ -301,7 +391,8 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> dispose() async {
-    await _bus.close();
+    // Only close the client we created; a caller-injected bus is theirs.
+    if (_ownsBus) await _bus.close();
   }
 
   // --- Helpers -------------------------------------------------------------
@@ -329,7 +420,22 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
       );
     }
     if (e is DBusMethodResponseException) {
-      throw BluetoothException('BlueZ error during $op', cause: e);
+      throw switch (e.errorName) {
+        // Adapter powered off — the retry story is "wait for the adapter",
+        // exactly what BluetoothDisabledException documents.
+        'org.bluez.Error.NotReady' => BluetoothDisabledException(
+          'Bluetooth adapter is powered off',
+          cause: e,
+        ),
+        'org.bluez.Error.NotAuthorized' ||
+        'org.bluez.Error.AuthenticationRejected' =>
+          BluetoothPermissionException('Not authorized during $op', cause: e),
+        'org.bluez.Error.DoesNotExist' => DeviceNotFoundException(
+          'Unknown device during $op',
+          cause: e,
+        ),
+        _ => BluetoothException('BlueZ error during $op', cause: e),
+      };
     }
     throw BluetoothException('D-Bus error during $op', cause: e);
   }
@@ -421,11 +527,30 @@ class _LinuxRfcommProfile implements RfcommTransport {
   _LinuxRfcommProfile._(this._socket, this._bus, this._profile) {
     _sub = _socket.listen(
       _incoming.add,
-      onError: _incoming.addError,
+      // A hard read error (link reset when the peer powers off) may or may not
+      // be followed by onDone, so treat it as a disconnect itself. It is
+      // deliberately NOT forwarded to `incoming`: every other backend ends
+      // `incoming` with a clean EOF on peer loss, so `await for` must
+      // terminate — not throw — on Linux too. The detail goes to the log.
+      onError: (Object e, StackTrace st) {
+        logConnection.fine(() => 'read failed — treating as disconnect: $e');
+        _handleDone();
+      },
       onDone: _handleDone,
       cancelOnError: false,
     );
-    _state.add(ConnectionState.connected);
+    // Write failures (e.g. EPIPE after the peer vanished) complete socket.done
+    // with an error. Nobody would otherwise await that future, and an unhandled
+    // async error can take down the whole app — swallow it and fold it into the
+    // normal disconnect path instead.
+    unawaited(
+      _socket.done.then(
+        (_) {},
+        onError: (Object _) {
+          _handleDone();
+        },
+      ),
+    );
   }
 
   final DBusClient _bus;
@@ -498,25 +623,50 @@ class _LinuxRfcommProfile implements RfcommTransport {
     } catch (e) {
       settled = true;
       await bus.unregisterObject(profile);
-      throw BluetoothConnectionException('RegisterProfile failed', cause: e);
+      _throwConnectError(e, 'RegisterProfile');
     }
 
+    // ONE deadline covers the whole connect: ConnectProfile itself (BlueZ can
+    // block for its own page timeout, 10-40s, against an absent peer — the
+    // caller's deadline must bound that too) plus the NewConnection wait.
+    final deadline = timeout ?? _connectSafetyTimeout;
+    final sw = Stopwatch()..start();
     final device = DBusRemoteObject(bus, name: 'org.bluez', path: devicePath);
     try {
-      await device.callMethod('org.bluez.Device1', 'ConnectProfile', [
-        DBusString(serviceUuid.value),
-      ], replySignature: DBusSignature(''));
+      await device
+          .callMethod('org.bluez.Device1', 'ConnectProfile', [
+            DBusString(serviceUuid.value),
+          ], replySignature: DBusSignature(''))
+          .timeout(deadline);
+    } on TimeoutException {
+      // The fd may still have arrived while the call was in flight.
+      if (!completer.isCompleted) {
+        settled = true;
+        unawaited(_unregisterProfile(bus, profile));
+        throw BluetoothTimeoutException(
+          'RFCOMM connect timed out',
+          timeout: deadline,
+        );
+      }
     } catch (e) {
-      settled = true;
-      await _unregisterProfile(bus, profile);
-      throw BluetoothConnectionException('ConnectProfile failed', cause: e);
+      // BlueZ can also deliver NewConnection and THEN report an error from
+      // ConnectProfile; if the transport exists, the link is up — prefer it
+      // over throwing (and over leaking its adopted fd).
+      if (!completer.isCompleted) {
+        settled = true;
+        await _unregisterProfile(bus, profile);
+        _throwConnectError(e, 'ConnectProfile');
+      }
+      logConnection.fine(
+        () => 'ConnectProfile errored after NewConnection; using the link: $e',
+      );
     }
+    if (completer.isCompleted) return completer.future;
 
-    // Always bound the wait — even with no caller timeout — or a silent peer
-    // hangs the future forever and leaks the registered profile.
-    final deadline = timeout ?? _connectSafetyTimeout;
+    // Wait out the REMAINDER of the deadline for NewConnection.
+    final remaining = deadline - sw.elapsed;
     return completer.future.timeout(
-      deadline,
+      remaining > Duration.zero ? remaining : const Duration(milliseconds: 1),
       onTimeout: () {
         settled = true;
         unawaited(_unregisterProfile(bus, profile));
@@ -526,6 +676,45 @@ class _LinuxRfcommProfile implements RfcommTransport {
         );
       },
     );
+  }
+
+  /// Maps a BlueZ connect-path failure into the domain taxonomy: adapter-off,
+  /// permission and unknown-device get their specific types (so isTransient is
+  /// truthful); everything else is a transient [BluetoothConnectionException].
+  static Never _throwConnectError(Object e, String op) {
+    if (e is DBusServiceUnknownException) {
+      throw BluetoothDisabledException(
+        'BlueZ (org.bluez) is unavailable — is the bluetooth service running?',
+        cause: e,
+      );
+    }
+    if (e is DBusAccessDeniedException) {
+      throw BluetoothPermissionException(
+        'Permission denied during $op',
+        cause: e,
+      );
+    }
+    if (e is DBusUnknownObjectException) {
+      throw DeviceNotFoundException('Unknown device during $op', cause: e);
+    }
+    if (e is DBusMethodResponseException) {
+      throw switch (e.errorName) {
+        'org.bluez.Error.NotReady' => BluetoothDisabledException(
+          'Bluetooth adapter is powered off',
+          cause: e,
+        ),
+        'org.bluez.Error.NotAuthorized' => BluetoothPermissionException(
+          'Not authorized during $op',
+          cause: e,
+        ),
+        'org.bluez.Error.DoesNotExist' => DeviceNotFoundException(
+          'Unknown device during $op',
+          cause: e,
+        ),
+        _ => BluetoothConnectionException('$op failed', cause: e),
+      };
+    }
+    throw BluetoothConnectionException('$op failed', cause: e);
   }
 
   /// Unregisters both the BlueZ profile (so bluetoothd forgets it) and the
@@ -578,11 +767,26 @@ class _LinuxRfcommProfile implements RfcommTransport {
   @override
   void send(Uint8List data) {
     if (_closed) throw const BluetoothWriteException('transport closed');
-    _socket.add(data);
+    try {
+      _socket.add(data);
+    } catch (e) {
+      // e.g. StateError once the socket's sink has already errored/closed.
+      throw BluetoothWriteException('write failed', cause: e);
+    }
   }
 
   @override
-  Future<void> flush() => _socket.flush();
+  Future<void> flush() async {
+    if (_closed) return;
+    try {
+      await _socket.flush();
+    } catch (e) {
+      // The link died with bytes still queued (peer powered off mid-write).
+      // The socket.done handler tears the transport down; report the loss to
+      // the caller as a domain exception rather than a raw SocketException.
+      throw BluetoothWriteException('flush failed — link lost', cause: e);
+    }
+  }
 
   @override
   Future<void> close() async {
@@ -591,11 +795,10 @@ class _LinuxRfcommProfile implements RfcommTransport {
     final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
     await _sub.cancel();
-    try {
-      await _socket.close();
-    } catch (_) {
-      /* already gone */
-    }
+    // destroy() closes both directions immediately and never blocks — unlike
+    // close(), which waits for queued bytes to drain and can stall against a
+    // peer that just vanished. Callers wanting a drain use flush() first
+    // (BluetoothConnection.finish does).
     _socket.destroy();
     await _unregisterProfile(_bus, _profile);
     if (!_state.isClosed) {

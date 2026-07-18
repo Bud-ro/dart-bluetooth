@@ -48,11 +48,12 @@ void btc_free(void *ptr);
 int32_t btc_adapter_state(void);
 
 // Returns a malloc'd UTF-8 JSON array of paired devices, or NULL on error.
-// Each element: {"address","name","classOfDevice","connected"}.
+// Each element: {"address","name","classOfDevice","connected","paired"}.
 char *btc_paired_devices_json(void);
 
 // Resolves the RFCOMM channel for `uuid` on `address` via the device's SDP
-// records. Returns the channel (1..30) or -1 if not found.
+// records, issuing a fresh SDP query (bounded, ~12s) when none are cached.
+// Returns the channel (1..30) or -1 if not found.
 int32_t btc_sdp_channel(const char *address, const char *uuid);
 
 // Starts a device inquiry. `found` fires per sighting (device_json malloc'd);
