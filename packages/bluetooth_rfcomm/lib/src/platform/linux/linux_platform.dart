@@ -88,14 +88,18 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
         final initial = await adapterState();
         if (cancelled) return; // listener went away during the await
         controller.add(initial);
-        final created = _obj(_adapterPath).propertiesChanged.listen((
-          sig,
-        ) async {
-          if (sig.propertiesInterface == _adapterIface &&
-              sig.changedProperties.containsKey('Powered')) {
-            controller.add(await adapterState());
-          }
-        });
+        final created = _obj(_adapterPath).propertiesChanged.listen(
+          (sig) async {
+            if (sig.propertiesInterface == _adapterIface &&
+                sig.changedProperties.containsKey('Powered')) {
+              controller.add(await adapterState());
+            }
+          },
+          // A malformed signal must not become an unhandled zone error (the
+          // dbus dispatcher addErrors signature mismatches into this stream).
+          onError: (Object e) =>
+              logAdapter.warning(() => 'adapter signal error: $e'),
+        );
         if (cancelled) {
           await created.cancel(); // cancelled while we were subscribing
         } else {
@@ -193,29 +197,35 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
             object: om,
             interface: _omIface,
             name: 'InterfacesAdded',
-          ).listen((signal) {
-            try {
-              final values = signal.values;
-              if (values.length < 2) return;
-              final ifaces = (values[1] as DBusDict).children.map(
-                (k, v) => MapEntry(
-                  (k as DBusString).value,
-                  (v as DBusDict).children.map(
-                    (pk, pv) => MapEntry(
-                      (pk as DBusString).value,
-                      (pv as DBusVariant).value,
+          ).listen(
+            (signal) {
+              try {
+                final values = signal.values;
+                if (values.length < 2) return;
+                final ifaces = (values[1] as DBusDict).children.map(
+                  (k, v) => MapEntry(
+                    (k as DBusString).value,
+                    (v as DBusDict).children.map(
+                      (pk, pv) => MapEntry(
+                        (pk as DBusString).value,
+                        (pv as DBusVariant).value,
+                      ),
                     ),
                   ),
-                ),
-              );
-              final props = ifaces[_deviceIface];
-              if (props == null) return;
-              controller.add(_discoveryFromProps(props));
-            } catch (_) {
-              // Skip a structurally-unexpected signal rather than erroring the
-              // discovery stream (mirrors the PropertiesChanged handler).
-            }
-          });
+                );
+                final props = ifaces[_deviceIface];
+                if (props == null) return;
+                controller.add(_discoveryFromProps(props));
+              } catch (_) {
+                // Skip a structurally-unexpected signal rather than erroring the
+                // discovery stream (mirrors the PropertiesChanged handler).
+              }
+            },
+            onError: (Object e) {
+              // Never let a malformed signal become an unhandled zone error.
+              logDiscovery.warning(() => 'InterfacesAdded signal error: $e');
+            },
+          );
       // Property updates (e.g. RSSI/name) on known devices. PropertiesChanged
       // is emitted from each device's own path, so we match a path NAMESPACE
       // under the adapter — an object scoped to '/' would never match.
@@ -226,18 +236,28 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
             interface: _propsIface,
             name: 'PropertiesChanged',
             pathNamespace: _adapterPath,
-          ).listen((signal) async {
-            try {
-              if (signal.values.isEmpty) return;
-              if ((signal.values[0] as DBusString).value != _deviceIface) {
-                return;
+          ).listen(
+            (signal) async {
+              try {
+                if (signal.values.isEmpty) return;
+                if ((signal.values[0] as DBusString).value != _deviceIface) {
+                  return;
+                }
+                final props = await _allDeviceProps(signal.path);
+                // The controller can close (stopDiscovery) while we awaited the
+                // props — guard explicitly rather than relying on the catch.
+                if (!controller.isClosed) {
+                  controller.add(_discoveryFromProps(props));
+                }
+              } catch (_) {
+                /* device vanished mid-update / malformed signal */
               }
-              final props = await _allDeviceProps(signal.path);
-              controller.add(_discoveryFromProps(props));
-            } catch (_) {
-              /* device vanished mid-update / malformed signal */
-            }
-          });
+            },
+            onError: (Object e) {
+              // Never let a malformed signal become an unhandled zone error.
+              logDiscovery.warning(() => 'PropertiesChanged signal error: $e');
+            },
+          );
       // Ask BlueZ to start inquiring — the op itself checks (serialized, so
       // against FRESH state) whether discovery is already running. A
       // concurrent discovery on this client (race with a stop still in

@@ -313,7 +313,10 @@ class BluetoothRfcomm {
   }
 
   void _releaseScan() {
-    _scanHolds--;
+    // Clamped: a hold released after dispose() force-zeroed the counter (a
+    // late stream cancel or scanDuration-window finally) must not drive it
+    // negative, or the next _holdScan() would be invisible.
+    if (_scanHolds > 0) _scanHolds--;
     if (!_scanShouldRun) {
       _pauseScanCycle();
       _wakeScanLoop();
@@ -418,6 +421,9 @@ class BluetoothRfcomm {
       final sub = _scannedUpdates.stream.listen(
         controller.add,
         onError: controller.addError,
+        // The shared source closing (dispose) must end this stream too, or a
+        // consumer's `await for` would hang forever.
+        onDone: controller.close,
       );
       controller.add(scannedDevices);
       controller.onCancel = sub.cancel;
@@ -639,6 +645,9 @@ class BluetoothRfcomm {
       final sub = _nearbyUpdates.stream.listen(
         deliver,
         onError: controller.addError,
+        // The shared source closing (dispose) must end this stream too, or a
+        // consumer's `await for` would hang forever.
+        onDone: controller.close,
       );
       if (_nearby.isNotEmpty) {
         deliver(_nearby.values.toList(growable: false));
@@ -656,7 +665,10 @@ class BluetoothRfcomm {
       _startNearbyLoop();
       controller.onCancel = () {
         if (scanInterval != null) _streamScanIntervals.remove(scanInterval);
-        _nearbyListeners--;
+        // Clamped: dispose() force-zeroes this counter, and a subscriber
+        // cancelling AFTER that must not drive it negative (a -1 would make
+        // the next listener's increment invisible — a silently dead engine).
+        if (_nearbyListeners > 0) _nearbyListeners--;
         if (_nearbyListeners <= 0) _wakeNearbyLoop();
         _releaseScan();
         return sub.cancel();

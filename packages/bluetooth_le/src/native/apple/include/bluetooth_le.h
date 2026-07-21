@@ -91,6 +91,15 @@ void ble_subscribe(int64_t conn_token, const char *service,
 // Returns the usable ATT MTU (max write payload + 3) for the connection.
 int32_t ble_max_write_len(int64_t conn_token, int32_t without_response);
 
+// Quiesces the backend: silences the registered callbacks, stops any scan,
+// cancels every tracked connection, and clears all connection/peripheral and
+// op-tracking state so no CoreBluetooth callback can reach Dart afterwards.
+// The Dart layer calls this at construction (hot-restart recovery: stop every
+// native event source left behind by a dead isolate BEFORE ble_register wires
+// up new callbacks) and at dispose (so nothing native ever invokes a torn-down
+// callback trampoline afterwards).
+void ble_reset(void);
+
 #if defined(__cplusplus)
 }
 #endif

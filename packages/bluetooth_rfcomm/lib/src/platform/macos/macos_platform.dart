@@ -28,7 +28,22 @@ import 'macos_bindings.dart';
 /// macOS requires a real, non-zero RFCOMM channel for serial; [connect] resolves
 /// it from SDP when one isn't supplied.
 class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
-  MacosBluetoothRfcomm();
+  MacosBluetoothRfcomm() {
+    // The callables must pin this isolate while native sources can dial them.
+    _setCallablesKeepAlive(true);
+    // Hot-restart recovery: a previous isolate's channels/inquiry hold C
+    // callback pointers into destroyed trampolines. Quiesce them (the native
+    // teardown nulls each channel's pointers before anything can fire) before
+    // this isolate hands out fresh ones.
+    btcReset();
+  }
+
+  static void _setCallablesKeepAlive(bool alive) {
+    _dataCb.keepIsolateAlive = alive;
+    _stateCb.keepIsolateAlive = alive;
+    _foundCb.keepIsolateAlive = alive;
+    _doneCb.keepIsolateAlive = alive;
+  }
 
   /// Upper bound on a single inbound chunk; guards `asTypedList` against a
   /// corrupted length from native code (RFCOMM frames are far smaller).
@@ -85,12 +100,14 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
   }
 
-  /// Whether a native inquiry is currently running on our behalf. IOBluetooth
-  /// has ONE inquiry slot, so concurrent discovery streams SHARE it: only the
-  /// first stream starts the radio, later streams piggyback on its sightings,
-  /// and only the last stream cancelling stops it — one stream tearing down no
-  /// longer kills another's inquiry.
-  static bool _nativeInquiryRunning = false;
+  /// Token of the native inquiry currently running on our behalf (null =
+  /// none). IOBluetooth has ONE inquiry slot, so concurrent discovery streams
+  /// SHARE it: only the first stream starts the radio, later streams piggyback
+  /// on its sightings, and only the last stream cancelling stops it — one
+  /// stream tearing down no longer kills another's inquiry. The token also
+  /// lets [_onInquiryDone] ignore a STALE done (queued from an inquiry that
+  /// was already stopped) so it can't tear down a freshly started one.
+  static int? _nativeInquiryToken;
 
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() {
@@ -99,7 +116,7 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
     controller = StreamController<BluetoothDiscoveryResult>.broadcast(
       onListen: () {
         _discoveries[token] = controller;
-        if (_nativeInquiryRunning) return; // share the running inquiry
+        if (_nativeInquiryToken != null) return; // share the running inquiry
         final rc = btcStartDiscovery(
           token,
           _foundCb.nativeFunction,
@@ -115,12 +132,12 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
           unawaited(controller.close());
           return;
         }
-        _nativeInquiryRunning = true;
+        _nativeInquiryToken = token;
       },
       onCancel: () async {
         _discoveries.remove(token);
-        if (_discoveries.isEmpty && _nativeInquiryRunning) {
-          _nativeInquiryRunning = false;
+        if (_discoveries.isEmpty && _nativeInquiryToken != null) {
+          _nativeInquiryToken = null;
           btcStopDiscovery();
         }
       },
@@ -130,8 +147,8 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> stopDiscovery() async {
-    if (_nativeInquiryRunning) {
-      _nativeInquiryRunning = false;
+    if (_nativeInquiryToken != null) {
+      _nativeInquiryToken = null;
       btcStopDiscovery();
     }
     // [inquiry stop] does not deliver deviceInquiryComplete, so close the
@@ -219,6 +236,7 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> dispose() async {
+    await stopDiscovery();
     for (final t in _transports.values.toList()) {
       await t.close();
     }
@@ -226,6 +244,10 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
       if (!c.isClosed) await c.close();
     }
     _discoveries.clear();
+    // Quiesce anything still live natively, then release the isolate pin so a
+    // pure-Dart CLI can exit without calling exit() explicitly.
+    btcReset();
+    _setCallablesKeepAlive(false);
   }
 
   // --- callback dispatch (static; correlate by token) ----------------------
@@ -273,8 +295,11 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 
   static void _onInquiryDone(int token, int aborted) {
+    // A done queued from an inquiry that was already stopped/replaced must not
+    // tear down a freshly started one — only the CURRENT inquiry's done acts.
+    if (token != _nativeInquiryToken) return;
+    _nativeInquiryToken = null;
     // The shared inquiry is over: every piggybacked stream completes with it.
-    _nativeInquiryRunning = false;
     for (final controller in _discoveries.values.toList()) {
       if (!controller.isClosed) unawaited(controller.close());
     }

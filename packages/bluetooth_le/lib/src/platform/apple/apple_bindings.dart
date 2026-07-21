@@ -126,3 +126,11 @@ external void bleRegister(
   ffi.Pointer<ffi.NativeFunction<OpCbNative>> op,
   ffi.Pointer<ffi.NativeFunction<NotifyCbNative>> notify,
 );
+
+/// Quiesces every native event source (scan, tracked connections) and NULLs
+/// the process-global callback slots — [bleRegister] re-arms them. Called at
+/// backend construction BEFORE registering (hot-restart recovery: a previous
+/// isolate's sources must be silenced before they can dial its destroyed
+/// trampolines) and at dispose.
+@ffi.Native<ffi.Void Function()>(symbol: 'ble_reset')
+external void bleReset();

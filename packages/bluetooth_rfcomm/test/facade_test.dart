@@ -428,6 +428,31 @@ void main() {
       },
     );
 
+    test('dispose closes live streams and late cancels are harmless', () async {
+      final bt2 = BluetoothRfcomm(platform: FakeBluetoothRfcommPlatform());
+      var scannedDone = false;
+      var nearbyDone = false;
+      final s1 = bt2.scannedDevicesStream.listen(
+        (_) {},
+        onDone: () => scannedDone = true,
+      );
+      final s2 = bt2.bondedAndDiscoveredStream().listen(
+        (_) {},
+        onDone: () => nearbyDone = true,
+      );
+      await pumpEventQueue();
+      await bt2.dispose();
+      await pumpEventQueue();
+      // A consumer's `await for` must terminate, not hang forever.
+      expect(scannedDone, isTrue);
+      expect(nearbyDone, isTrue);
+      // Late cancels after dispose must not corrupt the (zeroed) counters or
+      // throw.
+      await s1.cancel();
+      await s2.cancel();
+      expect(bt2.isScanning, isFalse);
+    });
+
     test('list APIs leave an already-running scan running', () async {
       await bt.startScan();
       await pumpEventQueue();

@@ -42,3 +42,9 @@ external int btcEaWrite(int handle, ffi.Pointer<ffi.Uint8> data, int len);
 
 @ffi.Native<ffi.Int32 Function(ffi.Int64)>(symbol: 'btc_ea_close')
 external int btcEaClose(int handle);
+
+/// Quiesces every native event source (open EA sessions) so no callback can
+/// fire afterwards. Called at backend construction (hot-restart recovery) and
+/// at dispose.
+@ffi.Native<ffi.Void Function()>(symbol: 'btc_ea_reset')
+external void btcEaReset();

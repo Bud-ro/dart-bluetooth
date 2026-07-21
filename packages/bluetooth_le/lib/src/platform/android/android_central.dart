@@ -38,6 +38,13 @@ class AndroidBleCentral extends BleCentralPlatform {
 
   AndroidBleCentral._() : _lib = AndroidBindings.open() {
     _activeLib = _lib;
+    // The callables must pin this isolate while native sources can dial them.
+    _setCallablesKeepAlive(true);
+    // Order is load-bearing: register FIRST so the process-global callback
+    // slots point at THIS isolate's live trampolines, THEN reset to quiesce
+    // any sources a hot-restarted predecessor left running — their dying
+    // events land here and are token-dropped, instead of dialing destroyed
+    // trampolines (a native crash).
     _lib.register(
       _scanCb.nativeFunction,
       _stateCb.nativeFunction,
@@ -45,6 +52,14 @@ class AndroidBleCentral extends BleCentralPlatform {
       _notifyCb.nativeFunction,
     );
     _lib.init();
+    _lib.reset();
+  }
+
+  static void _setCallablesKeepAlive(bool alive) {
+    _scanCb.keepIsolateAlive = alive;
+    _stateCb.keepIsolateAlive = alive;
+    _opCb.keepIsolateAlive = alive;
+    _notifyCb.keepIsolateAlive = alive;
   }
 
   final AndroidBindings _lib;
@@ -189,6 +204,11 @@ class AndroidBleCentral extends BleCentralPlatform {
       await _scanController!.close();
     }
     _scanController = null;
+    // Quiesce every remaining native event source, then release the isolate
+    // pin: nothing can dial the callables anymore, so the isolate may exit.
+    _lib.reset();
+    _setCallablesKeepAlive(false);
+    _instance = null;
   }
 
   // --- native callback dispatch --------------------------------------------

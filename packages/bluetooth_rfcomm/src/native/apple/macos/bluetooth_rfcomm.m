@@ -150,7 +150,14 @@ static BTCInquiry *g_inquiry = nil;
 // Runs on the worker thread only.
 - (void)inquiryFinished:(BOOL)aborted {
   if (g_inquiry == self) g_inquiry = nil;
-  if (self.done) self.done(self.token, aborted ? 1 : 0);
+  // Capture-and-clear BEFORE firing: a late deviceInquiryComplete can re-enter
+  // here after btc_finish_inquiry already ran (the deferred delegate-nil below
+  // hasn't executed yet), and must not double-fire `done` for the same token.
+  // With the callbacks cleared, the second entry is a no-op.
+  btc_inquiry_done_cb done = self.done;
+  self.done = NULL;
+  self.found = NULL;
+  if (done) done(self.token, aborted ? 1 : 0);
   // IOBluetoothDeviceInquiry retains its delegate, so self <-> self.inquiry is
   // a retain cycle once g_inquiry lets go. Break it on the next worker-loop
   // pass so the framework callback that got us here has fully unwound first.
@@ -227,6 +234,7 @@ static BTCSDPQuery *g_sdp_query = nil;
 @property(nonatomic, strong) NSMutableArray<NSData *> *writeQueue;
 @property(nonatomic) BOOL writeInFlight;
 - (void)enqueueWrite:(NSData *)data;
+- (void)teardown;
 @end
 
 static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
@@ -262,19 +270,32 @@ static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
     [self _writeFailed];
   }
 }
+// Delegate-safe teardown shared by every close path (local close, remote
+// close, failed write, btc_reset). Closes the channel now, but defers the
+// delegate-nil to the next worker-loop pass so any framework callback that got
+// us here unwinds against a live delegate; that pass also breaks the
+// BTCChannel <-> IOBluetoothRFCOMMChannel retain cycle (the framework retains
+// its delegate) and nulls the C callback pointers so a late delegate message
+// can never dial out into Dart afterwards. Removing the g_channels entry may
+// drop the last strong reference; the deferred block's capture of self keeps
+// the object alive until it has run. Worker thread only.
+- (void)teardown {
+  [self.writeQueue removeAllObjects];
+  [self.channel closeChannel];
+  [[BTCWorker shared] runAsync:^{
+    [self.channel setDelegate:nil];
+    self.channel = nil;
+    self.data = NULL;
+    self.state = NULL;
+  }];
+  if (self.handle != 0) [g_channels() removeObjectForKey:@(self.handle)];
+}
 // A failed write means the link is gone; surface it as a disconnect instead of
-// silently truncating the byte stream, and tear the channel down so the open
+// silently truncating the byte stream, then tear the channel down so the open
 // IOBluetoothRFCOMMChannel is not orphaned with a dangling delegate.
 - (void)_writeFailed {
-  // Removing the g_channels entry may drop the last strong reference; keep
-  // self alive until this method (and its caller) has fully unwound.
-  BTCChannel *keepAlive = self;
-  (void)keepAlive;
-  [self.writeQueue removeAllObjects];
   if (self.state) self.state(self.token, BTC_CONN_DISCONNECTED);
-  [self.channel closeChannel];
-  [self.channel setDelegate:nil];
-  if (self.handle != 0) [g_channels() removeObjectForKey:@(self.handle)];
+  [self teardown];
 }
 - (void)rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel
                             refcon:(void *)refcon
@@ -308,10 +329,10 @@ static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
 }
 - (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)rfcommChannel {
   if (self.state) self.state(self.token, BTC_CONN_DISCONNECTED);
-  // Remote-initiated close: drop the registry entry so the BTCChannel and its
-  // retained IOBluetoothRFCOMMChannel are released even if Dart never calls
-  // btc_rfcomm_close.
-  if (self.handle != 0) [g_channels() removeObjectForKey:@(self.handle)];
+  // Remote-initiated close: tear down (delegate-safely) so the BTCChannel and
+  // its retained IOBluetoothRFCOMMChannel are released even if Dart never
+  // calls btc_rfcomm_close.
+  [self teardown];
 }
 @end
 
@@ -483,10 +504,18 @@ int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len) {
 int32_t btc_rfcomm_close(int64_t handle) {
   [[BTCWorker shared] runSync:^{
     BTCChannel *ch = g_channels()[@(handle)];
-    if (ch) {
-      [ch.channel closeChannel];
-      [g_channels() removeObjectForKey:@(handle)];
-    }
+    if (ch) [ch teardown];
   }];
   return 0;
+}
+
+void btc_reset(void) {
+  [[BTCWorker shared] runSync:^{
+    btc_finish_inquiry(YES);
+    // allValues snapshots the map, so teardown's own removal is safe here.
+    for (BTCChannel *ch in [g_channels() allValues]) {
+      [ch teardown];
+    }
+    [g_channels() removeAllObjects];
+  }];
 }

@@ -33,6 +33,13 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     // Set before any native callback can fire so the static free-routing in
     // _onData/_onFound never sees a null binding.
     _activeLib = _lib;
+    // The callables must pin this isolate while native sources can dial them.
+    _setCallablesKeepAlive(true);
+    // Order is load-bearing: register FIRST so the process-global callback
+    // slots point at THIS isolate's live trampolines, THEN reset to quiesce
+    // any event sources a previous (hot-restarted) isolate left running —
+    // their dying events land here and are token-dropped, instead of dialing
+    // the dead isolate's destroyed trampolines (a native crash).
     _lib.register(
       _foundCb.nativeFunction,
       _doneCb.nativeFunction,
@@ -40,6 +47,14 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
       _stateCb.nativeFunction,
     );
     _lib.init();
+    _lib.reset();
+  }
+
+  static void _setCallablesKeepAlive(bool alive) {
+    _foundCb.keepIsolateAlive = alive;
+    _doneCb.keepIsolateAlive = alive;
+    _dataCb.keepIsolateAlive = alive;
+    _stateCb.keepIsolateAlive = alive;
   }
 
   final AndroidBindings _lib;
@@ -103,12 +118,15 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
   }
 
-  /// Whether a native inquiry is running on our behalf. The Kotlin side has a
-  /// SINGLE receiver slot, so concurrent discovery streams SHARE one inquiry:
-  /// only the first stream starts it, later streams piggyback on its
-  /// sightings, and only the last stream cancelling stops it — a second
-  /// startDiscovery no longer clobbers (and orphans) the first.
-  static bool _nativeInquiryRunning = false;
+  /// Token of the native inquiry running on our behalf (null = none). The
+  /// Kotlin side has a SINGLE receiver slot, so concurrent discovery streams
+  /// SHARE one inquiry: only the first stream starts it, later streams
+  /// piggyback on its sightings, and only the last stream cancelling stops it
+  /// — a second startDiscovery no longer clobbers (and orphans) the first.
+  /// The token also lets [_onInquiryDone] ignore a STALE done (a late
+  /// DISCOVERY_FINISHED from an inquiry already stopped) so it can't tear
+  /// down a freshly started one.
+  static int? _nativeInquiryToken;
 
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() {
@@ -118,7 +136,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     controller = StreamController<BluetoothDiscoveryResult>.broadcast(
       onListen: () {
         _discoveries[token] = controller;
-        if (_nativeInquiryRunning) return; // share the running inquiry
+        if (_nativeInquiryToken != null) return; // share the running inquiry
         if (_lib.startDiscovery(token) != 0) {
           controller.addError(
             const BluetoothDiscoveryException('startDiscovery failed'),
@@ -129,12 +147,12 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
           unawaited(controller.close());
           return;
         }
-        _nativeInquiryRunning = true;
+        _nativeInquiryToken = token;
       },
       onCancel: () async {
         _discoveries.remove(token);
-        if (_discoveries.isEmpty && _nativeInquiryRunning) {
-          _nativeInquiryRunning = false;
+        if (_discoveries.isEmpty && _nativeInquiryToken != null) {
+          _nativeInquiryToken = null;
           _lib.stopDiscovery();
         }
       },
@@ -144,8 +162,8 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> stopDiscovery() async {
-    if (_nativeInquiryRunning) {
-      _nativeInquiryRunning = false;
+    if (_nativeInquiryToken != null) {
+      _nativeInquiryToken = null;
       _lib.stopDiscovery();
     }
     // Close any discovery streams whose subscribers used stopDiscovery() rather
@@ -260,6 +278,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> dispose() async {
+    await stopDiscovery();
     for (final t in _transports.values.toList()) {
       await t.close();
     }
@@ -267,6 +286,11 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
       if (!c.isClosed) await c.close();
     }
     _discoveries.clear();
+    // Quiesce every remaining native event source, then release the isolate
+    // pin: with nothing left that can dial the callables, letting the isolate
+    // exit is safe — a pure-Dart CLI can now terminate without exit().
+    _lib.reset();
+    _setCallablesKeepAlive(false);
   }
 
   // --- static callback dispatch --------------------------------------------
@@ -297,8 +321,11 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 
   static void _onInquiryDone(int token, int aborted) {
+    // A done queued from an inquiry that was already stopped/replaced must not
+    // tear down a freshly started one — only the CURRENT inquiry's done acts.
+    if (token != _nativeInquiryToken) return;
+    _nativeInquiryToken = null;
     // The shared inquiry is over: every piggybacked stream completes with it.
-    _nativeInquiryRunning = false;
     for (final controller in _discoveries.values.toList()) {
       if (!controller.isClosed) unawaited(controller.close());
     }

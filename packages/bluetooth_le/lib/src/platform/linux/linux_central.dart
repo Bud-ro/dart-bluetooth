@@ -90,14 +90,18 @@ class LinuxBleCentral extends BleCentralPlatform {
         final initial = await adapterState();
         if (epoch != myEpoch) return;
         controller.add(initial);
-        final created = _obj(_adapterPath).propertiesChanged.listen((
-          sig,
-        ) async {
-          if (sig.propertiesInterface == _adapterIface &&
-              sig.changedProperties.containsKey('Powered')) {
-            controller.add(await adapterState());
-          }
-        });
+        final created = _obj(_adapterPath).propertiesChanged.listen(
+          (sig) async {
+            if (sig.propertiesInterface == _adapterIface &&
+                sig.changedProperties.containsKey('Powered')) {
+              controller.add(await adapterState());
+            }
+          },
+          // A malformed signal must not become an unhandled zone error (the
+          // dbus dispatcher addErrors signature mismatches into this stream).
+          onError: (Object e) =>
+              logAdapter.warning(() => 'adapter signal error: $e'),
+        );
         if (epoch != myEpoch) {
           await created.cancel();
         } else {
@@ -164,16 +168,21 @@ class LinuxBleCentral extends BleCentralPlatform {
             object: om,
             interface: _omIface,
             name: 'InterfacesAdded',
-          ).listen((signal) {
-            try {
-              if (signal.values.length < 2) return;
-              final ifaces = _ifacesFromDict(signal.values[1] as DBusDict);
-              final props = ifaces[_deviceIface];
-              if (props != null) controller.add(_scanResultFromProps(props));
-            } catch (_) {
-              // Skip a malformed signal rather than erroring the scan stream.
-            }
-          });
+          ).listen(
+            (signal) {
+              try {
+                if (signal.values.length < 2) return;
+                final ifaces = _ifacesFromDict(signal.values[1] as DBusDict);
+                final props = ifaces[_deviceIface];
+                if (props != null) controller.add(_scanResultFromProps(props));
+              } catch (_) {
+                // Skip a malformed signal rather than erroring the scan stream.
+              }
+            },
+            onError: (Object e) {
+              logScan.warning(() => 'InterfacesAdded signal error: $e');
+            },
+          );
       // RSSI/name updates on already-known devices arrive as PropertiesChanged
       // from each device's own path, so match the adapter path namespace.
       changedSub =
@@ -183,18 +192,27 @@ class LinuxBleCentral extends BleCentralPlatform {
             interface: _propsIface,
             name: 'PropertiesChanged',
             pathNamespace: _adapterPath,
-          ).listen((signal) async {
-            try {
-              if (signal.values.isEmpty) return;
-              if ((signal.values[0] as DBusString).value != _deviceIface) {
-                return;
+          ).listen(
+            (signal) async {
+              try {
+                if (signal.values.isEmpty) return;
+                if ((signal.values[0] as DBusString).value != _deviceIface) {
+                  return;
+                }
+                final props = await _allProps(signal.path, _deviceIface);
+                // The controller can close (stopScan) while we awaited the
+                // props — guard explicitly rather than relying on the catch.
+                if (!controller.isClosed) {
+                  controller.add(_scanResultFromProps(props));
+                }
+              } catch (_) {
+                // Device vanished mid-update / malformed signal.
               }
-              final props = await _allProps(signal.path, _deviceIface);
-              controller.add(_scanResultFromProps(props));
-            } catch (_) {
-              // Device vanished mid-update / malformed signal.
-            }
-          });
+            },
+            onError: (Object e) {
+              logScan.warning(() => 'PropertiesChanged signal error: $e');
+            },
+          );
 
       // Only the FIRST local scan configures and starts the BlueZ inquiry; a
       // concurrent scan rides the one already running (with its filter — one
@@ -488,14 +506,22 @@ class LinuxGattConnection implements GattConnection {
   Future<void> open(Duration? timeout) async {
     // Watch the device for disconnects before we connect, so we never miss the
     // transition.
-    _deviceSub = _obj(_devicePath).propertiesChanged.listen((sig) {
-      if (sig.propertiesInterface != _deviceIface) return;
-      final connected = sig.changedProperties['Connected'];
-      if (connected is DBusBoolean && !connected.value) {
-        _setState(BleConnectionState.disconnected);
-        _teardown();
-      }
-    });
+    _deviceSub = _obj(_devicePath).propertiesChanged.listen(
+      (sig) {
+        if (sig.propertiesInterface != _deviceIface) return;
+        final connected = sig.changedProperties['Connected'];
+        if (connected is DBusBoolean && !connected.value) {
+          _setState(BleConnectionState.disconnected);
+          _teardown();
+        }
+      },
+      // A malformed signal must not become an unhandled zone error.
+      onError: (Object e) => logConnection.warning(
+        () =>
+            'device signal error: '
+            '$e',
+      ),
+    );
     final device = _obj(_devicePath);
     final connect = device.callMethod(
       _deviceIface,
@@ -540,15 +566,22 @@ class LinuxGattConnection implements GattConnection {
       return; // property absent / bus issue — discoverServices lazy-resolves
     }
     final done = Completer<void>();
-    final sub = device.propertiesChanged.listen((sig) {
-      if (sig.propertiesInterface != _deviceIface) return;
-      final r = sig.changedProperties['ServicesResolved'];
-      if (r is DBusBoolean && r.value && !done.isCompleted) done.complete();
-      final c = sig.changedProperties['Connected'];
-      if (c is DBusBoolean && !c.value && !done.isCompleted) {
-        done.complete(); // disconnect; the device watch handles teardown
-      }
-    });
+    final sub = device.propertiesChanged.listen(
+      (sig) {
+        if (sig.propertiesInterface != _deviceIface) return;
+        final r = sig.changedProperties['ServicesResolved'];
+        if (r is DBusBoolean && r.value && !done.isCompleted) done.complete();
+        final c = sig.changedProperties['Connected'];
+        if (c is DBusBoolean && !c.value && !done.isCompleted) {
+          done.complete(); // disconnect; the device watch handles teardown
+        }
+      },
+      onError: (Object e) => logConnection.warning(
+        () =>
+            'device signal error: '
+            '$e',
+      ),
+    );
     try {
       await done.future.timeout(timeout ?? LinuxBleCentral._busTimeout);
     } on TimeoutException {
@@ -682,13 +715,18 @@ class LinuxGattConnection implements GattConnection {
         try {
           final path = await _charPath(service, characteristic);
           if (epoch != myEpoch) return;
-          sub = _obj(path).propertiesChanged.listen((sig) {
-            if (sig.propertiesInterface != _charIface) return;
-            final value = sig.changedProperties['Value'];
-            if (value != null) {
-              controller.add(LinuxBleCentral._bytesOf(value));
-            }
-          });
+          sub = _obj(path).propertiesChanged.listen(
+            (sig) {
+              if (sig.propertiesInterface != _charIface) return;
+              final value = sig.changedProperties['Value'];
+              if (value != null && !controller.isClosed) {
+                controller.add(LinuxBleCentral._bytesOf(value));
+              }
+            },
+            // A malformed signal must not become an unhandled zone error.
+            onError: (Object e) =>
+                logGatt.warning(() => 'notify signal error: $e'),
+          );
           _notifySubs.add(sub!);
           await _obj(path).callMethod(
             _charIface,
@@ -704,7 +742,15 @@ class LinuxGattConnection implements GattConnection {
             await sub!.cancel();
             sub = null;
           }
-          controller.addError(_gattError(e, 'subscribe'));
+          // The link can drop while we were parked at an await above, and
+          // _teardown() then closes this controller before we get here —
+          // addError on a closed controller is a StateError that would land as
+          // an UNHANDLED zone error (process death in a CLI). Guard it.
+          if (!controller.isClosed) {
+            controller.addError(_gattError(e, 'subscribe'));
+          } else {
+            logGatt.fine(() => 'subscribe failed after teardown: $e');
+          }
         }
       },
       onCancel: () async {

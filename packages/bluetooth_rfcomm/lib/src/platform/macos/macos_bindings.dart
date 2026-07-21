@@ -76,3 +76,10 @@ external int btcRfcommWrite(int handle, ffi.Pointer<ffi.Uint8> data, int len);
 
 @ffi.Native<ffi.Int32 Function(ffi.Int64)>(symbol: 'btc_rfcomm_close')
 external int btcRfcommClose(int handle);
+
+/// Quiesces every native event source (open channels, running inquiry) so no
+/// callback can fire afterwards. Called at backend construction (hot-restart
+/// recovery: a previous isolate's channels must be silenced before its dead
+/// callback trampolines could be dialed) and at dispose.
+@ffi.Native<ffi.Void Function()>(symbol: 'btc_reset')
+external void btcReset();

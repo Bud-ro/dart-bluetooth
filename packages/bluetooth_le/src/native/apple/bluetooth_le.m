@@ -426,49 +426,54 @@ int32_t ble_connect(int64_t conn_token, const char *peripheral_id) {
   if (!peripheral_id) return -1;
   BLECentral *c = [BLECentral shared];
   NSString *pid = @(peripheral_id);
-  CBPeripheral *p = c.peripherals[pid];
-  if (!p) {
-    NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:pid];
-    if (uuid) {
-      NSArray<CBPeripheral *> *known =
-          [c.manager retrievePeripheralsWithIdentifiers:@[ uuid ]];
-      if (known.count) {
-        p = known.firstObject;
-        c.peripherals[pid] = p;
+  // peripherals/connections are confined to c.queue (the delegate callbacks
+  // mutate them there); dispatch_sync is deadlock-free because Dart caller
+  // threads are never on c.queue.
+  __block int32_t result = -1;
+  dispatch_sync(c.queue, ^{
+    CBPeripheral *p = c.peripherals[pid];
+    if (!p) {
+      NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:pid];
+      if (uuid) {
+        NSArray<CBPeripheral *> *known =
+            [c.manager retrievePeripheralsWithIdentifiers:@[ uuid ]];
+        if (known.count) {
+          p = known.firstObject;
+          c.peripherals[pid] = p;
+        }
       }
     }
-  }
-  if (!p) return -1;
+    if (!p) return;
 
-  BLEPeripheral *w = [BLEPeripheral new];
-  w.token = conn_token;
-  w.peripheral = p;
-  p.delegate = w;
-  c.connections[@(conn_token)] = w;
-  dispatch_async(c.queue, ^{
+    BLEPeripheral *w = [BLEPeripheral new];
+    w.token = conn_token;
+    w.peripheral = p;
+    p.delegate = w;
+    c.connections[@(conn_token)] = w;
     [c.manager connectPeripheral:p options:nil];
+    result = 0;
   });
-  return 0;
+  return result;
 }
 
 void ble_disconnect(int64_t conn_token) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) return;
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) return;
     [c.manager cancelPeripheralConnection:w.peripheral];
   });
 }
 
 void ble_discover_services(int64_t req_id, int64_t conn_token) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) {
-    if (g_op) g_op(req_id, -1, NULL, NULL, 0);
-    return;
-  }
-  w.discoverReqId = req_id;
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
+    w.discoverReqId = req_id;
     [w.peripheral discoverServices:nil];
   });
 }
@@ -476,13 +481,13 @@ void ble_discover_services(int64_t req_id, int64_t conn_token) {
 void ble_read(int64_t req_id, int64_t conn_token, const char *service,
               const char *characteristic) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) {
-    if (g_op) g_op(req_id, -1, NULL, NULL, 0);
-    return;
-  }
   NSString *svc = @(service), *chr = @(characteristic);
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
     CBCharacteristic *ch = [w charForService:svc characteristic:chr];
     if (!ch) {
       if (g_op) g_op(req_id, -1, NULL, NULL, 0);
@@ -497,16 +502,16 @@ void ble_write(int64_t req_id, int64_t conn_token, const char *service,
                const char *characteristic, const uint8_t *data, int32_t len,
                int32_t without_response) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) {
-    if (g_op) g_op(req_id, -1, NULL, NULL, 0);
-    return;
-  }
   NSString *svc = @(service), *chr = @(characteristic);
   NSData *payload = (data && len > 0)
                         ? [NSData dataWithBytes:data length:(NSUInteger)len]
                         : [NSData data];
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
     CBCharacteristic *ch = [w charForService:svc characteristic:chr];
     if (!ch) {
       if (g_op) g_op(req_id, -1, NULL, NULL, 0);
@@ -529,10 +534,10 @@ void ble_write(int64_t req_id, int64_t conn_token, const char *service,
 void ble_subscribe(int64_t conn_token, const char *service,
                    const char *characteristic, int32_t enable) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) return;
   NSString *svc = @(service), *chr = @(characteristic);
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) return;
     CBCharacteristic *ch = [w charForService:svc characteristic:chr];
     if (!ch) return;
     NSString *key = char_key(ch);
@@ -547,11 +552,39 @@ void ble_subscribe(int64_t conn_token, const char *service,
 
 int32_t ble_max_write_len(int64_t conn_token, int32_t without_response) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) return 20;
-  CBCharacteristicWriteType type = without_response
-                                       ? CBCharacteristicWriteWithoutResponse
-                                       : CBCharacteristicWriteWithResponse;
-  NSUInteger n = [w.peripheral maximumWriteValueLengthForType:type];
-  return (int32_t)(n + 3); // report as an ATT MTU (payload + 3-byte header)
+  __block int32_t result = 20;
+  dispatch_sync(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) return;
+    CBCharacteristicWriteType type = without_response
+                                         ? CBCharacteristicWriteWithoutResponse
+                                         : CBCharacteristicWriteWithResponse;
+    NSUInteger n = [w.peripheral maximumWriteValueLengthForType:type];
+    result = (int32_t)(n + 3); // report as an ATT MTU (payload + 3-byte header)
+  });
+  return result;
+}
+
+void ble_reset(void) {
+  BLECentral *c = [BLECentral shared];
+  dispatch_sync(c.queue, ^{
+    // Silence the C callback pointers first (on the queue, where they are
+    // read) so an already-queued delegate event delivered after this block
+    // cannot dial out into Dart; ble_register re-arms them.
+    g_scan = NULL;
+    g_state = NULL;
+    g_op = NULL;
+    g_notify = NULL;
+    c.wantScan = NO;
+    c.scanning = NO;
+    [c.manager stopScan];
+    for (BLEPeripheral *w in c.connections.allValues) {
+      w.peripheral.delegate = nil;
+      [c.manager cancelPeripheralConnection:w.peripheral];
+    }
+    // Dropping the wrappers also drops their op-tracking state
+    // (pendingReads/pendingWrites/subscribed).
+    [c.connections removeAllObjects];
+    [c.peripherals removeAllObjects];
+  });
 }

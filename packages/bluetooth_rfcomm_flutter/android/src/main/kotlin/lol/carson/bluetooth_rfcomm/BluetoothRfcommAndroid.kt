@@ -38,6 +38,9 @@ object BluetoothRfcommAndroid {
     private var context: Context? = null
     private var discoveryReceiver: BroadcastReceiver? = null
     private var discoveryToken: Long = 0
+    // Guards discoveryReceiver/discoveryToken so receiver swaps are atomic and
+    // a stale receiver's FINISHED broadcast can't tear down a newer discovery.
+    private val discoveryLock = Any()
 
     private val sockets = ConcurrentHashMap<Long, BluetoothSocket>()
     private val nextHandle = AtomicLong(1)
@@ -107,41 +110,52 @@ object BluetoothRfcommAndroid {
         return try {
             val a = adapter ?: return -1
             val ctx = context ?: return -1
-            stopDiscovery()
-            discoveryToken = token
-            val receiver = object : BroadcastReceiver() {
-                override fun onReceive(c: Context, intent: Intent) {
-                    when (intent.action) {
-                        BluetoothDevice.ACTION_FOUND -> {
-                            val device = deviceExtra(intent)
-                            val rssi = intent.getShortExtra(
-                                BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE
-                            )
-                            if (device != null) {
-                                val json = deviceJson(
-                                    device,
-                                    bonded = device.bondState ==
-                                        BluetoothDevice.BOND_BONDED,
-                                    rssi = if (rssi.toInt() == Short.MIN_VALUE.toInt())
-                                        null else rssi.toInt(),
+            synchronized(discoveryLock) {
+                stopDiscoveryLocked()
+                discoveryToken = token
+                val receiver = object : BroadcastReceiver() {
+                    override fun onReceive(c: Context, intent: Intent) {
+                        when (intent.action) {
+                            BluetoothDevice.ACTION_FOUND -> {
+                                val device = deviceExtra(intent)
+                                val rssi = intent.getShortExtra(
+                                    BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE
                                 )
-                                nativeOnFound(token, json.toString())
+                                if (device != null) {
+                                    val json = deviceJson(
+                                        device,
+                                        bonded = device.bondState ==
+                                            BluetoothDevice.BOND_BONDED,
+                                        rssi = if (rssi.toInt() == Short.MIN_VALUE.toInt())
+                                            null else rssi.toInt(),
+                                    )
+                                    nativeOnFound(token, json.toString())
+                                }
                             }
-                        }
-                        BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
-                            stopDiscovery() // unregister before signalling done
-                            nativeOnInquiryDone(token, 0)
+                            BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                                // A FINISHED delivered to a STALE receiver (one
+                                // already replaced by a newer startDiscovery,
+                                // with the broadcast still in flight) must not
+                                // cancel the new scan or unregister the new
+                                // receiver: only the CURRENT receiver may act.
+                                synchronized(discoveryLock) {
+                                    if (discoveryReceiver !== this) return
+                                    // Unregister before signalling done.
+                                    stopDiscoveryLocked()
+                                }
+                                nativeOnInquiryDone(token, 0)
+                            }
                         }
                     }
                 }
+                val filter = IntentFilter().apply {
+                    addAction(BluetoothDevice.ACTION_FOUND)
+                    addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+                }
+                registerReceiverCompat(ctx, receiver, filter)
+                discoveryReceiver = receiver
+                if (a.startDiscovery()) 0 else -1
             }
-            val filter = IntentFilter().apply {
-                addAction(BluetoothDevice.ACTION_FOUND)
-                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
-            }
-            registerReceiverCompat(ctx, receiver, filter)
-            discoveryReceiver = receiver
-            if (a.startDiscovery()) 0 else -1
         } catch (t: Throwable) {
             -1
         }
@@ -171,9 +185,15 @@ object BluetoothRfcommAndroid {
         }
     }
 
-    @SuppressLint("MissingPermission")
     @JvmStatic
     fun stopDiscovery(): Int {
+        synchronized(discoveryLock) { stopDiscoveryLocked() }
+        return 0
+    }
+
+    // Must be called with discoveryLock held.
+    @SuppressLint("MissingPermission")
+    private fun stopDiscoveryLocked() {
         // Independent try blocks: if cancelDiscovery throws (e.g. a
         // SecurityException), the receiver must still be unregistered or it
         // leaks for the lifetime of the process.
@@ -186,7 +206,6 @@ object BluetoothRfcommAndroid {
         } catch (_: Throwable) {
         }
         discoveryReceiver = null
-        return 0
     }
 
     /**
@@ -297,6 +316,34 @@ object BluetoothRfcommAndroid {
         try {
             socket.close()
         } catch (_: Throwable) {
+        }
+        return 0
+    }
+
+    /**
+     * Quiesces every event source owned by this object: stops discovery
+     * (unregistering the receiver) and closes every open socket, shutting the
+     * write executors down and unblocking the read loops. Called by the Dart
+     * layer at construction — BEFORE it registers new callback pointers — so
+     * nothing left over from a dead isolate (Flutter hot restart) can invoke a
+     * destroyed NativeCallable trampoline; also called at dispose.
+     *
+     * Deliberately does NOT touch the C callback pointers themselves: the Dart
+     * side owns (re-)registration, reset only kills the event sources. The read
+     * loops unblocked here still fire a final nativeOnState/close(handle) as
+     * they die; both are harmless — close() on an absent handle is a no-op and
+     * the stale token is dropped on the Dart side.
+     */
+    @JvmStatic
+    fun reset(): Int {
+        synchronized(discoveryLock) {
+            stopDiscoveryLocked()
+            // Drain both maps. close() removes each handle from both, so the
+            // dying read loops' own close(handle) calls find nothing to do.
+            for (handle in sockets.keys.toList()) close(handle)
+            for (exec in writeExecutors.values) exec.shutdownNow()
+            writeExecutors.clear()
+            sockets.clear()
         }
         return 0
     }

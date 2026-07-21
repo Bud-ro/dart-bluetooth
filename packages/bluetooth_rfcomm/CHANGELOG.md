@@ -2,6 +2,32 @@
 
 ## 0.2.0
 
+### Callback-lifetime hardening
+
+A targeted delete-then-invoke audit (can a callback be unregistered/freed and
+still be called later?) across the Dart, FFI and native layers:
+
+- **New native `reset` entry points** (`btc_reset` on macOS, `btc_ea_reset` on
+  iOS, `btc_and_reset` on Android) that quiesce every native event source
+  (open channels/sockets/sessions, running inquiries). Called at backend
+  construction — so a Flutter **hot restart** can no longer leave native read
+  loops dialing the dead isolate's destroyed callback trampolines (a native
+  crash) — and at `dispose()`, after which the callables release their isolate
+  pin, so a pure-Dart CLI now exits without an explicit `exit()`.
+- macOS: every channel-teardown path now defers `setDelegate:nil` + callback
+  nulling (previously only the write-failure path did), fixing a per-connection
+  retain cycle / potential use-after-free; a late `deviceInquiryComplete` can
+  no longer double-fire the inquiry-done callback.
+- macOS/Android: a stale inquiry-done (queued from an already-stopped inquiry)
+  is now token-checked so it can't tear down a freshly started discovery;
+  Android's discovery receiver swap is synchronized and identity-checked so an
+  old FINISHED broadcast can't cancel a new scan.
+- Facade: `scannedDevicesStream`/`bondedAndDiscoveredStream` now close when
+  the facade is disposed (previously a consumer's `await for` hung forever);
+  late stream cancels after `dispose()` can no longer corrupt the scan-engine
+  hold counters; Linux D-Bus signal subscriptions all handle dispatcher errors
+  (a malformed BlueZ signal was an unhandled-zone-error process killer).
+
 ### Deep-review hardening
 
 A 13-lens adversarially-verified review of the whole stack; the surviving

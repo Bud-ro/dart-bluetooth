@@ -40,6 +40,14 @@ int32_t btc_ea_write(int64_t handle, const uint8_t *data, int32_t len);
 // Closes the session. Returns 0 on success.
 int32_t btc_ea_close(int64_t handle);
 
+// Quiesces the backend: closes every open EASession (un-scheduling its streams
+// and nilling their delegates) and clears the handle map. The Dart layer calls
+// this at construction (hot-restart recovery: stop every native event source
+// left behind by a dead isolate BEFORE new callbacks are registered) and at
+// dispose (so nothing native ever invokes a torn-down callback trampoline
+// afterwards).
+void btc_ea_reset(void);
+
 #if defined(__cplusplus)
 }
 #endif

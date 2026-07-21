@@ -33,12 +33,26 @@ class AppleBleCentral extends BleCentralPlatform {
   static AppleBleCentral? _instance;
 
   AppleBleCentral._() {
+    // The callables must pin this isolate while native sources can dial them.
+    _setCallablesKeepAlive(true);
+    // Order is load-bearing and the OPPOSITE of the Android backend:
+    // ble_reset NULLs the process-global callback slots (so a hot-restarted
+    // predecessor's sources are silenced before they can dial its destroyed
+    // trampolines), and ble_register then re-arms them with THIS isolate's.
+    bleReset();
     bleRegister(
       _scanCb.nativeFunction,
       _stateCb.nativeFunction,
       _opCb.nativeFunction,
       _notifyCb.nativeFunction,
     );
+  }
+
+  static void _setCallablesKeepAlive(bool alive) {
+    _scanCb.keepIsolateAlive = alive;
+    _stateCb.keepIsolateAlive = alive;
+    _opCb.keepIsolateAlive = alive;
+    _notifyCb.keepIsolateAlive = alive;
   }
 
   static int _nextScanToken = 1;
@@ -167,6 +181,12 @@ class AppleBleCentral extends BleCentralPlatform {
       await _scanController!.close();
     }
     _scanController = null;
+    // Quiesce natively (this also NULLs the callback slots), then release the
+    // isolate pin: nothing can dial the callables anymore, so the isolate may
+    // exit. A later construction re-arms via the factory (fresh _instance).
+    bleReset();
+    _setCallablesKeepAlive(false);
+    _instance = null;
   }
 
   // --- native callback dispatch --------------------------------------------

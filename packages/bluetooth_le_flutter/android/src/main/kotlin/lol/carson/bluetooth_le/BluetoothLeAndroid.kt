@@ -177,6 +177,25 @@ object BluetoothLeAndroid {
         }
     }
 
+    /**
+     * Quiesces every event source owned by this object: stops any active scan
+     * and disconnects/closes every tracked GATT connection, clearing the
+     * connection map without completing any in-flight request. Called by the
+     * Dart layer at construction — BEFORE it registers new callback pointers —
+     * so nothing left over from a dead isolate (Flutter hot restart) can invoke
+     * a destroyed NativeCallable trampoline; also called at dispose.
+     *
+     * Deliberately does NOT touch the C callback pointers themselves: the Dart
+     * side owns (re-)registration, reset only kills the event sources.
+     */
+    @JvmStatic
+    fun reset(): Int {
+        stopScan()
+        for (connToken in connections.keys.toList()) disconnect(connToken)
+        connections.clear()
+        return 0
+    }
+
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun disconnect(connToken: Long) {

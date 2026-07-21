@@ -2,6 +2,20 @@
 
 ## 0.1.1
 
+### Callback-lifetime hardening
+
+- Apple: the connection/peripheral maps are now confined to the CoreBluetooth
+  dispatch queue — they were previously mutated from Dart caller threads while
+  CB delegate callbacks removed entries on the queue (NSMutableDictionary is
+  not thread-safe; this was crash-capable). New `ble_reset` / `ble_and_reset`
+  native entry points quiesce every event source at backend construction
+  (Flutter hot-restart no longer risks native calls into the dead isolate's
+  destroyed callback trampolines) and at `dispose()`, which now also releases
+  the callables' isolate pin.
+- Linux: a `subscribe` whose link drops mid-setup no longer `addError`s a
+  closed controller (an unhandled-zone-error process killer); every D-Bus
+  signal subscription now handles dispatcher errors (malformed BlueZ signals).
+
 Reliability fixes from a deep code review (no API changes).
 
 - Android: notification enable/disable (the CCCD descriptor write) now runs as

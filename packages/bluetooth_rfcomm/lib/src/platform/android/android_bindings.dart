@@ -76,6 +76,9 @@ class AndroidBindings {
         .lookupFunction<ffi.Int32 Function(ffi.Int64), int Function(int)>(
           'btc_and_close',
         );
+    reset = _lib.lookupFunction<ffi.Void Function(), void Function()>(
+      'btc_and_reset',
+    );
   }
 
   factory AndroidBindings.open() =>
@@ -112,4 +115,10 @@ class AndroidBindings {
   /// timeout/closed/unknown handle.
   late final int Function(int) flush;
   late final int Function(int) close;
+
+  /// Quiesces every native event source (read loops, discovery receiver) so
+  /// nothing can invoke a callback afterwards. Called AFTER [register] at
+  /// construction (so any dying read-loop's final events land in the NEW
+  /// listeners, which token-drop them) and at dispose.
+  late final void Function() reset;
 }

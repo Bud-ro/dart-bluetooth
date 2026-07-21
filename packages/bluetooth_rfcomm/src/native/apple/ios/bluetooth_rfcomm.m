@@ -328,3 +328,16 @@ int32_t btc_ea_close(int64_t handle) {
   }];
   return 0;
 }
+
+void btc_ea_reset(void) {
+  [[BTCWorker shared] runSync:^{
+    // closeSession un-schedules the streams and nils their delegates, so no
+    // stream event can dial out into Dart after this returns.
+    for (BTCSession *h in [g_sessions() allValues]) {
+      [h closeSession];
+      h.data = NULL;
+      h.state = NULL;
+    }
+    [g_sessions() removeAllObjects];
+  }];
+}

@@ -430,3 +430,17 @@ BTC_EXPORT int32_t btc_and_close(int64_t handle) {
   clear_pending(env);
   return r;
 }
+
+// Quiesces every Kotlin-side event source (discovery receiver, read loops,
+// write executors) WITHOUT touching the registered callback pointers — the
+// Dart layer calls this at construction, before registering fresh
+// NativeCallable pointers, so nothing left over from a dead isolate (Flutter
+// hot restart) can invoke a destroyed trampoline; also called at dispose.
+BTC_EXPORT void btc_and_reset(void) {
+  JNIEnv *env = get_env();
+  if (!env) return;
+  jmethodID m = static_method(env, "reset", "()I");
+  if (!m) return;
+  (*env)->CallStaticIntMethod(env, g_class, m);
+  clear_pending(env);
+}

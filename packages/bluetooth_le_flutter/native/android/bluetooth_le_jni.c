@@ -390,3 +390,17 @@ BLE_EXPORT void ble_and_request_mtu(int64_t req_id, int64_t conn_token,
                                (jlong)conn_token, (jint)mtu);
   clear_pending(env);
 }
+
+// Quiesces every Kotlin-side event source (scan callback, GATT connections)
+// WITHOUT touching the registered callback pointers — the Dart layer calls
+// this at construction, before registering fresh NativeCallable pointers, so
+// nothing left over from a dead isolate (Flutter hot restart) can invoke a
+// destroyed trampoline; also called at dispose.
+BLE_EXPORT void ble_and_reset(void) {
+  JNIEnv *env = get_env();
+  if (!env) return;
+  jmethodID m = static_method(env, "reset", "()I");
+  if (!m) return;
+  (*env)->CallStaticIntMethod(env, g_class, m);
+  clear_pending(env);
+}

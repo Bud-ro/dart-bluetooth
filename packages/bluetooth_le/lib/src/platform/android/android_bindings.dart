@@ -130,6 +130,9 @@ class AndroidBindings {
           ffi.Void Function(ffi.Int64, ffi.Int64, ffi.Int32),
           void Function(int, int, int)
         >('ble_and_request_mtu');
+    reset = _lib.lookupFunction<ffi.Void Function(), void Function()>(
+      'ble_and_reset',
+    );
   }
 
   factory AndroidBindings.open() =>
@@ -180,4 +183,11 @@ class AndroidBindings {
   )
   subscribe;
   late final void Function(int, int, int) requestMtu;
+
+  /// Quiesces every native event source (scan, GATT connections) so nothing
+  /// can invoke a callback afterwards; does NOT touch the registered callback
+  /// pointers. Called AFTER [register] at construction (so dying sources'
+  /// final events land in the NEW listeners, which token-drop them) and at
+  /// dispose.
+  late final void Function() reset;
 }

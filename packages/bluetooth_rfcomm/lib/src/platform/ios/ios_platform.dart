@@ -27,7 +27,18 @@ import 'ios_bindings.dart';
 /// a MAC. RFCOMM channel / service UUID don't apply; the accessory's first
 /// declared protocol string is used.
 class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
-  IosBluetoothRfcomm();
+  IosBluetoothRfcomm() {
+    // The callables must pin this isolate while native sources can dial them.
+    _setCallablesKeepAlive(true);
+    // Hot-restart recovery: close any EA sessions a previous isolate left
+    // open before this isolate hands out fresh callback pointers.
+    btcEaReset();
+  }
+
+  static void _setCallablesKeepAlive(bool alive) {
+    _dataCb.keepIsolateAlive = alive;
+    _stateCb.keepIsolateAlive = alive;
+  }
 
   static const int _maxInboundChunk = 1 << 20;
   static int _nextToken = 1;
@@ -154,6 +165,9 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
     for (final t in _transports.values.toList()) {
       await t.close();
     }
+    // Quiesce anything still live natively, then release the isolate pin.
+    btcEaReset();
+    _setCallablesKeepAlive(false);
   }
 
   // --- helpers -------------------------------------------------------------

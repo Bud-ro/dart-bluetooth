@@ -78,6 +78,14 @@ int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len);
 // Closes `handle`. Returns 0 on success.
 int32_t btc_rfcomm_close(int64_t handle);
 
+// Quiesces the backend: finishes any in-progress inquiry (firing its done
+// callback) and tears down every open RFCOMM channel delegate-safely, clearing
+// the handle map. The Dart layer calls this at construction (hot-restart
+// recovery: stop every native event source left behind by a dead isolate
+// BEFORE new callbacks are registered) and at dispose (so nothing native ever
+// invokes a torn-down callback trampoline afterwards).
+void btc_reset(void);
+
 #if defined(__cplusplus)
 }
 #endif
