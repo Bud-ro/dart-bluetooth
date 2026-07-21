@@ -2,12 +2,9 @@
 
 ## 0.1.1
 
-- Android: descriptor (CCCD) writes issued by subscribe are now tracked per
-  request and completed via a new `onDescriptorWrite` GATT callback, so Dart
-  can serialize them with other GATT ops instead of colliding with Android's
-  one-outstanding-op limit. The `ble_and_subscribe` JNI/C ABI gained a request
-  id — use with `bluetooth_le` >= 0.1.1 (older versions call the old
-  four-argument form).
+- Android native fixes for `bluetooth_le` 0.1.1 (tracked CCCD writes, scan
+  cleanup, hot-restart quiesce hook). Use with `bluetooth_le` >= 0.1.1; no API
+  changes here.
 
 ## 0.1.0
 

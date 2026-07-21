@@ -26,6 +26,39 @@ abstract final class BleLoggers {
 
   /// Diagnostics from the native backends: `bluetooth_le.native`.
   static const String native = 'bluetooth_le.native';
+
+  /// All of the above, for convenience.
+  static const List<String> all = [
+    package,
+    scan,
+    connection,
+    gatt,
+    data,
+    adapter,
+    native,
+  ];
+
+  /// The package's parent [Logger] (`bluetooth_le`). With
+  /// `hierarchicalLoggingEnabled = true`, setting its level controls every
+  /// subsystem at once; [setLevel] does exactly that in one call.
+  static Logger get root => Logger(package);
+
+  /// The package's [Logger]s, parent first — for bulk configuration or
+  /// attaching listeners per subsystem.
+  static List<Logger> get loggers => [for (final name in all) Logger(name)];
+
+  /// One-call setup: enables `hierarchicalLoggingEnabled` and sets [level] on
+  /// the package's [root] logger, so every `bluetooth_le.*` subsystem follows
+  /// it (and the rest of the app's loggers are untouched).
+  ///
+  /// ```dart
+  /// BleLoggers.setLevel(Level.FINE);
+  /// Logger.root.onRecord.listen((r) => debugPrint('${r.loggerName}: ${r.message}'));
+  /// ```
+  static void setLevel(Level level) {
+    hierarchicalLoggingEnabled = true;
+    root.level = level;
+  }
 }
 
 final Logger logScan = Logger(BleLoggers.scan);

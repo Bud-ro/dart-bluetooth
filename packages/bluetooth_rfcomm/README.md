@@ -240,16 +240,21 @@ recoverable problems at `WARNING`, and a failed `connect()` at `SEVERE`.
 ```dart
 import 'package:logging/logging.dart';
 
-Logger.root.level = Level.FINE;
+// One call: this package's loggers at FINE, everything else untouched.
+BluetoothRfcommLoggers.setLevel(Level.FINE);
 Logger.root.onRecord.listen((r) {
   print('${r.level.name} ${r.loggerName}: ${r.message}');
 });
 ```
 
-For per-subsystem levels, set `hierarchicalLoggingEnabled = true` and configure
-individual loggers (e.g. silence `BluetoothRfcommLoggers.data` to drop raw
-bytes). Raw-byte messages are built lazily, so leaving that logger off costs
-nothing.
+For per-subsystem levels, configure individual loggers (all reachable via
+`BluetoothRfcommLoggers.loggers` / `.root`, or by name) — e.g. silence
+`BluetoothRfcommLoggers.data` to drop raw bytes. Raw-byte messages are built
+lazily, so leaving that logger off costs nothing.
+
+The package itself never prints. The one exception outside `package:logging`'s
+reach: the Android native layer logs RFCOMM connect failures to logcat under
+the tag `BluetoothRfcomm` (the JNI ABI can't carry the throwable across).
 
 ## Testing without hardware
 

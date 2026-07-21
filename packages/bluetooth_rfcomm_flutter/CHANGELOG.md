@@ -2,10 +2,9 @@
 
 ## 0.2.0
 
-- Track `bluetooth_rfcomm` 0.2.0: background scan API
-  (`startScan`/`stopScan`/`forgetScannedDevices`/`scannedDevices`),
-  `BluetoothConnection.disconnect()`, and hardened disconnect handling. No
-  plugin-side changes; this release just widens the dependency.
+- Tracks `bluetooth_rfcomm` 0.2.0 (background scan, list APIs, `disconnect()`,
+  reliability fixes). Android native picks up the core's new flush/reset hooks
+  and discovery-receiver fixes; no API changes here.
 
 ## 0.1.0
 
