@@ -318,6 +318,15 @@ int32_t btc_ea_write(int64_t handle, const uint8_t *data, int32_t len) {
   return result;
 }
 
+int64_t btc_ea_pending(int64_t handle) {
+  __block int64_t result = 0;
+  [[BTCWorker shared] runSync:^{
+    BTCSession *h = g_sessions()[@(handle)];
+    if (h) result = (int64_t)h.outBuffer.length;
+  }];
+  return result;
+}
+
 int32_t btc_ea_close(int64_t handle) {
   [[BTCWorker shared] runSync:^{
     BTCSession *h = g_sessions()[@(handle)];

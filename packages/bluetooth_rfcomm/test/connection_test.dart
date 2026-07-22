@@ -145,6 +145,114 @@ void main() {
     },
   );
 
+  group('backpressure surface', () {
+    test(
+      'maxPayloadSize surfaces the transport value (null by default)',
+      () async {
+        final (conn, transport) = await open();
+        expect(conn.maxPayloadSize, isNull); // Windows/Linux/iOS model
+        transport.maxPayloadSize = 1011; // macOS RFCOMM MTU model
+        expect(conn.maxPayloadSize, 1011);
+      },
+    );
+
+    test('platform seeds maxPayloadSize onto new transports', () async {
+      fake.transportMaxPayloadSize = 990;
+      final conn = await bt.connect(FakeBluetoothRfcommPlatform.sampleDevice());
+      expect(conn.maxPayloadSize, 990);
+    });
+
+    test('pendingWriteBytes tracks add and drains on flush', () async {
+      final (conn, transport) = await open();
+      expect(conn.pendingWriteBytes, 0);
+      conn.add(Uint8List.fromList([1, 2, 3]));
+      conn.add(Uint8List.fromList([4, 5]));
+      expect(conn.pendingWriteBytes, 5);
+      expect(transport.pendingWriteBytes, 5);
+      await conn.flush();
+      expect(conn.pendingWriteBytes, 0);
+    });
+
+    test('drain() with an empty queue completes immediately', () async {
+      final (conn, transport) = await open();
+      await conn.drain();
+      expect(transport.flushCount, 0); // no work, no flush
+    });
+
+    test('drain() uses flush where flush is exact (poll-free)', () async {
+      final (conn, transport) = await open();
+      conn.add(Uint8List.fromList(List.filled(100, 0)));
+      await conn.drain();
+      expect(conn.pendingWriteBytes, 0);
+      expect(transport.flushCount, 1);
+    });
+
+    test(
+      'drain() polls where flush is best-effort (macOS/iOS model)',
+      () async {
+        final (conn, transport) = await open();
+        transport.flushDrains = false; // flush resolves without draining
+        conn.add(Uint8List.fromList(List.filled(10, 0)));
+        final drained = conn.drain();
+        // Simulate the OS draining the native queue a moment later.
+        Future<void>.delayed(const Duration(milliseconds: 20), () {
+          transport.pendingWriteBytes = 0;
+        });
+        await drained;
+        expect(conn.pendingWriteBytes, 0);
+      },
+    );
+
+    test(
+      'drain(belowBytes:) completes once the queue dips below the cap',
+      () async {
+        final (conn, transport) = await open();
+        transport.pendingWriteBytes = 1000;
+        final drained = conn.drain(belowBytes: 256);
+        Future<void>.delayed(const Duration(milliseconds: 15), () {
+          transport.pendingWriteBytes = 600; // not enough yet
+        });
+        Future<void>.delayed(const Duration(milliseconds: 30), () {
+          transport.pendingWriteBytes = 200; // below the cap
+        });
+        await drained;
+        expect(transport.pendingWriteBytes, lessThanOrEqualTo(256));
+        expect(transport.flushCount, 0); // belowBytes > 0 never flushes
+      },
+    );
+
+    test('drain() rejects a negative belowBytes', () async {
+      final (conn, _) = await open();
+      expect(() => conn.drain(belowBytes: -1), throwsRangeError);
+    });
+
+    test(
+      'drain() throws when the peer drops with bytes still queued',
+      () async {
+        final (conn, transport) = await open();
+        transport.flushDrains = false;
+        conn.add(Uint8List.fromList([1, 2, 3]));
+        final drained = conn.drain();
+        transport.dropPeer();
+        await expectLater(drained, throwsA(isA<BluetoothWriteException>()));
+      },
+    );
+
+    test('drain() throws when close() discards queued bytes', () async {
+      final (conn, transport) = await open();
+      transport.pendingWriteBytes = 42;
+      final drained = conn.drain(belowBytes: 10);
+      await conn.close(); // discards, does not flush
+      await expectLater(drained, throwsA(isA<BluetoothWriteException>()));
+    });
+
+    test('drain() after disconnect completes if the condition holds', () async {
+      final (conn, _) = await open();
+      await conn.finish(); // flushes: queue empty
+      await conn.drain(); // must not throw or hang
+    });
+  });
+
   test('every API is crash-free after the peer drops', () async {
     final (conn, transport) = await open();
     transport.dropPeer();

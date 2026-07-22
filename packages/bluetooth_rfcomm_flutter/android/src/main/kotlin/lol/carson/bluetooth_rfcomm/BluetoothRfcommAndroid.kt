@@ -47,6 +47,16 @@ object BluetoothRfcommAndroid {
     // One single-threaded executor PER socket: writes to a given socket are never
     // reordered, and a stalled write on one socket can't block writes to others.
     private val writeExecutors = ConcurrentHashMap<Long, java.util.concurrent.ExecutorService>()
+    // Bytes submitted to a socket's write executor and not yet written (or
+    // failed): incremented at enqueue, decremented when the task finishes.
+    // Read by pendingBytes() for the Dart-side pendingWriteBytes getter.
+    private val pendingWrite = ConcurrentHashMap<Long, AtomicLong>()
+    // Set once ANY executor write on the socket has failed. From that moment
+    // the stream has a hole, so write() fail-fasts and flush() reports the
+    // loss (-1) instead of pretending the drain succeeded — the failure also
+    // closes the socket, which unblocks the read loop into its disconnect
+    // report, so callers always learn the link is gone.
+    private val writeFailed = ConcurrentHashMap<Long, Boolean>()
 
     // Implemented in the C shim (registered via RegisterNatives).
     @JvmStatic external fun nativeOnFound(token: Long, json: String)
@@ -236,6 +246,7 @@ object BluetoothRfcommAndroid {
             socket.connect()
             val handle = nextHandle.getAndIncrement()
             sockets[handle] = socket
+            pendingWrite[handle] = AtomicLong(0)
             writeExecutors[handle] = Executors.newSingleThreadExecutor { r ->
                 Thread(r, "btc-write-$handle").apply { isDaemon = true }
             }
@@ -270,26 +281,65 @@ object BluetoothRfcommAndroid {
     fun write(handle: Long, data: ByteArray): Int {
         val socket = sockets[handle] ?: return -1
         val exec = writeExecutors[handle] ?: return -1
+        // A previous write already failed: the byte stream has a hole, so no
+        // later message may be transmitted (or silently swallowed). Fail fast;
+        // the read loop's disconnect is already on its way.
+        if (writeFailed[handle] == true) return -1
+        val pending = pendingWrite[handle]
+        pending?.addAndGet(data.size.toLong())
         try {
             exec.execute {
                 try {
                     socket.outputStream.write(data)
                     socket.outputStream.flush()
                 } catch (_: Throwable) {
-                    // A failed write means the link is dead. Close the socket so
-                    // the read loop unblocks and reports disconnect, instead of
-                    // silently black-holing further writes.
+                    // A failed write means the link is dead. Mark the handle
+                    // failed (write() fail-fasts, flush() reports the loss)
+                    // and close the socket so the read loop unblocks and
+                    // reports disconnect, instead of silently black-holing
+                    // further writes.
+                    writeFailed[handle] = true
                     try {
                         socket.close()
                     } catch (_: Throwable) {
                     }
+                } finally {
+                    pending?.addAndGet(-data.size.toLong())
                 }
             }
         } catch (_: java.util.concurrent.RejectedExecutionException) {
+            pending?.addAndGet(-data.size.toLong())
             return -1 // executor already shut down (closed)
         }
         return 0
     }
+
+    /**
+     * OS-advertised maximum single-write payload for the socket
+     * (BluetoothSocket.getMaxTransmitPacketSize, API 23+). Returns -1 when the
+     * handle is unknown or the value is unavailable.
+     */
+    @JvmStatic
+    fun maxTxSize(handle: Long): Int {
+        val socket = sockets[handle] ?: return -1
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                socket.maxTransmitPacketSize
+            } else {
+                -1
+            }
+        } catch (t: Throwable) {
+            -1
+        }
+    }
+
+    /**
+     * Bytes submitted to the socket's write executor and not yet handed to the
+     * socket (exact — maintained by an AtomicLong around each write task).
+     * Returns 0 for an unknown/closed handle.
+     */
+    @JvmStatic
+    fun pendingBytes(handle: Long): Long = pendingWrite[handle]?.get() ?: 0L
 
     /**
      * Drains the per-socket write queue: submits a marker task to the write
@@ -302,7 +352,9 @@ object BluetoothRfcommAndroid {
         val exec = writeExecutors[handle] ?: return -1
         return try {
             exec.submit(Runnable {}).get(10, java.util.concurrent.TimeUnit.SECONDS)
-            0
+            // The marker draining is not enough: if any earlier write FAILED,
+            // bytes were lost — flush must report that, not a clean drain.
+            if (writeFailed[handle] == true) -1 else 0
         } catch (t: Throwable) {
             -1 // shut down (closed), interrupted, or timed out
         }
@@ -312,6 +364,8 @@ object BluetoothRfcommAndroid {
     fun close(handle: Long): Int {
         val socket = sockets.remove(handle)
         writeExecutors.remove(handle)?.shutdownNow()
+        pendingWrite.remove(handle)
+        writeFailed.remove(handle)
         if (socket == null) return 0
         try {
             socket.close()
@@ -344,6 +398,8 @@ object BluetoothRfcommAndroid {
             for (exec in writeExecutors.values) exec.shutdownNow()
             writeExecutors.clear()
             sockets.clear()
+            pendingWrite.clear()
+            writeFailed.clear()
         }
         return 0
     }

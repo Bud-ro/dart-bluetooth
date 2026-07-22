@@ -13,7 +13,9 @@ import 'platform/platform_interface.dart';
 ///
 /// Obtain one from [BluetoothRfcomm.connect]. Read with [input] and write with
 /// [add] (fire-and-forget, never blocks) or [write] (awaits the OS accepting the
-/// bytes). [input] closes cleanly when the peer disconnects.
+/// bytes). [input] closes cleanly when the peer disconnects. For bulk sending,
+/// pace against the outbound queue with [pendingWriteBytes]/[drain] — the
+/// queue is unbounded and never silently drops accepted bytes.
 ///
 /// A connection is **single-use**: once it drops or you [disconnect]/[close]/
 /// [finish] it, it can't be reopened — call [BluetoothRfcomm.connect] again for
@@ -93,13 +95,27 @@ class BluetoothConnection {
   bool get isConnected => _state == ConnectionState.connected;
 
   /// Queues [data] for transmission and returns immediately — it never blocks
-  /// the caller (bytes drain on a background isolate/thread). The queue is
-  /// unbounded, so for sustained bulk writes against a slow link pace yourself
-  /// with [write]/[flush] rather than calling [add] in a tight loop. Fine for
-  /// the small, low-rate frames typical of RFCOMM serial.
+  /// the caller (bytes drain on a background isolate/thread).
+  ///
+  /// The queue between [add] and the OS is **unbounded and lossless**: every
+  /// byte accepted here is either delivered to the OS or reported as lost
+  /// (via [flush]/[drain]/the terminal disconnect) — this package never
+  /// silently drops accepted bytes. The flip side is that nothing stops *you*
+  /// from queueing faster than the link drains, which only grows memory.
+  /// Pick the pacing that fits the traffic:
+  ///
+  ///  * **Small, occasional frames** (commands, telemetry ticks): plain [add],
+  ///    fire-and-forget.
+  ///  * **Request/response**: `await write(frame)` per message, so each frame
+  ///    reaches the OS before you send the next.
+  ///  * **Bulk transfer**: window it — [add] chunks while
+  ///    [pendingWriteBytes] is below a cap, then `await drain(belowBytes: …)`.
+  ///
   /// Empty payloads are ignored. Throws [BluetoothWriteException] if [data]
   /// exceeds the platform's 32-bit length limit, or if the connection is already
   /// closed / has dropped (check [isConnected] if you need to avoid that).
+  /// Payloads larger than [maxPayloadSize] are fine — transports split them
+  /// into OS-sized writes; the limit is per *native write*, not per [add].
   void add(Uint8List data) {
     if (data.isEmpty) return;
     if (data.length > 0x7fffffff) {
@@ -118,14 +134,75 @@ class BluetoothConnection {
   /// throws [BluetoothWriteException] where the platform can tell that queued
   /// bytes were lost to a dead link (Windows, Linux, Android). On macOS and
   /// iOS this is best-effort: bytes are queued to the native layer and there
-  /// is no drain acknowledgement, so flush resolves immediately.
+  /// is no drain acknowledgement, so flush resolves immediately — use [drain]
+  /// there when you need the queue verifiably empty ([pendingWriteBytes] is
+  /// accurate on every platform).
   Future<void> flush() => _transport.flush();
 
-  /// Convenience: [add] then [flush].
+  /// Convenience: [add] then [flush] — the natural request/response rhythm
+  /// (`await conn.write(request)` then read the reply from [input]). Awaiting
+  /// each write also self-paces a sender to the link's real speed on the
+  /// platforms where [flush] is exact.
   Future<void> write(Uint8List data) {
     add(data);
     return flush();
   }
+
+  /// OS-advertised largest single *native* write payload (RFCOMM MTU on
+  /// macOS, max transmit packet size on Android); null where the OS exposes
+  /// none (Windows/Linux stream sockets, iOS EA).
+  ///
+  /// This is a frame *size*, not a data *rate* — Bluetooth Classic advertises
+  /// no throughput number anywhere (see the README's "Backpressure and
+  /// throughput" section). You never have to chunk to it ([add] takes any
+  /// size); it is informational, e.g. for sizing protocol frames so each fits
+  /// one RFCOMM packet.
+  int? get maxPayloadSize => _transport.maxPayloadSize;
+
+  /// Bytes accepted by [add]/[write] but not yet handed to the OS — the
+  /// current depth of the unbounded outbound queue. 0 means fully drained.
+  ///
+  /// Poll it to window bulk transfers (see [drain]) or to surface a
+  /// "sending…" indicator; it is accurate on every platform.
+  int get pendingWriteBytes => _transport.pendingWriteBytes;
+
+  /// Completes once [pendingWriteBytes] is at or below [belowBytes] — the
+  /// awaitable form of the queue-depth check, for windowed bulk sending:
+  /// [add] chunks until the queue holds a window's worth, then
+  /// `await drain(belowBytes: window ~/ 2)` before adding more.
+  ///
+  /// With the default `belowBytes: 0` this resolves when the queue is fully
+  /// drained; where [flush] is exact (Windows, Linux, Android) that case is
+  /// poll-free and precise. Otherwise the queue is polled every few
+  /// milliseconds, so completion can lag the condition by one poll interval
+  /// (~5 ms) — ample for pacing, not for hard real-time.
+  ///
+  /// Throws [BluetoothWriteException] if the connection drops (or [close]
+  /// discards the queue) while more than [belowBytes] bytes remain — queued
+  /// bytes were lost, and per this package's no-silent-drop contract that is
+  /// always reported. Completes normally, without waiting, whenever the
+  /// condition already holds — even after disconnect.
+  Future<void> drain({int belowBytes = 0}) async {
+    RangeError.checkNotNegative(belowBytes, 'belowBytes');
+    while (true) {
+      final pending = _transport.pendingWriteBytes;
+      if (pending <= belowBytes) return;
+      if (_state == ConnectionState.disconnected) {
+        throw BluetoothWriteException(
+          'connection closed with $pending bytes undelivered',
+        );
+      }
+      if (belowBytes == 0) {
+        // Poll-free where the platform acknowledges drains; on macOS/iOS
+        // flush resolves immediately and we fall through to the poll.
+        await flush();
+        if (_transport.pendingWriteBytes == 0) return;
+      }
+      await Future<void>.delayed(_drainPollInterval);
+    }
+  }
+
+  static const Duration _drainPollInterval = Duration(milliseconds: 5);
 
   /// Closes immediately, discarding anything not yet flushed.
   ///

@@ -425,6 +425,10 @@ class _AndroidTransport implements RfcommTransport {
       return false;
     }
     _handle = handle;
+    // Fetched ONCE at bind (a sync JNI hop) — it is fixed for the socket's
+    // lifetime, so the getter never pays the native call again.
+    final mtu = _lib.maxTx(handle);
+    _maxPayload = mtu > 0 ? mtu : null;
     _current = ConnectionState.connected;
     if (!_state.isClosed) _state.add(ConnectionState.connected);
     return true;
@@ -448,6 +452,25 @@ class _AndroidTransport implements RfcommTransport {
 
   @override
   ConnectionState get state => _current;
+
+  int? _maxPayload;
+
+  /// OS-advertised max single-write payload
+  /// (`BluetoothSocket.getMaxTransmitPacketSize`), fetched once after connect;
+  /// null when the OS doesn't report one (pre-API-23, or an older native lib).
+  @override
+  int? get maxPayloadSize => _maxPayload;
+
+  /// Bytes accepted by [send] but not yet handed to the socket: read straight
+  /// from the Kotlin per-socket AtomicLong (incremented at enqueue, decremented
+  /// when the executor write task finishes), so it is exact — the cost is one
+  /// sync JNI call per read. Returns 0 once closed.
+  @override
+  int get pendingWriteBytes {
+    if (_closed || _handle == 0) return 0;
+    final n = _lib.pendingBytes(_handle);
+    return n > 0 ? n : 0;
+  }
 
   @override
   void send(Uint8List data) {

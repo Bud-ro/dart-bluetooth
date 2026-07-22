@@ -16,6 +16,15 @@ import '../../models/uuid.dart';
 import '../platform_interface.dart';
 import 'ios_bindings.dart';
 
+// Additive binding for the transport-introspection C export. Declared here
+// (with an explicit assetId matching ios_bindings.dart's @DefaultAsset) rather
+// than in the shared bindings file to keep that file's surface stable.
+@ffi.Native<ffi.Int64 Function(ffi.Int64)>(
+  symbol: 'btc_ea_pending',
+  assetId: 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart',
+)
+external int _btcEaPending(int handle);
+
 /// iOS backend over ExternalAccessory (EASession).
 ///
 /// Only MFi accessories appear here — see the note in the C header. For a
@@ -275,6 +284,16 @@ class _IosEaTransport implements RfcommTransport {
   @override
   ConnectionState get state => _current;
 
+  /// ExternalAccessory streams advertise no per-write payload limit.
+  @override
+  int? get maxPayloadSize => null;
+
+  /// Bytes accepted by [send] but not yet written to the accessory's output
+  /// stream (the native outBuffer backlog).
+  @override
+  int get pendingWriteBytes =>
+      (_closed || _handle == 0) ? 0 : _btcEaPending(_handle);
+
   @override
   void send(Uint8List data) {
     if (_closed || _handle == 0) {
@@ -291,7 +310,12 @@ class _IosEaTransport implements RfcommTransport {
   }
 
   @override
-  Future<void> flush() async {}
+  Future<void> flush() async {
+    // Drain the native outBuffer. Bounded: closing the session clears it.
+    while (!_closed && _handle != 0 && _btcEaPending(_handle) > 0) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+  }
 
   @override
   Future<void> close() async {

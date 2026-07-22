@@ -18,6 +18,10 @@ New:
   even after the link already dropped.
 - Logging conveniences: `BluetoothRfcommLoggers.root` / `.loggers` /
   `.setLevel(...)` for one-call control of the package's logger hierarchy.
+- Backpressure surface: `maxPayloadSize` (the OS-advertised max single-write
+  payload — the most any OS reports; Bluetooth Classic has no baud rate to
+  advertise), `pendingWriteBytes`, and `drain({belowBytes})` for windowed
+  bulk pacing. See the README's "Backpressure and throughput" section.
 
 Changed:
 
@@ -33,7 +37,14 @@ Fixed — two adversarial review passes over the whole stack; highlights:
 - Disconnects always bubble up, and every API is safe to call after one:
   writes fail with `BluetoothWriteException`, teardown is idempotent, and
   `flush()` reports lost bytes honestly (Windows previously acked success on
-  a dead link).
+  a dead link; Android could report a clean flush after a failed write).
+- Sending is now lossless under load on every platform: transient write
+  errors (buffer-full, credit stalls, sniff-mode wakes) retry with backoff
+  instead of dropping bytes or tearing the connection down. The macOS write
+  path was rebuilt — writes no longer block the shared event thread (which
+  stalled inbound data and made 100ms-cadence traffic look like dropped
+  messages), flow-control callbacks resume stalled writes immediately, and a
+  transient error no longer wipes the queue.
 - macOS: a stopped inquiry now completes its stream (the "list devices twice"
   bug); sightings report real paired state; writes moved off the worker run
   loop; SDP queries the device when nothing is cached.

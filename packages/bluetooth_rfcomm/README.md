@@ -153,9 +153,14 @@ so reconnect by calling `connect` again.
 `BluetoothConnection`:
 
 - `input` — `Stream<Uint8List>`; closes on disconnect (clean EOF)
-- `add(bytes)` — synchronous, never blocks (drained off the calling isolate)
+- `add(bytes)` — synchronous, never blocks (drained off the calling isolate);
+  the outbound queue is unbounded and **never silently drops accepted bytes**
 - `write(bytes)` (= `add` + `flush`); `flush()` awaits the OS accepting queued
-  bytes on Windows/Linux and is best-effort on macOS/iOS/Android
+  bytes on Windows/Linux/Android and is best-effort on macOS/iOS
+- `pendingWriteBytes` — bytes accepted but not yet handed to the OS;
+  `drain({belowBytes})` — awaits the queue dipping to that depth;
+  `maxPayloadSize` — the OS-advertised max single-write payload, or null (see
+  [Backpressure and throughput](#backpressure-and-throughput))
 - `stateChanges`, `state`, `isConnected`
 - `disconnect()` (= `finish()`: flush then close) / `close()` (immediate,
   discards unflushed bytes)
@@ -177,6 +182,64 @@ works at all (it rejects channel 0):
 final services = await bt.discoverServices(device);   // inspect SDP
 final conn = await bt.connect(device, channel: 1);     // or force a channel
 ```
+
+### Backpressure and throughput
+
+**The contract: bytes you hand to `add` are never silently dropped.** The queue
+between `add` and the OS is unbounded and lossless — every accepted byte is
+either delivered to the OS or *loudly* reported lost (a
+`BluetoothWriteException` from `flush`/`drain`, or the terminal disconnect).
+The flip side of an unbounded queue is that nothing stops you from queueing
+faster than the link drains; the fix is not a bigger buffer somewhere, it's
+pacing with the async primitives:
+
+- **Small, occasional frames** (commands, telemetry): `conn.add(frame)`,
+  fire-and-forget.
+- **Request/response**: `await conn.write(request)` per message — each frame
+  reaches the OS before the next is sent.
+- **Bulk transfer**: window it against `pendingWriteBytes` with `drain`:
+
+```dart
+// Send a large payload without ever holding more than ~64 KiB in the queue.
+const window = 64 * 1024;
+const chunkSize = 4 * 1024;
+for (var off = 0; off < payload.length; off += chunkSize) {
+  final end = (off + chunkSize < payload.length) ? off + chunkSize : payload.length;
+  conn.add(Uint8List.sublistView(payload, off, end));
+  if (conn.pendingWriteBytes >= window) {
+    await conn.drain(belowBytes: window ~/ 2); // let the link catch up
+  }
+}
+await conn.drain(); // fully handed to the OS (throws if the link died first)
+```
+
+`drain(belowBytes: 0)` is exact and poll-free on Windows/Linux/Android (it
+rides `flush`); elsewhere, and for `belowBytes > 0`, the queue is polled every
+~5 ms — plenty precise for pacing.
+
+**Why is there no `bitsPerSecond`?** Unlike a UART, Bluetooth Classic
+advertises **no throughput number anywhere** — no OS API reports a data rate
+for an RFCOMM link. The radio renegotiates packet types with link quality, the
+link may sit in sniff (power-save) mode, RFCOMM's own credit-based flow
+control lets the *peer* throttle you, and the bandwidth is shared with every
+other connection on the adapter. Any number this package invented would be a
+measurement, not a capability — so it doesn't invent one. What the OS *does*
+advertise is at most a maximum size for a single outgoing packet, exposed
+verbatim as `maxPayloadSize`:
+
+| Platform | `maxPayloadSize` | OS source |
+| --- | --- | --- |
+| macOS | RFCOMM frame payload size (typically ≤ 1011 B) | `IOBluetoothRFCOMMChannel getMTU` |
+| Android | max outgoing packet size | `BluetoothSocket.getMaxTransmitPacketSize()` |
+| Windows | `null` — stream socket, nothing advertised per link | (`SO_SNDBUF` is buffer capacity, not a rate) |
+| Linux | `null` — BlueZ profile fd, nothing advertised | — |
+| iOS | `null` — ExternalAccessory streams | — |
+
+That's a frame *size*, not a rate — useful for sizing protocol frames so each
+fits one RFCOMM packet, nothing more. You never have to chunk to it: `add`
+accepts any size and transports split as needed. To observe actual throughput,
+measure it yourself: watch `pendingWriteBytes` fall over time. Design details
+in [doc/backpressure.md](doc/backpressure.md).
 
 ### Errors
 

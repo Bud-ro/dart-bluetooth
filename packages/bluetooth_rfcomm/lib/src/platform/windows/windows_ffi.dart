@@ -40,6 +40,7 @@ bool isFatalWsaSendError(int wsa) =>
 // setsockopt(SOL_SOCKET, SO_RCVTIMEO) — bounds how long recv() blocks (DWORD ms).
 const int solSocket = 0xffff; // SOL_SOCKET
 const int soRcvTimeo = 0x1006; // SO_RCVTIMEO
+const int soSndBuf = 0x1001; // SO_SNDBUF (OS send-buffer size, DWORD bytes)
 
 // --- WSALookupService (device inquiry) constants ------------------------------
 

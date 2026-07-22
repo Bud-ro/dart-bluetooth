@@ -72,6 +72,25 @@ class AndroidBindings {
         .lookupFunction<ffi.Int32 Function(ffi.Int64), int Function(int)>(
           'btc_and_flush',
         );
+    // Optional symbols (added in 0.2.0): tolerate an older .so — a version
+    // skew between the Dart package and the bundled native library must not
+    // take down the whole backend, only degrade these two getters.
+    try {
+      maxTx = _lib
+          .lookupFunction<ffi.Int32 Function(ffi.Int64), int Function(int)>(
+            'btc_and_max_tx',
+          );
+    } on ArgumentError {
+      maxTx = (_) => -1;
+    }
+    try {
+      pendingBytes = _lib
+          .lookupFunction<ffi.Int64 Function(ffi.Int64), int Function(int)>(
+            'btc_and_pending_bytes',
+          );
+    } on ArgumentError {
+      pendingBytes = (_) => 0;
+    }
     close = _lib
         .lookupFunction<ffi.Int32 Function(ffi.Int64), int Function(int)>(
           'btc_and_close',
@@ -112,8 +131,17 @@ class AndroidBindings {
 
   /// Blocks until every write queued before the call has been handed to the
   /// socket (bounded at 10s natively). Returns 0 on success, -1 on
-  /// timeout/closed/unknown handle.
+  /// timeout/closed/unknown handle, or when any earlier queued write failed
+  /// (bytes were lost — the drain must not report success).
   late final int Function(int) flush;
+
+  /// OS-advertised max single-write payload
+  /// (`BluetoothSocket.getMaxTransmitPacketSize`, API 23+); <= 0 = unknown.
+  late final int Function(int) maxTx;
+
+  /// Bytes submitted to the handle's write executor and not yet handed to the
+  /// socket (exact; 0 for unknown/closed handles).
+  late final int Function(int) pendingBytes;
   late final int Function(int) close;
 
   /// Quiesces every native event source (read loops, discovery receiver) so

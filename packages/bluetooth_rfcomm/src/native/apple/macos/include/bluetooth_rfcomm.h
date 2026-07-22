@@ -71,9 +71,23 @@ int32_t btc_stop_discovery(void);
 int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
                         const char *uuid, btc_data_cb data, btc_state_cb state);
 
-// Queues `len` bytes for transmission on `handle`. Returns 0 on success.
-// Non-blocking: the write is dispatched to the worker thread.
+// Queues `len` bytes for transmission on `handle`. Returns 0 on success, -1 if
+// the handle is unknown/closed (the payload is NOT silently dropped — callers
+// must surface the error), -2 if the buffered backlog cap (4 MiB) would be
+// exceeded. Non-blocking: bytes are drained via writeAsync on the worker
+// thread; transient write errors (no credits / queue full / sniff-mode wake)
+// are retried with bounded backoff and never tear the connection down.
 int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len);
+
+// The RFCOMM channel MTU (largest single write payload) negotiated for
+// `handle`, cached when the channel finished opening. Returns 0 if unknown or
+// the handle is closed.
+int32_t btc_rfcomm_mtu(int64_t handle);
+
+// Bytes accepted by btc_rfcomm_write for `handle` but not yet handed to the OS
+// (the in-flight chunk already passed to writeAsync is excluded). 0 for an
+// unknown/closed handle.
+int64_t btc_rfcomm_pending(int64_t handle);
 
 // Closes `handle`. Returns 0 on success.
 int32_t btc_rfcomm_close(int64_t handle);

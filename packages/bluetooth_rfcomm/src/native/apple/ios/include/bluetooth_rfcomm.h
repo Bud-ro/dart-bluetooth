@@ -37,6 +37,10 @@ int64_t btc_ea_open(int64_t token, const char *accessory_id,
 // handle, or the buffered backlog cap — 1 MiB — would be exceeded).
 int32_t btc_ea_write(int64_t handle, const uint8_t *data, int32_t len);
 
+// Bytes accepted by btc_ea_write for `handle` but not yet written to the
+// output stream (the outBuffer backlog). 0 for an unknown/closed handle.
+int64_t btc_ea_pending(int64_t handle);
+
 // Closes the session. Returns 0 on success.
 int32_t btc_ea_close(int64_t handle);
 

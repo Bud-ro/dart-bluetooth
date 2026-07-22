@@ -956,6 +956,29 @@ void _recvEntry(List<Object?> args) {
 // Writer-isolate exit notification (sent before wsaCleanup so close() knows
 // the writer will never touch the socket again).
 const String _evtWriterExit = 'writer-exit';
+// Writer-isolate consumed-bytes report: {'event': ..., 'total': cumulative}.
+const String _evtConsumed = 'writer-consumed';
+
+/// SO_SNDBUF asked of the OS for the RFCOMM socket (best-effort). A roomier OS
+/// send buffer lets the writer's blocking `send()` return as soon as the bytes
+/// are queued instead of stalling on a slow link, and makes transient
+/// WSAENOBUFS far less likely under bursty traffic.
+const int _sendBufBytes = 256 * 1024;
+
+/// Bounded retry policy for TRANSIENT send errors (WSAENOBUFS, a clobbered
+/// last-error, …): retry the REMAINDER of the message — never skip bytes —
+/// up to [_maxSendRetries] times, [_sendRetryDelay] apart (~500ms total).
+/// Exhaustion escalates to disconnect; a hole in the stream is never an option.
+const int _maxSendRetries = 100;
+const Duration _sendRetryDelay = Duration(milliseconds: 5);
+
+/// Consumed-report granularity: the writer tells the main isolate how many
+/// bytes it has handed to the OS at most every [_consumedReportBytes] bytes or
+/// [_consumedReportMs] ms (whichever comes first, and only when there is
+/// something unreported) — so `pendingWriteBytes` lags reality by at most that
+/// much while staying O(1) per message.
+const int _consumedReportBytes = 16 * 1024;
+const int _consumedReportMs = 25;
 
 void _writeEntry(List<Object?> args) {
   final socket = args[0] as int;
@@ -963,17 +986,50 @@ void _writeEntry(List<Object?> args) {
   // This isolate calls send(), so it needs its own WSAStartup (Winsock init does
   // not carry across Dart isolates); balanced by the wsaCleanup on shutdown.
   final ws = WinsockBindings()..startup();
+  // Best-effort SO_SNDBUF sizing (see _sendBufBytes). Failure is harmless —
+  // the stack keeps its default.
+  final opt = calloc<ffi.Uint8>(4);
+  opt.cast<ffi.Uint32>().value = _sendBufBytes;
+  ws.setsockopt(socket, solSocket, soSndBuf, opt, 4);
+  calloc.free(opt);
   final rp = ReceivePort();
   mainPort.send(rp.sendPort);
-  // First FATAL send error seen; acked back on flush so flush()/write() can
-  // fail honestly instead of resolving on a dead link (Linux parity).
+  // Reusable grow-only staging buffer: one allocation amortized over the whole
+  // connection instead of a calloc/free per message.
+  var bufCap = 8192;
+  var buf = calloc<ffi.Uint8>(bufCap);
+  // First send error that lost bytes; acked back on flush so flush()/write()
+  // can fail honestly instead of resolving on a dead link (Linux parity).
+  // Once set the writer sends NOTHING further: after losing part of message N,
+  // transmitting message N+1 would put a silent hole in a reliable stream.
   var fatalWsa = 0;
+  // Cumulative bytes consumed (handed to the OS, or dropped after the link
+  // died — the transport is closing then anyway) for pendingWriteBytes.
+  var consumedTotal = 0;
+  var unreportedConsumed = 0;
+  final reportGap = Stopwatch()..start();
+  void reportConsumed({bool force = false}) {
+    if (unreportedConsumed == 0) return;
+    if (!force &&
+        unreportedConsumed < _consumedReportBytes &&
+        reportGap.elapsedMilliseconds < _consumedReportMs) {
+      return;
+    }
+    mainPort.send(<String, Object>{
+      'event': _evtConsumed,
+      'total': consumedTotal,
+    });
+    unreportedConsumed = 0;
+    reportGap.reset();
+  }
+
   rp.listen((msg) {
     if (msg == null) {
       // Announce exit BEFORE cleanup: after this message the writer will never
       // touch the socket again, so close() may safely closesocket.
       mainPort.send(<String, Object>{'event': _evtWriterExit});
       rp.close();
+      calloc.free(buf);
       ws.wsaCleanup(); // balance this isolate's WSAStartup on shutdown
       return;
     }
@@ -982,53 +1038,87 @@ void _writeEntry(List<Object?> args) {
     final ack = rec[1] as SendPort?;
     if (data != null) {
       final bytes = data.materialize().asUint8List();
-      // DIAGNOSTICS: time the blocking send() and capture any error code. A slow
-      // send is the signature of the link waking from sniff (low-power) mode; an
-      // error code is the writer-side view of the rare disconnect. Report back to
-      // the main isolate only when notable (slow or failed) to limit noise.
-      final sw = Stopwatch()..start();
-      final err = _sendAll(ws, socket, bytes);
-      sw.stop();
-      if (err != 0 && fatalWsa == 0 && isFatalWsaSendError(err)) {
-        fatalWsa = err;
+      if (fatalWsa != 0) {
+        // Link already failed mid-stream — never transmit past a hole. Count
+        // the bytes consumed so pendingWriteBytes drains while the transport
+        // tears down (close() discards unflushed bytes by contract).
+        consumedTotal += bytes.length;
+        unreportedConsumed += bytes.length;
+      } else {
+        if (bytes.length > bufCap) {
+          calloc.free(buf);
+          bufCap = bytes.length * 2;
+          buf = calloc<ffi.Uint8>(bufCap);
+        }
+        buf.asTypedList(bytes.length).setAll(0, bytes);
+        // DIAGNOSTICS: time the blocking send() and capture any error code. A
+        // slow send is the signature of the link waking from sniff (low-power)
+        // mode; an error code is the writer-side view of the rare disconnect.
+        // Report back to the main isolate only when notable (slow or failed).
+        final sw = Stopwatch()..start();
+        final err = _sendAll(ws, socket, buf, bytes.length);
+        sw.stop();
+        consumedTotal += bytes.length;
+        unreportedConsumed += bytes.length;
+        if (err != 0) {
+          // _sendAll already retried transient errors; any error here means
+          // bytes may be missing from the stream — the link is done for.
+          fatalWsa = err;
+          mainPort.send(<String, int>{
+            'bytes': bytes.length,
+            'ms': sw.elapsedMilliseconds,
+            'wsa': err,
+          });
+        } else if (sw.elapsedMilliseconds > 50) {
+          mainPort.send(<String, int>{
+            'bytes': bytes.length,
+            'ms': sw.elapsedMilliseconds,
+            'wsa': 0,
+          });
+        }
       }
-      if (err != 0 || sw.elapsedMilliseconds > 50) {
-        mainPort.send(<String, int>{
-          'bytes': bytes.length,
-          'ms': sw.elapsedMilliseconds,
-          'wsa': err,
-        });
-      }
+      reportConsumed();
     }
-    // The flush ack carries the first fatal error (0 = all bytes handed to the
-    // OS), so a flush after a failed send reports the loss.
-    ack?.send(fatalWsa);
+    // The flush ack carries the first byte-losing error (0 = every byte handed
+    // to the OS) plus the up-to-date consumed total, so a flush after a failed
+    // send reports the loss and pendingWriteBytes is exact after a flush.
+    ack?.send(<int>[fatalWsa, consumedTotal]);
   });
 }
 
-/// Sends [bytes] fully. Returns 0 on success, or the WSA error code (or -1 if
-/// `WSAGetLastError()` was 0) when `send` failed before all bytes went out.
-int _sendAll(WinsockBindings ws, int socket, Uint8List bytes) {
-  final ptr = calloc<ffi.Uint8>(bytes.length);
-  try {
-    ptr.asTypedList(bytes.length).setAll(0, bytes);
-    var offset = 0;
-    while (offset < bytes.length) {
-      final n = ws.send(
-        socket,
-        ptr + offset,
-        bytes.length - offset,
-        _sendChunkFlags,
-      );
-      if (n == socketError || n <= 0) {
-        return _wsaError(ws.wsaGetLastError()); // peer gone / error
-      }
+/// Sends [len] bytes of [buf] fully. Returns 0 only when EVERY byte was handed
+/// to the OS; otherwise the WSA error code (or -1 if `WSAGetLastError()` was 0).
+///
+/// Never skips bytes: a fatal error (connection dead) returns immediately, and
+/// a transient one (WSAENOBUFS, clobbered last-error, …) retries the REMAINDER
+/// under the bounded [_maxSendRetries]/[_sendRetryDelay] policy — so a nonzero
+/// return always means "this stream can no longer be trusted", which the writer
+/// escalates to disconnect. A transient blip mid-message therefore either heals
+/// invisibly or kills the link; it can never silently drop a message while
+/// later ones keep flowing.
+int _sendAll(
+  WinsockBindings ws,
+  int socket,
+  ffi.Pointer<ffi.Uint8> buf,
+  int len,
+) {
+  var offset = 0;
+  var retries = 0;
+  while (offset < len) {
+    final n = ws.send(socket, buf + offset, len - offset, _sendChunkFlags);
+    if (n > 0) {
       offset += n;
+      retries = 0; // progress resets the retry budget
+      continue;
     }
-    return 0;
-  } finally {
-    calloc.free(ptr);
+    final err = _wsaError(ws.wsaGetLastError());
+    if (isFatalWsaSendError(err)) {
+      return err; // link is dead — no point retrying
+    }
+    if (++retries > _maxSendRetries) return err; // transient but not clearing
+    sleep(_sendRetryDelay); // writer isolate only; the app isolate never blocks
   }
+  return 0;
 }
 
 /// RFCOMM transport backed by a Winsock socket, with a dedicated reader isolate
@@ -1069,6 +1159,11 @@ class _WindowsRfcommTransport implements RfcommTransport {
   /// First fatal writer-side send error (writer ack / control message), so
   /// flush() can fail honestly instead of resolving on a dead link.
   int? _fatalSendWsa;
+
+  /// Bytes accepted by [send] (counted at enqueue) and cumulative bytes the
+  /// writer has reported consumed — their difference is [pendingWriteBytes].
+  int _sendEnqueuedBytes = 0;
+  int _writerConsumedBytes = 0;
 
   // DIAGNOSTICS: time since the previous outbound send, to flag sends that follow
   // a long idle (the case where the link has dropped into sniff mode).
@@ -1143,19 +1238,25 @@ class _WindowsRfcommTransport implements RfcommTransport {
           if (!_writerExited.isCompleted) _writerExited.complete();
           return;
         }
+        if (msg['event'] == _evtConsumed) {
+          // Cumulative + monotonic, so "take the max" is race-proof against a
+          // flush ack that carried a fresher total.
+          final total = msg['total'] as int;
+          if (total > _writerConsumedBytes) _writerConsumedBytes = total;
+          return;
+        }
         final wsa = msg['wsa'] as int;
         if (wsa != 0) {
-          // A failed send is a recoverable problem -> WARNING.
           logConnection.warning(() => 'send failed: ${msg['bytes']}B wsa=$wsa');
-          // A connection-level failure code means the link is gone. Don't wait
-          // for the reader's recv() to notice (that can take the full link-
-          // supervision timeout, ~20s, when the peer just powered off) — bubble
-          // the disconnect up now. Other codes (e.g. WSAENOBUFS) may be
-          // transient, so those only log; the reader remains the backstop.
-          if (isFatalWsaSendError(wsa)) {
-            _fatalSendWsa ??= wsa;
-            _onClosedByPeer();
-          }
+          // The writer only reports a send error after its bounded transient-
+          // retry budget is exhausted (or a fatal code) — either way bytes may
+          // be missing from the stream, so EVERY reported send error escalates
+          // to disconnect. Silently resuming after a hole is never an option;
+          // and for fatal codes this also beats waiting for the reader's
+          // recv() to notice (the link-supervision timeout can be ~20s when
+          // the peer just powered off).
+          _fatalSendWsa ??= wsa;
+          _onClosedByPeer();
         } else {
           // A slow (but successful) send — link waking from sniff mode. Per-event
           // diagnostic detail -> FINER.
@@ -1192,12 +1293,31 @@ class _WindowsRfcommTransport implements RfcommTransport {
   @override
   ConnectionState get state => _current;
 
+  /// Winsock RFCOMM is a stream socket: the OS fragments writes of any size,
+  /// so there is no OS-advertised per-write payload cap to report.
+  @override
+  int? get maxPayloadSize => null;
+
+  /// Bytes accepted by [send] but not yet handed to the OS (approximate).
+  ///
+  /// Granularity: the writer isolate reports its consumed total at most every
+  /// [_consumedReportBytes] bytes / [_consumedReportMs] ms, and a [flush] ack
+  /// carries an exact total — so this can briefly OVER-state the backlog by up
+  /// to that window, never under-state it. Returns 0 once closed.
+  @override
+  int get pendingWriteBytes {
+    if (_closed) return 0;
+    final pending = _sendEnqueuedBytes - _writerConsumedBytes;
+    return pending > 0 ? pending : 0;
+  }
+
   @override
   void send(Uint8List data) {
     if (_closed) throw const BluetoothWriteException('transport closed');
     final gapMs = _txGap.elapsedMilliseconds;
     _txGap.reset();
     logConnection.finer(() => 'tx ${data.length}B (idle gap ${gapMs}ms)');
+    _sendEnqueuedBytes += data.length;
     final msg = <Object?>[
       TransferableTypedData.fromList([data]),
       null,
@@ -1229,10 +1349,17 @@ class _WindowsRfcommTransport implements RfcommTransport {
     } finally {
       ack.close();
     }
-    // The ack carries the writer's first fatal send error (0 = every byte was
-    // handed to the OS). Failing here — instead of resolving successfully on a
-    // dead link — matches the Linux backend's flush semantics.
-    final fatal = result is int && result != 0 ? result : _fatalSendWsa;
+    // The ack is [firstByteLosingWsa, consumedTotal]: 0 in the first slot means
+    // every byte was handed to the OS. Failing here — instead of resolving
+    // successfully on a dead link — matches the Linux flush semantics.
+    int? fatal;
+    if (result is List) {
+      final ackFatal = result[0] as int;
+      final total = result[1] as int;
+      if (total > _writerConsumedBytes) _writerConsumedBytes = total;
+      if (ackFatal != 0) fatal = ackFatal;
+    }
+    fatal ??= _fatalSendWsa;
     if (fatal != null && fatal != 0) {
       throw BluetoothWriteException('flush failed — link lost', code: fatal);
     }

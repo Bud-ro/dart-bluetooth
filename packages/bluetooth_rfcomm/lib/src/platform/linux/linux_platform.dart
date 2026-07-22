@@ -775,6 +775,15 @@ class _LinuxRfcommProfile implements RfcommTransport {
   ConnectionState _current = ConnectionState.connected;
   bool _closed = false;
 
+  /// Bytes handed to [send] and not yet covered by a successful [flush].
+  ///
+  /// dart:io's `Socket` hides its internal outbound buffer (there is no public
+  /// "bytes not yet written" counter), so this is tracked around flush(): it
+  /// counts every byte since the last successful flush. That makes it an UPPER
+  /// bound on the true backlog — the kernel may already have taken some of it —
+  /// exact (0) immediately after a flush resolves.
+  int _bytesSinceFlush = 0;
+
   @override
   Stream<Uint8List> get incoming => _incoming.stream;
 
@@ -784,11 +793,26 @@ class _LinuxRfcommProfile implements RfcommTransport {
   @override
   ConnectionState get state => _current;
 
+  /// BlueZ hands us a stream socket; the kernel fragments writes of any size,
+  /// so there is no OS-advertised per-write payload cap to report.
+  @override
+  int? get maxPayloadSize => null;
+
+  /// See [_bytesSinceFlush]: an upper bound on bytes accepted by [send] but
+  /// not yet handed to the OS, refreshed (to 0) by each successful [flush].
+  /// Returns 0 once closed.
+  @override
+  int get pendingWriteBytes => _closed ? 0 : _bytesSinceFlush;
+
   @override
   void send(Uint8List data) {
     if (_closed) throw const BluetoothWriteException('transport closed');
     try {
       _socket.add(data);
+      // Count only bytes the sink actually accepted. Socket.add's internal
+      // buffer is unbounded — writers pacing themselves should flush() (which
+      // applies real backpressure) or watch pendingWriteBytes.
+      _bytesSinceFlush += data.length;
     } catch (e) {
       // e.g. StateError once the socket's sink has already errored/closed.
       throw BluetoothWriteException('write failed', cause: e);
@@ -798,8 +822,13 @@ class _LinuxRfcommProfile implements RfcommTransport {
   @override
   Future<void> flush() async {
     if (_closed) return;
+    // Snapshot what THIS flush covers: sends racing in while we await are the
+    // next flush's business (Socket.flush may or may not have drained them).
+    final covered = _bytesSinceFlush;
     try {
       await _socket.flush();
+      _bytesSinceFlush -= covered;
+      if (_bytesSinceFlush < 0) _bytesSinceFlush = 0;
     } catch (e) {
       // The link died with bytes still queued (peer powered off mid-write).
       // The socket.done handler tears the transport down; report the loss to

@@ -233,11 +233,57 @@ static BTCSDPQuery *g_sdp_query = nil;
 // NSData stays queued (alive) until its rfcommChannelWriteComplete fires.
 @property(nonatomic, strong) NSMutableArray<NSData *> *writeQueue;
 @property(nonatomic) BOOL writeInFlight;
+// MTU cached at rfcommChannelOpenComplete (getMTU is only meaningful once the
+// channel is open; before that it can read 0).
+@property(nonatomic) BluetoothRFCOMMMTU mtu;
+// Set (permanently) by teardown; every queue/retry path checks it so a late
+// framework callback can never resurrect a dead channel or reschedule work.
+@property(nonatomic) BOOL tornDown;
+// Transient-write-error retry state: consecutive failed attempts for the
+// current head chunk (reset on any successful completion) and whether a
+// delayed retry is already queued on the worker run loop.
+@property(nonatomic) int retryAttempts;
+@property(nonatomic) BOOL retryScheduled;
 - (void)enqueueWrite:(NSData *)data;
+- (int64_t)pendingBytes;
 - (void)teardown;
 @end
 
 static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
+
+// Chunk-size fallback when the channel MTU cannot be read. writeAsync REJECTS
+// payloads larger than the negotiated MTU, so the fallback must sit BELOW any
+// plausible negotiation — 127 bytes is the classic RFCOMM default frame size.
+// (The old fallback of 0xFFFF guaranteed a failed write — and therefore a full
+// connection teardown — the moment getMTU misreported 0.)
+static const NSUInteger kBTCFallbackChunk = 127;
+
+// Cap on bytes buffered in a channel's writeQueue. Past this btc_rfcomm_write
+// fails (-2) instead of buffering without bound against a stalled peer.
+static const int64_t kBTCWriteBacklogCap = 4 * 1024 * 1024; // 4 MiB
+
+// Bounded budget of consecutive transient-error retries for one chunk before
+// the error is treated as fatal (~7.5 s worst case with the backoff below).
+static const int kBTCMaxWriteRetries = 10;
+
+// Transient write statuses: conditions that clear on their own once the peer
+// drains, grants RFCOMM credits, or the link wakes from sniff/low-power mode.
+// These must NOT tear down the connection (that would eat the whole queue);
+// they are retried with bounded backoff. Anything else — not-open, bad
+// argument, device gone — is genuinely fatal. If the link really died, the
+// framework also delivers rfcommChannelClosed, which tears down regardless.
+static BOOL btc_write_status_is_transient(IOReturn rc) {
+  switch (rc) {
+    case kIOReturnNoResources: // out of credits / outgoing queue full
+    case kIOReturnNoSpace:
+    case kIOReturnNoMemory:
+    case kIOReturnBusy:
+    case kIOReturnTimeout: // e.g. sniff-mode wake latency exceeded a deadline
+      return YES;
+    default:
+      return NO;
+  }
+}
 
 @implementation BTCChannel
 // Splits data into MTU-sized chunks and starts draining the queue via
@@ -245,30 +291,105 @@ static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
 // blocking writeSync here would freeze every runSync C-ABI call behind it.
 // Ordering is preserved: one chunk in flight at a time, next sent from the
 // write-complete callback. Worker thread only.
+//
+// Latency note (sniff mode): with idle gaps of ~100 ms+ between messages the
+// controllers may place the ACL link in sniff/low-power mode; the first write
+// after an idle gap then stalls until the next sniff anchor point (commonly up
+// to ~1.28 s). That is pure LATENCY — RFCOMM/L2CAP retransmission means no
+// bytes are lost — and IOBluetooth exposes no public knob to veto sniff
+// (link-policy HCI control is private API). Callers who need tight latency
+// should keep the link busy (keepalives) or budget for the wake latency. The
+// transient-retry logic below exists precisely so a credit/queue stall during
+// such a wake never tears the connection down.
 - (void)enqueueWrite:(NSData *)data {
-  if (!self.channel) return;
+  if (!self.channel || self.tornDown) return;
   if (!self.writeQueue) self.writeQueue = [NSMutableArray new];
-  BluetoothRFCOMMMTU mtu = [self.channel getMTU];
-  if (mtu == 0) mtu = 0xFFFF;
-  for (NSUInteger offset = 0; offset < data.length; offset += mtu) {
-    NSUInteger chunk = data.length - offset;
-    if (chunk > mtu) chunk = mtu;
-    [self.writeQueue
-        addObject:[data subdataWithRange:NSMakeRange(offset, chunk)]];
+  NSUInteger mtu = self.mtu;
+  if (mtu == 0 && self.channel) mtu = [self.channel getMTU];
+  if (mtu == 0) mtu = kBTCFallbackChunk;
+  if (data.length <= mtu) {
+    // Common case (small message): no subdata copy needed.
+    [self.writeQueue addObject:data];
+  } else {
+    for (NSUInteger offset = 0; offset < data.length; offset += mtu) {
+      NSUInteger chunk = data.length - offset;
+      if (chunk > mtu) chunk = mtu;
+      [self.writeQueue
+          addObject:[data subdataWithRange:NSMakeRange(offset, chunk)]];
+    }
   }
   [self _sendNextChunk];
 }
+// Bytes accepted by btc_rfcomm_write but not yet handed to the OS. The head
+// chunk, while in flight, HAS been handed over (writeAsync accepted it), so it
+// is excluded. Worker thread only.
+- (int64_t)pendingBytes {
+  int64_t total = 0;
+  for (NSData *d in self.writeQueue) total += (int64_t)d.length;
+  if (self.writeInFlight && self.writeQueue.count > 0) {
+    total -= (int64_t)((NSData *)self.writeQueue[0]).length;
+  }
+  return total;
+}
 - (void)_sendNextChunk {
-  if (self.writeInFlight || self.writeQueue.count == 0 || !self.channel) return;
+  if (self.writeInFlight || self.writeQueue.count == 0 || !self.channel ||
+      self.tornDown) {
+    return;
+  }
   NSData *chunk = self.writeQueue.firstObject; // stays queued until complete
   self.writeInFlight = YES;
   IOReturn rc = [self.channel writeAsync:(void *)chunk.bytes
                                   length:(UInt16)chunk.length
                                   refcon:NULL];
   if (rc != kIOReturnSuccess) {
+    // Submission failed: no write-complete is coming for this attempt. The
+    // chunk is still at the queue head; classify and retry or fail.
     self.writeInFlight = NO;
-    [self _writeFailed];
+    [self _writeErrored:rc bytesWritten:0];
   }
+}
+// A write attempt failed with `rc` (submission return or completion status);
+// the affected chunk is still at the queue head. Transient statuses back off
+// and retry (bounded); anything else — or an exhausted retry budget — is a
+// real link failure and funnels to _writeFailed. `bytesWritten` (from the
+// bytesWritten: completion variant, 0 elsewhere) trims any delivered prefix so
+// a retry never re-sends bytes the peer already received.
+- (void)_writeErrored:(IOReturn)rc bytesWritten:(size_t)bytesWritten {
+  if (self.tornDown) return;
+  if (btc_write_status_is_transient(rc) &&
+      self.retryAttempts < kBTCMaxWriteRetries) {
+    self.retryAttempts++;
+    if (bytesWritten > 0 && self.writeQueue.count > 0) {
+      NSData *head = self.writeQueue[0];
+      if (bytesWritten >= head.length) {
+        [self.writeQueue removeObjectAtIndex:0];
+      } else {
+        self.writeQueue[0] = [head
+            subdataWithRange:NSMakeRange(bytesWritten,
+                                         head.length - bytesWritten)];
+      }
+    }
+    [self _scheduleRetry];
+    return;
+  }
+  [self _writeFailed];
+}
+// Exponential backoff: 40 ms, 80 ms, ... capped at 1.28 s — long enough to
+// ride out an RFCOMM credit stall or a sniff-mode wake (sniff intervals are
+// commonly <= 1.28 s), short enough that a truly dead link still fails fast
+// (rfcommChannelClosed usually beats the budget anyway). A queue-space /
+// flow-control delegate event retries sooner. Worker thread only.
+- (void)_scheduleRetry {
+  if (self.retryScheduled || self.tornDown) return;
+  self.retryScheduled = YES;
+  NSTimeInterval delay = 0.02 * (double)(1 << MIN(self.retryAttempts, 6));
+  [self performSelector:@selector(_retryNow)
+             withObject:nil
+             afterDelay:delay];
+}
+- (void)_retryNow {
+  self.retryScheduled = NO;
+  [self _sendNextChunk];
 }
 // Delegate-safe teardown shared by every close path (local close, remote
 // close, failed write, btc_reset). Closes the channel now, but defers the
@@ -280,6 +401,13 @@ static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
 // drop the last strong reference; the deferred block's capture of self keeps
 // the object alive until it has run. Worker thread only.
 - (void)teardown {
+  self.tornDown = YES;
+  // Cancel any delayed _retryNow still queued on the worker run loop so it
+  // cannot fire into a dead channel (it would no-op on tornDown, but the
+  // pending perform also retains self).
+  [NSObject cancelPreviousPerformRequestsWithTarget:self];
+  self.retryScheduled = NO;
+  self.writeInFlight = NO;
   [self.writeQueue removeAllObjects];
   [self.channel closeChannel];
   [[BTCWorker shared] runAsync:^{
@@ -290,23 +418,65 @@ static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
   }];
   if (self.handle != 0) [g_channels() removeObjectForKey:@(self.handle)];
 }
-// A failed write means the link is gone; surface it as a disconnect instead of
-// silently truncating the byte stream, then tear the channel down so the open
-// IOBluetoothRFCOMMChannel is not orphaned with a dangling delegate.
+// A GENUINELY fatal write failure (non-transient status, or the bounded retry
+// budget is spent): surface it as a disconnect instead of silently truncating
+// the byte stream, then tear the channel down so the open
+// IOBluetoothRFCOMMChannel is not orphaned with a dangling delegate. Transient
+// conditions never reach here — see _writeErrored.
 - (void)_writeFailed {
   if (self.state) self.state(self.token, BTC_CONN_DISCONNECTED);
   [self teardown];
 }
+// Shared handler for both write-complete delegate variants. `haveBytes` is YES
+// only for the bytesWritten: variant. The writeInFlight guard makes a
+// duplicate or post-teardown delivery a no-op (a failed submission never gets
+// a completion, so nothing legitimate is swallowed).
+- (void)_writeCompleteStatus:(IOReturn)error
+                bytesWritten:(size_t)bytesWritten
+                   haveBytes:(BOOL)haveBytes {
+  if (!self.writeInFlight) return;
+  self.writeInFlight = NO;
+  if (error != kIOReturnSuccess) {
+    [self _writeErrored:error bytesWritten:haveBytes ? bytesWritten : 0];
+    return;
+  }
+  self.retryAttempts = 0;
+  // Chunk delivered; its NSData may be released now. Send the next one.
+  if (self.writeQueue.count > 0) [self.writeQueue removeObjectAtIndex:0];
+  [self _sendNextChunk];
+}
+// IOBluetoothRFCOMMChannelDelegate declares TWO write-complete selectors:
+//   rfcommChannelWriteComplete:refcon:status:
+//   rfcommChannelWriteComplete:refcon:status:bytesWritten:
+// The framework probes the delegate with respondsToSelector: and invokes
+// whichever variant it finds (newer SDKs prefer the bytesWritten one).
+// Implement BOTH so completions arrive regardless of which the installed OS
+// probes for — if neither matched, the one-in-flight queue would stall forever
+// after the first chunk and every later message would look "dropped". The
+// refcon is the opaque value passed to writeAsync (NULL here — legal; it is
+// only echoed back, never interpreted) and is deliberately not matched on.
 - (void)rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel
                             refcon:(void *)refcon
                             status:(IOReturn)error {
-  self.writeInFlight = NO;
-  if (error != kIOReturnSuccess) {
-    [self _writeFailed];
-    return;
-  }
-  // Chunk delivered; its NSData may be released now. Send the next one.
-  if (self.writeQueue.count > 0) [self.writeQueue removeObjectAtIndex:0];
+  [self _writeCompleteStatus:error bytesWritten:0 haveBytes:NO];
+}
+- (void)rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel
+                            refcon:(void *)refcon
+                            status:(IOReturn)error
+                      bytesWritten:(size_t)bytesWritten {
+  [self _writeCompleteStatus:error bytesWritten:bytesWritten haveBytes:YES];
+}
+// The framework's own "you may write again" signals. After a transient
+// kIOReturnNoResources-style failure these fire as soon as the outgoing queue
+// drains / the peer grants RFCOMM credits, so the queue resumes immediately
+// instead of waiting out the backoff timer. Harmless when idle: _sendNextChunk
+// no-ops if a write is already in flight or the queue is empty.
+- (void)rfcommChannelQueueSpaceAvailable:
+    (IOBluetoothRFCOMMChannel *)rfcommChannel {
+  [self _sendNextChunk];
+}
+- (void)rfcommChannelFlowControlChanged:
+    (IOBluetoothRFCOMMChannel *)rfcommChannel {
   [self _sendNextChunk];
 }
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)rfcommChannel
@@ -321,6 +491,11 @@ static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
 }
 - (void)rfcommChannelOpenComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel
                            status:(IOReturn)error {
+  // getMTU is only valid once the channel is open; cache it here so the write
+  // path and btc_rfcomm_mtu never see a not-yet-negotiated 0.
+  if (error == kIOReturnSuccess && self.channel) {
+    self.mtu = [self.channel getMTU];
+  }
   if (self.state) {
     self.state(self.token,
                error == kIOReturnSuccess ? BTC_CONN_CONNECTED
@@ -492,13 +667,46 @@ int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
 
 int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len) {
   if (len <= 0) return 0;
-  // Copy now; the caller's buffer may be freed before the async block runs.
+  // Copy now; the caller's buffer may be freed before the block runs.
   // (NSData copies here — same contract as the previous malloc'd copy.)
   NSData *bytes = [NSData dataWithBytes:data length:(NSUInteger)len];
-  [[BTCWorker shared] runAsync:^{
-    [g_channels()[@(handle)] enqueueWrite:bytes];
+  __block int32_t result = -1;
+  // runSync (not runAsync) so the backlog check is race-free against the
+  // worker's own draining and so an unknown/closed handle is REPORTED instead
+  // of silently swallowing the payload. Nothing on the worker blocks anymore
+  // (writes are writeAsync), so this returns promptly.
+  [[BTCWorker shared] runSync:^{
+    BTCChannel *ch = g_channels()[@(handle)];
+    if (!ch || ch.tornDown) return; // -1: not open (never silently drop)
+    if ([ch pendingBytes] + len > kBTCWriteBacklogCap) {
+      result = -2; // backlog full: peer has stalled for a long time
+      return;
+    }
+    [ch enqueueWrite:bytes];
+    result = 0;
   }];
-  return 0;
+  return result;
+}
+
+int32_t btc_rfcomm_mtu(int64_t handle) {
+  __block int32_t result = 0;
+  [[BTCWorker shared] runSync:^{
+    BTCChannel *ch = g_channels()[@(handle)];
+    if (!ch) return;
+    BluetoothRFCOMMMTU mtu = ch.mtu;
+    if (mtu == 0 && ch.channel) mtu = [ch.channel getMTU];
+    result = (int32_t)mtu;
+  }];
+  return result;
+}
+
+int64_t btc_rfcomm_pending(int64_t handle) {
+  __block int64_t result = 0;
+  [[BTCWorker shared] runSync:^{
+    BTCChannel *ch = g_channels()[@(handle)];
+    if (ch) result = [ch pendingBytes];
+  }];
+  return result;
 }
 
 int32_t btc_rfcomm_close(int64_t handle) {

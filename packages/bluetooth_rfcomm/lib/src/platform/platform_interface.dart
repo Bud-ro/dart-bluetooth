@@ -35,10 +35,22 @@ abstract interface class RfcommTransport {
 
   /// Queues [data] for transmission. Must return immediately without blocking;
   /// the platform drains the queue off the calling isolate.
+  ///
+  /// The queue is unbounded and lossless: every byte accepted here is either
+  /// eventually handed to the OS or reported lost via [flush] / the terminal
+  /// disconnect — a transport must never silently drop accepted bytes.
   void send(Uint8List data);
 
   /// Completes when all queued bytes have been handed to the OS.
   Future<void> flush();
+
+  /// OS-advertised largest single write payload (RFCOMM MTU on macOS, max
+  /// transmit packet size on Android); null where the OS exposes none
+  /// (Windows/Linux stream sockets, iOS EA).
+  int? get maxPayloadSize;
+
+  /// Bytes accepted by [send] but not yet handed to the OS.
+  int get pendingWriteBytes;
 
   /// Closes the channel. Idempotent.
   Future<void> close();

@@ -16,6 +16,21 @@ import '../../models/uuid.dart';
 import '../platform_interface.dart';
 import 'macos_bindings.dart';
 
+// Additive bindings for the transport-introspection C exports. Declared here
+// (with an explicit assetId matching macos_bindings.dart's @DefaultAsset)
+// rather than in the shared bindings file to keep that file's surface stable.
+@ffi.Native<ffi.Int32 Function(ffi.Int64)>(
+  symbol: 'btc_rfcomm_mtu',
+  assetId: 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart',
+)
+external int _btcRfcommMtu(int handle);
+
+@ffi.Native<ffi.Int64 Function(ffi.Int64)>(
+  symbol: 'btc_rfcomm_pending',
+  assetId: 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart',
+)
+external int _btcRfcommPending(int handle);
+
 /// macOS backend over IOBluetooth.
 ///
 /// Calls into the C ABI in `macos/bluetooth_rfcomm/Sources/bluetooth_rfcomm/`
@@ -424,6 +439,22 @@ class _MacRfcommTransport implements RfcommTransport {
   @override
   ConnectionState get state => _current;
 
+  /// The negotiated RFCOMM channel MTU — the OS-advertised largest single
+  /// write payload — or null if it cannot be read (channel closed, or the
+  /// native layer reported none).
+  @override
+  int? get maxPayloadSize {
+    if (_closed || _handle == 0) return null;
+    final mtu = _btcRfcommMtu(_handle);
+    return mtu > 0 ? mtu : null;
+  }
+
+  /// Bytes accepted by [send] but not yet handed to the OS (sitting in the
+  /// native write queue).
+  @override
+  int get pendingWriteBytes =>
+      (_closed || _handle == 0) ? 0 : _btcRfcommPending(_handle);
+
   @override
   void send(Uint8List data) {
     if (_closed || _handle == 0) {
@@ -433,7 +464,17 @@ class _MacRfcommTransport implements RfcommTransport {
     try {
       ptr.asTypedList(data.length).setAll(0, data);
       final rc = btcRfcommWrite(_handle, ptr, data.length);
-      if (rc != 0) throw BluetoothWriteException('write failed', code: rc);
+      if (rc != 0) {
+        // -1: channel already closed natively (a disconnect event is on its
+        // way); -2: the bounded native backlog is full (peer stalled). Either
+        // way the bytes were NOT queued — surface it, never drop silently.
+        throw BluetoothWriteException(
+          rc == -2
+              ? 'write rejected: native write backlog full (peer stalled)'
+              : 'write failed: channel is not open',
+          code: rc,
+        );
+      }
     } finally {
       calloc.free(ptr);
     }
@@ -441,8 +482,12 @@ class _MacRfcommTransport implements RfcommTransport {
 
   @override
   Future<void> flush() async {
-    // Writes are dispatched in order on the native worker thread; there is no
-    // separate user-space buffer to drain.
+    // Drain the native write queue (bytes accepted by [send] but not yet
+    // handed to the OS). Bounded: on disconnect the native teardown clears the
+    // queue, so pending falls to 0 and the loop exits.
+    while (!_closed && _handle != 0 && _btcRfcommPending(_handle) > 0) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
   }
 
   @override

@@ -410,6 +410,32 @@ BTC_EXPORT int32_t btc_and_write(int64_t handle, const uint8_t *data, int32_t le
   return (int32_t)rc;
 }
 
+// OS-advertised max single-write payload (BluetoothSocket.
+// getMaxTransmitPacketSize). <= 0 means unknown; the Dart side reports null.
+BTC_EXPORT int32_t btc_and_max_tx(int64_t handle) {
+  JNIEnv *env = get_env();
+  if (!env) return -1;
+  jmethodID m = static_method(env, "maxTxSize", "(J)I");
+  if (!m) return -1;
+  int32_t r =
+      (int32_t)(*env)->CallStaticIntMethod(env, g_class, m, (jlong)handle);
+  clear_pending(env);
+  return r;
+}
+
+// Bytes submitted to the socket's write executor and not yet handed to the
+// socket (exact; 0 for an unknown/closed handle).
+BTC_EXPORT int64_t btc_and_pending_bytes(int64_t handle) {
+  JNIEnv *env = get_env();
+  if (!env) return 0;
+  jmethodID m = static_method(env, "pendingBytes", "(J)J");
+  if (!m) return 0;
+  int64_t r =
+      (int64_t)(*env)->CallStaticLongMethod(env, g_class, m, (jlong)handle);
+  clear_pending(env);
+  return r;
+}
+
 BTC_EXPORT int32_t btc_and_flush(int64_t handle) {
   JNIEnv *env = get_env();
   if (!env) return -1;
