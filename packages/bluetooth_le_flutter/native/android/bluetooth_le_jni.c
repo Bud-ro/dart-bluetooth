@@ -88,7 +88,7 @@ static JNIEnv *get_env(void) {
   JNIEnv *env = NULL;
   jint r = (*g_vm)->GetEnv(g_vm, (void **)&env, JNI_VERSION_1_6);
   if (r == JNI_EDETACHED) {
-    if ((*g_vm)->AttachCurrentThread(g_vm, &env, NULL) != JNI_OK) return NULL;
+    if ((*g_vm)->AttachCurrentThread(g_vm, (void *)&env, NULL) != JNI_OK) return NULL;
     pthread_once(&g_detach_once, make_detach_key);
     pthread_setspecific(g_detach_key, (void *)1);
   } else if (r != JNI_OK) {

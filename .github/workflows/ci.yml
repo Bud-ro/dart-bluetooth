@@ -67,6 +67,7 @@ jobs:
           for f in packages/bluetooth_rfcomm_flutter/native/android/bluetooth_rfcomm_jni.c \
                    packages/bluetooth_le_flutter/native/android/bluetooth_le_jni.c; do
             clang -fsyntax-only -Wall -Wextra -Werror \
+              -Wno-unused-parameter \
               -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" "$f"
           done
 

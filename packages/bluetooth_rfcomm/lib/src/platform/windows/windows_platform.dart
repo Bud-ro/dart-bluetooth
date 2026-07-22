@@ -329,7 +329,14 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
   /// unrelated fresh inquiry that reused the value.
   void _endLookup(int? handle) {
     if (handle == null) return;
-    debugOnLookupEnd?.call(handle);
+    // The test hook REPLACES the FFI call entirely: on real Windows, calling
+    // WSALookupServiceEnd with a test's fabricated handle value is an access
+    // violation inside the provider, not a polite error.
+    final hook = debugOnLookupEnd;
+    if (hook != null) {
+      hook(handle);
+      return;
+    }
     try {
       _ws.lookupServiceEnd(handle);
     } catch (e) {
