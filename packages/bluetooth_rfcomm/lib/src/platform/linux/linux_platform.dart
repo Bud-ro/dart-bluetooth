@@ -79,14 +79,16 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
   Stream<BluetoothAdapterState> adapterStateChanges() {
     late StreamController<BluetoothAdapterState> controller;
     StreamSubscription<DBusPropertiesChangedSignal>? sub;
-    var cancelled = false;
+    // Bumped on every listen AND cancel, so an in-flight onListen can detect it
+    // was superseded mid-await (and not wire up a dead subscription) without a
+    // one-way `cancelled` latch that would leave a re-listened stream (broadcast
+    // onListen re-fires on 0 -> 1) permanently silent.
+    var epoch = 0;
     controller = StreamController<BluetoothAdapterState>.broadcast(
       onListen: () async {
-        // Broadcast onListen refires when listeners return after dropping to
-        // zero — reset the latch or a re-listened stream stays silent forever.
-        cancelled = false;
+        final myEpoch = ++epoch;
         final initial = await adapterState();
-        if (cancelled) return; // listener went away during the await
+        if (epoch != myEpoch) return; // superseded during the await
         controller.add(initial);
         final created = _obj(_adapterPath).propertiesChanged.listen(
           (sig) async {
@@ -100,14 +102,14 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
           onError: (Object e) =>
               logAdapter.warning(() => 'adapter signal error: $e'),
         );
-        if (cancelled) {
-          await created.cancel(); // cancelled while we were subscribing
+        if (epoch != myEpoch) {
+          await created.cancel(); // superseded while we were subscribing
         } else {
           sub = created;
         }
       },
       onCancel: () async {
-        cancelled = true;
+        epoch++;
         final s = sub;
         sub = null;
         await s?.cancel();
@@ -167,6 +169,36 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
   /// then skip StartDiscovery and be silently starved).
   bool _bluezDiscovering = false;
 
+  /// Watches Adapter1 for BlueZ dropping our discovery session behind our back
+  /// (suspend/resume power-cycles the adapter; bluetoothd also stops discovery
+  /// on its own). Without this, [_bluezDiscovering] goes stale-true and every
+  /// later serialized start op skips StartDiscovery — the background scan and
+  /// all one-shot discoveries would be silently starved forever.
+  StreamSubscription<DBusPropertiesChangedSignal>? _discoveryInvalidation;
+
+  /// Lazily (once, on first discovery) subscribes to the adapter's
+  /// PropertiesChanged. Powered=false, or Discovering=false while we believe
+  /// we're discovering, clears [_bluezDiscovering] so the next serialized start
+  /// op re-issues StartDiscovery. A false clear (e.g. a late echo of our own
+  /// stop) is harmless: the re-issued StartDiscovery treats InProgress as
+  /// success.
+  void _ensureDiscoveryInvalidationWatch() {
+    _discoveryInvalidation ??= _obj(_adapterPath).propertiesChanged.listen(
+      (sig) {
+        if (sig.propertiesInterface != _adapterIface) return;
+        final powered = sig.changedProperties['Powered'];
+        final discovering = sig.changedProperties['Discovering'];
+        final lost =
+            (powered is DBusBoolean && !powered.value) ||
+            (discovering is DBusBoolean && !discovering.value);
+        if (lost && _bluezDiscovering) _bluezDiscovering = false;
+      },
+      // A malformed signal must not become an unhandled zone error.
+      onError: (Object e) =>
+          logDiscovery.warning(() => 'discovery watch signal error: $e'),
+    );
+  }
+
   /// Serializes StartDiscovery/StopDiscovery calls so a stop issued by a
   /// just-cancelled stream can't land after — and silently kill — the
   /// StartDiscovery of a stream that began a moment later.
@@ -186,6 +218,7 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
     StreamSubscription<DBusSignal>? changedSub;
 
     Future<void> begin() async {
+      _ensureDiscoveryInvalidationWatch();
       final om = DBusRemoteObject(
         _bus,
         name: _service,
@@ -379,9 +412,20 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
         'Linux requires a MAC-address DeviceId for RFCOMM connect',
       );
     }
+    final DBusObjectPath devicePath;
+    try {
+      devicePath = _devicePath(device);
+    } on ArgumentError catch (e) {
+      // Connect callers catch BluetoothException; match the guard above
+      // rather than leaking the raw ArgumentError.
+      throw BluetoothConnectionException(
+        'Malformed Bluetooth device address "${device.value}"',
+        cause: e,
+      );
+    }
     return _LinuxRfcommProfile.connect(
       bus: _bus,
-      devicePath: _devicePath(device),
+      devicePath: devicePath,
       serviceUuid: serviceUuid,
       channel: channel,
       timeout: timeout,
@@ -411,6 +455,8 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> dispose() async {
+    await _discoveryInvalidation?.cancel();
+    _discoveryInvalidation = null;
     // Only close the client we created; a caller-injected bus is theirs.
     if (_ownsBus) await _bus.close();
   }
@@ -421,6 +467,11 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
   /// callers never have to handle `DBus*Exception` directly. Always throws.
   Never _mapDbus(Object e, String op) {
     if (e is BluetoothException) throw e;
+    if (e is ArgumentError) {
+      // A malformed device address ([_devicePath]) is invalid input, not a
+      // D-Bus failure — don't mislabel it as one.
+      throw BluetoothException('Invalid device address during $op', cause: e);
+    }
     if (e is DBusServiceUnknownException) {
       throw BluetoothDisabledException(
         'BlueZ (org.bluez) is unavailable — is the bluetooth service running?',
@@ -468,8 +519,24 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
   }
 
+  /// Strict `AA:BB:CC:DD:EE:FF` — the form `DeviceId.address` normalizes to.
+  static final RegExp _macAddress = RegExp(r'^[0-9A-F]{2}(:[0-9A-F]{2}){5}$');
+
+  /// Builds the BlueZ object path for [device], validating the address shape
+  /// FIRST: `DBusObjectPath` throws a raw ArgumentError about D-Bus path
+  /// internals on hostile input, which must not leak out of this backend. All
+  /// device-path consumers funnel through here, so a malformed address fails
+  /// the same way everywhere ([ArgumentError], wrapped into a domain exception
+  /// by [_mapDbus] / openRfcomm before reaching callers).
   DBusObjectPath _devicePath(DeviceId device) {
-    final mac = device.address.replaceAll(':', '_').toUpperCase();
+    if (!device.isAddress || !_macAddress.hasMatch(device.address)) {
+      throw ArgumentError.value(
+        device.value,
+        'device',
+        'not a valid Bluetooth MAC address',
+      );
+    }
+    final mac = device.address.replaceAll(':', '_');
     return DBusObjectPath('/org/bluez/$_adapterName/dev_$mac');
   }
 
@@ -541,10 +608,11 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 }
 
-/// Registers a transient `org.bluez.Profile1` to obtain an RFCOMM file
-/// descriptor for SPP, then exposes it as an [RfcommTransport].
+/// Obtains an RFCOMM file descriptor for SPP through a shared
+/// `org.bluez.Profile1` registration ([_SharedProfile]), then exposes it as an
+/// [RfcommTransport].
 class _LinuxRfcommProfile implements RfcommTransport {
-  _LinuxRfcommProfile._(this._socket, this._bus, this._profile) {
+  _LinuxRfcommProfile._(this._socket, this._shared, this._devicePath) {
     _sub = _socket.listen(
       _incoming.add,
       // A hard read error (link reset when the peer powers off) may or may not
@@ -573,10 +641,13 @@ class _LinuxRfcommProfile implements RfcommTransport {
     );
   }
 
-  final DBusClient _bus;
-  final DBusObject _profile;
+  /// The shared per-UUID profile registration this transport holds one
+  /// reference on (released by [close]).
+  final _SharedProfile _shared;
 
-  static int _profileCounter = 0;
+  /// The BlueZ device object path this link belongs to, for routing
+  /// RequestDisconnection and rejecting duplicate fds in [_SharedProfile].
+  final String _devicePath;
 
   /// Internal upper bound applied when the caller passes no `timeout`, so a peer
   /// that never drives Profile1.NewConnection can't hang the connect forever and
@@ -591,60 +662,27 @@ class _LinuxRfcommProfile implements RfcommTransport {
     Duration? timeout,
   }) async {
     // BlueZ delivers the connected RFCOMM socket as a Unix fd to a registered
-    // Profile1 object's NewConnection method. We export such an object, register
-    // the profile, then trigger Device1.ConnectProfile; the fd that arrives is
-    // adopted as a dart:io Socket for duplex I/O.
-    final completer = Completer<RfcommTransport>();
-    // `settled` covers ALL terminal paths (success, timeout, RegisterProfile /
-    // ConnectProfile failure) — `completer.isCompleted` alone misses timeout,
-    // because `.timeout()` completes the returned future, not this completer.
-    var settled = false;
-    final profilePath = DBusObjectPath(
-      '/lol/carson/bluetooth_rfcomm/profile${_profileCounter++}',
-    );
-    late final _Profile1 profile;
-    profile = _Profile1(profilePath, (socket) {
-      if (settled) {
-        // Arrived after a timeout/error — don't leak the fd or the profile.
-        socket.destroy();
-        unawaited(_unregisterProfile(bus, profile));
-        return;
-      }
-      settled = true;
-      final transport = _LinuxRfcommProfile._(socket, bus, profile);
-      // BlueZ tells us to drop the link via RequestDisconnection/Release; wire
-      // it to the transport's (idempotent) close so the Dart side actually tears
-      // down instead of staying "connected" with a leaked fd.
-      profile.onDisconnect = () => unawaited(transport.close());
-      completer.complete(transport);
-    });
-    await bus.registerObject(profile);
-
-    final mgr = DBusRemoteObject(
-      bus,
-      name: 'org.bluez',
-      path: DBusObjectPath('/org/bluez'),
-    );
-    final options = <String, DBusValue>{'Role': const DBusString('client')};
-    if (channel != null && channel > 0) {
-      options['Channel'] = DBusUint16(channel);
-    }
+    // Profile1 object's NewConnection method — and it matches profiles by
+    // UUID, so concurrent connects must share ONE Profile1 per UUID (see
+    // _SharedProfile) whose NewConnection routes each fd by the device
+    // object-path argument. Here we enlist as the pending connect for
+    // [devicePath], trigger Device1.ConnectProfile, and adopt the routed fd as
+    // a dart:io Socket for duplex I/O.
+    final _SharedProfile shared;
     try {
-      await mgr.callMethod(
-        'org.bluez.ProfileManager1',
-        'RegisterProfile',
-        [
-          profilePath,
-          DBusString(serviceUuid.value),
-          DBusDict.stringVariant(options),
-        ],
-        replySignature: DBusSignature(''),
+      shared = await _SharedProfile.acquire(
+        bus: bus,
+        serviceUuid: serviceUuid,
+        channel: channel,
       );
     } catch (e) {
-      settled = true;
-      await bus.unregisterObject(profile);
       _throwConnectError(e, 'RegisterProfile');
     }
+    // Terminal-path bookkeeping: every failure below must BOTH withdraw the
+    // pending entry (so a late fd for this device is destroyed, not delivered
+    // to nobody) and release the acquired profile reference. On success the
+    // reference is handed to the transport instead (net zero at hand-off).
+    final pending = shared.addPending(devicePath.value);
 
     // ONE deadline covers the whole connect: ConnectProfile itself (BlueZ can
     // block for its own page timeout, 10-40s, against an absent peer — the
@@ -660,9 +698,9 @@ class _LinuxRfcommProfile implements RfcommTransport {
           .timeout(deadline);
     } on TimeoutException {
       // The fd may still have arrived while the call was in flight.
-      if (!completer.isCompleted) {
-        settled = true;
-        unawaited(_unregisterProfile(bus, profile));
+      if (!pending.isCompleted) {
+        shared.abandonPending(devicePath.value, pending);
+        unawaited(shared.release());
         throw BluetoothTimeoutException(
           'RFCOMM connect timed out',
           timeout: deadline,
@@ -670,32 +708,47 @@ class _LinuxRfcommProfile implements RfcommTransport {
       }
     } catch (e) {
       // BlueZ can also deliver NewConnection and THEN report an error from
-      // ConnectProfile; if the transport exists, the link is up — prefer it
-      // over throwing (and over leaking its adopted fd).
-      if (!completer.isCompleted) {
-        settled = true;
-        await _unregisterProfile(bus, profile);
+      // ConnectProfile; if the fd arrived, the link is up — prefer it over
+      // throwing (and over leaking the adopted fd).
+      if (!pending.isCompleted) {
+        shared.abandonPending(devicePath.value, pending);
+        await shared.release();
         _throwConnectError(e, 'ConnectProfile');
       }
       logConnection.fine(
         () => 'ConnectProfile errored after NewConnection; using the link: $e',
       );
     }
-    if (completer.isCompleted) return completer.future;
 
-    // Wait out the REMAINDER of the deadline for NewConnection.
-    final remaining = deadline - sw.elapsed;
-    return completer.future.timeout(
-      remaining > Duration.zero ? remaining : const Duration(milliseconds: 1),
-      onTimeout: () {
-        settled = true;
-        unawaited(_unregisterProfile(bus, profile));
+    final Socket socket;
+    if (pending.isCompleted) {
+      socket = await pending.future;
+    } else {
+      // Wait out the REMAINDER of the deadline for NewConnection.
+      final remaining = deadline - sw.elapsed;
+      try {
+        socket = await pending.future.timeout(
+          remaining > Duration.zero
+              ? remaining
+              : const Duration(milliseconds: 1),
+        );
+      } on TimeoutException {
+        shared.abandonPending(devicePath.value, pending);
+        unawaited(shared.release());
         throw BluetoothTimeoutException(
           'RFCOMM connect timed out',
           timeout: deadline,
         );
-      },
-    );
+      }
+    }
+    // Success: the pending connect's profile reference becomes the
+    // transport's, released by its (idempotent) close. Registering the
+    // transport also wires BlueZ's RequestDisconnection/Release to that close
+    // (routed per-device by _SharedProfile), so the Dart side actually tears
+    // down instead of staying "connected" with a leaked fd.
+    final transport = _LinuxRfcommProfile._(socket, shared, devicePath.value);
+    shared.addTransport(devicePath.value, transport);
+    return transport;
   }
 
   /// Maps a BlueZ connect-path failure into the domain taxonomy: adapter-off,
@@ -735,34 +788,6 @@ class _LinuxRfcommProfile implements RfcommTransport {
       };
     }
     throw BluetoothConnectionException('$op failed', cause: e);
-  }
-
-  /// Unregisters both the BlueZ profile (so bluetoothd forgets it) and the
-  /// local D-Bus object. Best-effort; safe to call more than once.
-  static Future<void> _unregisterProfile(
-    DBusClient bus,
-    DBusObject profile,
-  ) async {
-    try {
-      final mgr = DBusRemoteObject(
-        bus,
-        name: 'org.bluez',
-        path: DBusObjectPath('/org/bluez'),
-      );
-      await mgr.callMethod(
-        'org.bluez.ProfileManager1',
-        'UnregisterProfile',
-        [profile.path],
-        replySignature: DBusSignature(''),
-      );
-    } catch (_) {
-      /* already gone */
-    }
-    try {
-      await bus.unregisterObject(profile);
-    } catch (_) {
-      /* already gone */
-    }
   }
 
   final Socket _socket;
@@ -849,7 +874,11 @@ class _LinuxRfcommProfile implements RfcommTransport {
     // peer that just vanished. Callers wanting a drain use flush() first
     // (BluetoothConnection.finish does).
     _socket.destroy();
-    await _unregisterProfile(_bus, _profile);
+    // Drop out of the shared profile's routing tables, then give back the
+    // reference acquired at connect time (the LAST release unregisters the
+    // profile from BlueZ). `_closed` above guarantees this runs once.
+    _shared.removeTransport(_devicePath, this);
+    await _shared.release();
     if (!_state.isClosed) {
       if (!alreadyDisconnected) _state.add(ConnectionState.disconnected);
       await _state.close();
@@ -862,32 +891,262 @@ class _LinuxRfcommProfile implements RfcommTransport {
   }
 }
 
-/// A transient `org.bluez.Profile1` exported on the bus. BlueZ invokes
-/// `NewConnection(object device, fd handle, dict props)` with the connected
-/// RFCOMM socket as a Unix fd, which we adopt as a dart:io [Socket].
+/// One shared `org.bluez.Profile1` registration per (D-Bus client, service
+/// UUID, channel).
+///
+/// BlueZ matches ConnectProfile results against its registered profiles by
+/// UUID, NOT by which client call triggered them — so two concurrent connects
+/// each registering their own Profile1 under the same UUID could have BlueZ
+/// hand device B's fd to device A's object (cross-wired transports). Instead
+/// ONE object per UUID is registered and its `NewConnection(device, fd, opts)`
+/// handler routes each fd by the device object-path argument to the pending
+/// connect for THAT device.
+///
+/// Ownership rules:
+/// - Every in-flight connect holds one reference ([acquire]); on failure or
+///   timeout it releases it, on success it hands it to the transport it built.
+/// - Every open transport holds one reference, released by its close().
+/// - So refs == pending connects + open transports. The LAST [release]
+///   retires this instance: it is removed from the registry SYNCHRONOUSLY (a
+///   racing new connect then builds a fresh registration under its own object
+///   path rather than reusing a half-unregistered one) and then unregistered
+///   from BlueZ and the bus, best-effort.
+class _SharedProfile {
+  _SharedProfile._(this._bus, this._key, this._serviceUuid, this._channel)
+    : _object = _Profile1(
+        DBusObjectPath('/lol/carson/bluetooth_rfcomm/profile${_counter++}'),
+      ) {
+    _object._owner = this;
+  }
+
+  /// Live registrations, per D-Bus client (an Expando rather than a plain
+  /// static map so backends with injected buses — tests, multi-adapter apps —
+  /// never share or leak each other's profile objects).
+  static final Expando<Map<String, _SharedProfile>> _registries =
+      Expando<Map<String, _SharedProfile>>();
+
+  static int _counter = 0;
+
+  static Map<String, _SharedProfile> _registryFor(DBusClient bus) =>
+      _registries[bus] ??= <String, _SharedProfile>{};
+
+  final DBusClient _bus;
+  final String _key;
+  final Uuid _serviceUuid;
+  final int? _channel;
+  final _Profile1 _object;
+
+  /// Pending connects + open transports — see the class doc's ownership rules.
+  int _refs = 0;
+
+  /// Memoized so concurrent connects for the same UUID await ONE
+  /// RegisterProfile instead of racing duplicates.
+  Future<void>? _registration;
+
+  /// Connects waiting on NewConnection, FIFO per device object path.
+  final Map<String, List<Completer<Socket>>> _pending = {};
+
+  /// Open transports per device object path — consulted to route
+  /// RequestDisconnection and to politely reject an fd for an
+  /// already-connected device.
+  final Map<String, Set<_LinuxRfcommProfile>> _transports = {};
+
+  /// Returns the shared profile for ([serviceUuid], [channel]) on [bus] with
+  /// one reference taken and its BlueZ registration completed. On registration
+  /// failure the reference is given back before rethrowing.
+  static Future<_SharedProfile> acquire({
+    required DBusClient bus,
+    required Uuid serviceUuid,
+    required int? channel,
+  }) async {
+    // The channel participates in the key because it is fixed at
+    // RegisterProfile time (a profile option, not a ConnectProfile argument):
+    // connects demanding different channels genuinely need different
+    // registrations. Uuid.value is canonical lower-case, so equal UUIDs
+    // always share.
+    final key = '${serviceUuid.value}#${channel ?? 0}';
+    final registry = _registryFor(bus);
+    final shared = registry[key] ??= _SharedProfile._(
+      bus,
+      key,
+      serviceUuid,
+      channel,
+    );
+    shared._refs++;
+    try {
+      await (shared._registration ??= shared._register());
+    } catch (_) {
+      await shared.release();
+      rethrow;
+    }
+    return shared;
+  }
+
+  Future<void> _register() async {
+    await _bus.registerObject(_object);
+    final options = <String, DBusValue>{'Role': const DBusString('client')};
+    final channel = _channel;
+    if (channel != null && channel > 0) {
+      options['Channel'] = DBusUint16(channel);
+    }
+    await _manager().callMethod(
+      'org.bluez.ProfileManager1',
+      'RegisterProfile',
+      [
+        _object.path,
+        DBusString(_serviceUuid.value),
+        DBusDict.stringVariant(options),
+      ],
+      replySignature: DBusSignature(''),
+    );
+  }
+
+  DBusRemoteObject _manager() => DBusRemoteObject(
+    _bus,
+    name: 'org.bluez',
+    path: DBusObjectPath('/org/bluez'),
+  );
+
+  /// Enlists a connect waiting for [devicePath]'s fd. The caller MUST pair
+  /// this with either a routed completion, or [abandonPending] + [release] on
+  /// its terminal failure path.
+  Completer<Socket> addPending(String devicePath) {
+    final completer = Completer<Socket>();
+    _pending
+        .putIfAbsent(devicePath, () => <Completer<Socket>>[])
+        .add(completer);
+    return completer;
+  }
+
+  /// Withdraws a timed-out/failed pending connect, so a late fd for that
+  /// device is destroyed (see [_handleNewConnection]) instead of completing a
+  /// connect nobody is awaiting anymore.
+  void abandonPending(String devicePath, Completer<Socket> completer) {
+    final queue = _pending[devicePath];
+    if (queue == null) return;
+    queue.remove(completer);
+    if (queue.isEmpty) _pending.remove(devicePath);
+  }
+
+  void addTransport(String devicePath, _LinuxRfcommProfile transport) {
+    _transports
+        .putIfAbsent(devicePath, () => <_LinuxRfcommProfile>{})
+        .add(transport);
+  }
+
+  void removeTransport(String devicePath, _LinuxRfcommProfile transport) {
+    final set = _transports[devicePath];
+    if (set == null) return;
+    set.remove(transport);
+    if (set.isEmpty) _transports.remove(devicePath);
+  }
+
+  /// Gives back one reference; the LAST one retires this instance (see the
+  /// class doc). The returned future completes once any resulting BlueZ
+  /// unregistration has finished, so a transport's close() can await the same
+  /// cleanup the old per-connect profile awaited.
+  Future<void> release() async {
+    _refs--;
+    if (_refs > 0) return;
+    final registry = _registryFor(_bus);
+    // `identical`: a later connect may already have replaced this retired
+    // instance under the same key — never evict the newcomer.
+    if (identical(registry[_key], this)) registry.remove(_key);
+    try {
+      await _manager().callMethod(
+        'org.bluez.ProfileManager1',
+        'UnregisterProfile',
+        [_object.path],
+        replySignature: DBusSignature(''),
+      );
+    } catch (_) {
+      /* already gone / never registered */
+    }
+    try {
+      await _bus.unregisterObject(_object);
+    } catch (_) {
+      /* already gone */
+    }
+  }
+
+  /// Routes `NewConnection(object device, fd handle, dict props)`.
+  DBusMethodResponse _handleNewConnection(DBusMethodCall methodCall) {
+    final values = methodCall.values;
+    if (values.length < 2) {
+      // Reject so BlueZ tears down the connection instead of leaking its fd.
+      return DBusMethodErrorResponse.failed('missing fd');
+    }
+    // Adopt the fd FIRST: every rejection below must destroy a real socket,
+    // or the duplicated fd would leak in this process.
+    final Socket socket;
+    try {
+      socket = values[1].asUnixFd().toSocket();
+    } catch (e) {
+      return DBusMethodErrorResponse.failed('bad fd: $e');
+    }
+    final deviceValue = values[0];
+    if (deviceValue is! DBusObjectPath) {
+      socket.destroy();
+      return DBusMethodErrorResponse.failed('missing device object path');
+    }
+    final devicePath = deviceValue.value;
+    final queue = _pending[devicePath];
+    if (queue != null && queue.isNotEmpty) {
+      final completer = queue.removeAt(0);
+      if (queue.isEmpty) _pending.remove(devicePath);
+      completer.complete(socket);
+      return DBusMethodSuccessResponse([]);
+    }
+    // No connect is waiting for this device (it timed out, or BlueZ pushed an
+    // unsolicited server-role connection). Destroy our copy of the fd and
+    // tell BlueZ no, politely.
+    socket.destroy();
+    return DBusMethodErrorResponse.failed(
+      _transports.containsKey(devicePath)
+          ? 'already connected'
+          : 'no pending connect for this device',
+    );
+  }
+
+  /// Handles `RequestDisconnection(object device)` and `Release()`. Closing
+  /// the transport(s) is what actually tears the Dart side down — otherwise
+  /// we'd stay "connected" with a leaked fd after BlueZ dropped the link.
+  void _handleDisconnectRequest(DBusMethodCall methodCall) {
+    final values = methodCall.values;
+    final target = values.isNotEmpty && values[0] is DBusObjectPath
+        ? (values[0] as DBusObjectPath).value
+        : null;
+    // RequestDisconnection names a device — close only its links. Release
+    // (and a malformed call) names nobody: BlueZ is done with the whole
+    // profile, so every link it owns goes down. Pending connects are left to
+    // their own timeouts, matching the previous per-connect behavior.
+    final doomed = target != null
+        ? (_transports[target]?.toList() ?? const <_LinuxRfcommProfile>[])
+        : _transports.values.expand((s) => s).toList();
+    for (final transport in doomed) {
+      unawaited(transport.close());
+    }
+  }
+}
+
+/// The `org.bluez.Profile1` D-Bus object exported for a [_SharedProfile];
+/// method calls are delegated back to the owning shared profile for routing.
 class _Profile1 extends DBusObject {
-  _Profile1(super.path, this.onConnection);
+  _Profile1(super.path);
 
-  final void Function(Socket socket) onConnection;
-
-  /// Set once the transport exists; invoked when BlueZ asks us to drop the link.
-  void Function()? onDisconnect;
+  /// Set by [_SharedProfile]'s constructor immediately after creation (the
+  /// two are mutually referential).
+  late final _SharedProfile _owner;
 
   @override
   Future<DBusMethodResponse> handleMethodCall(DBusMethodCall methodCall) async {
     if (methodCall.interface == 'org.bluez.Profile1') {
       switch (methodCall.name) {
         case 'NewConnection':
-          if (methodCall.values.length < 2) {
-            // Reject so BlueZ tears down the connection instead of leaking its fd.
-            return DBusMethodErrorResponse.failed('missing fd');
-          }
-          final socket = methodCall.values[1].asUnixFd().toSocket();
-          onConnection(socket);
-          return DBusMethodSuccessResponse([]);
+          return _owner._handleNewConnection(methodCall);
         case 'RequestDisconnection':
         case 'Release':
-          onDisconnect?.call();
+          _owner._handleDisconnectRequest(methodCall);
           return DBusMethodSuccessResponse([]);
       }
     }

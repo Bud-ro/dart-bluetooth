@@ -19,6 +19,13 @@ import 'platform/platform_interface.dart';
 /// tests. Every method dispatches to the host-appropriate backend and runs its
 /// blocking work off the calling isolate.
 ///
+/// Use ONE facade per process for radio work: the scan/connect coordination
+/// (pausing inquiries while a connect handshakes) is per-facade, while the
+/// radio and backend are process-shared — a second default-constructed
+/// facade's scan can collide with the first one's connects. Share [instance]
+/// (or your own single facade) across modules instead of constructing per
+/// module.
+///
 /// ```dart
 /// final bt = BluetoothRfcomm.instance;
 /// await bt.startScan(); // e.g. in main()
@@ -28,13 +35,21 @@ import 'platform/platform_interface.dart';
 /// ```
 class BluetoothRfcomm {
   /// Creates a facade over [platform], or the auto-selected host backend.
+  ///
+  /// Ownership: a facade constructed WITHOUT an explicit [platform] shares
+  /// the process-wide backend with every other default-constructed facade
+  /// (including [instance]) — its [dispose] releases only facade-level
+  /// resources and leaves the shared backend running. A facade given an
+  /// explicit [platform] owns it, and [dispose] disposes it.
   BluetoothRfcomm({BluetoothRfcommPlatform? platform})
-    : _platform = platform ?? BluetoothRfcommPlatform.instance;
+    : _platform = platform ?? BluetoothRfcommPlatform.instance,
+      _ownsPlatform = platform != null;
 
   /// Shared instance backed by the host's default platform.
   static final BluetoothRfcomm instance = BluetoothRfcomm();
 
   final BluetoothRfcommPlatform _platform;
+  final bool _ownsPlatform;
 
   /// Whether this host can do Bluetooth Classic RFCOMM at all.
   Future<bool> isSupported() => _platform.isSupported();
@@ -912,6 +927,9 @@ class BluetoothRfcomm {
     }
     if (!_scannedUpdates.isClosed) await _scannedUpdates.close();
     if (!_nearbyUpdates.isClosed) await _nearbyUpdates.close();
-    await _platform.dispose();
+    // Only dispose a caller-injected backend. The process-shared singleton
+    // must survive this facade: other facades (and any constructed later)
+    // share it, and there is no public way to resurrect it once disposed.
+    if (_ownsPlatform) await _platform.dispose();
   }
 }

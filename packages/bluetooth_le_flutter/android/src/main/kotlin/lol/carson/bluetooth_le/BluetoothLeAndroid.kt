@@ -154,11 +154,18 @@ object BluetoothLeAndroid {
 
     // --- Connect -------------------------------------------------------------
 
+    /**
+     * Return codes (additive; Dart maps them to domain exceptions):
+     *  0 initiated, -1 generic failure (unknown device / connectGatt null),
+     *  -2 adapter missing or powered off, -3 SecurityException (missing
+     *  BLUETOOTH_CONNECT runtime grant).
+     */
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun connect(connToken: Long, address: String): Int {
         return try {
-            val a = adapter ?: return -1
+            val a = adapter ?: return -2
+            if (!a.isEnabled) return -2
             val device = a.getRemoteDevice(address) ?: return -1
             val conn = Conn(connToken)
             connections[connToken] = conn
@@ -171,6 +178,9 @@ object BluetoothLeAndroid {
                 return -1
             }
             0
+        } catch (se: SecurityException) {
+            connections.remove(connToken)
+            -3
         } catch (t: Throwable) {
             connections.remove(connToken)
             -1

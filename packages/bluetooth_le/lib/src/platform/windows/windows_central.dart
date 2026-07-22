@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:ffi' as ffi;
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -47,6 +48,9 @@ class WindowsBleCentral extends BleCentralPlatform {
       await c.close();
     }
     _open.clear();
+    // Vacate the platform-level singleton slot so a later default construction
+    // gets a fresh backend, not this disposed one.
+    BleCentralPlatform.detachInstance(this);
   }
 
   @override
@@ -99,17 +103,81 @@ class WindowsBleCentral extends BleCentralPlatform {
       );
     }
     logConnection.fine(() => 'connecting to ${id.value}');
-    final path = _findDevicePath(id.address);
-    if (path == null) {
+    // The SetupDi enumeration + CreateFile are blocking Win32 calls (seconds,
+    // when the BLE interface is in a bad power state) — run them on a worker
+    // isolate (mirrors the rfcomm Windows open path) so the calling isolate
+    // stays responsive, and honour [timeout].
+    final connectFuture = _spawnConnect(id.address);
+    var timedOut = false;
+    // Isolate.run can't be cancelled: if the connect succeeds AFTER we time
+    // out, close the late handle instead of leaking it.
+    unawaited(
+      connectFuture.then((r) {
+        final (handle, _, found) = r;
+        if (timedOut && found && handle != 0 && handle != invalidHandleValue) {
+          try {
+            _lib.closeHandle(handle);
+          } catch (_) {}
+        }
+      }, onError: (_) {}),
+    );
+    final (int, int, bool) result;
+    try {
+      result = await (timeout == null
+          ? connectFuture
+          : connectFuture.timeout(
+              timeout,
+              onTimeout: () {
+                timedOut = true;
+                throw BleTimeoutException(
+                  'connect to ${id.value} timed out',
+                  timeout: timeout,
+                );
+              },
+            ));
+    } on BleException {
+      rethrow;
+    } catch (e) {
+      // Map worker-isolate errors into the domain hierarchy.
+      throw BleConnectionException('connect to ${id.value} failed', cause: e);
+    }
+    final (handle, error, found) = result;
+    if (!found) {
       throw DeviceNotFoundException(
         'No paired BLE device for ${id.value}; pair it in Windows settings '
         'first',
       );
     }
+    if (handle == invalidHandleValue || handle == 0) {
+      throw BleConnectionException(
+        'CreateFile failed for ${id.value}',
+        code: error,
+      );
+    }
+    final conn = WindowsGattConnection(handle, _lib);
+    _open.add(conn);
+    conn._onClosed = () => _open.remove(conn);
+    return conn;
+  }
+
+  // Static (no `this` in scope) so the Isolate.run closure captures only the
+  // sendable address — an inline closure in connect() would drag `this` (and
+  // its non-sendable DynamicLibrary bindings) into the isolate message.
+  static Future<(int, int, bool)> _spawnConnect(String address) =>
+      Isolate.run(() => _connectBlocking(address));
+
+  /// Runs on the worker isolate: creates its OWN bindings (DynamicLibrary
+  /// handles aren't sendable) and performs the blocking SetupDi + CreateFile
+  /// sequence. Returns `(handle, lastError, devicePathFound)` — Win32 HANDLEs
+  /// are process-wide, so the handle is usable from the calling isolate.
+  static (int, int, bool) _connectBlocking(String address) {
+    final lib = WindowsBleBindings();
+    final path = _findDevicePath(lib, address);
+    if (path == null) return (0, 0, false);
     final pathPtr = path.toNativeUtf16();
     final int handle;
     try {
-      handle = _lib.createFile(
+      handle = lib.createFile(
         pathPtr,
         genericRead | genericWrite,
         fileShareRead | fileShareWrite,
@@ -122,26 +190,20 @@ class WindowsBleCentral extends BleCentralPlatform {
       calloc.free(pathPtr);
     }
     if (handle == invalidHandleValue || handle == 0) {
-      throw BleConnectionException(
-        'CreateFile failed for ${id.value}',
-        code: _lib.getLastError(),
-      );
+      return (handle, lib.getLastError(), true);
     }
-    final conn = WindowsGattConnection(handle, _lib);
-    _open.add(conn);
-    conn._onClosed = () => _open.remove(conn);
-    return conn;
+    return (handle, 0, true);
   }
 
   /// Enumerates `GUID_BLUETOOTHLE_DEVICE_INTERFACE` and returns the device
   /// interface path whose embedded address matches [address], or null.
-  String? _findDevicePath(String address) {
+  static String? _findDevicePath(WindowsBleBindings lib, String address) {
     final target = 'dev_${address.replaceAll(':', '').toLowerCase()}';
     final guid = calloc<Guid>();
     final ifaceData = calloc<SpDeviceInterfaceData>();
     final reqSize = calloc<ffi.Uint32>();
     WindowsBleBindings.writeBleInterfaceGuid(guid.ref);
-    final devInfo = _lib.getClassDevs(
+    final devInfo = lib.getClassDevs(
       guid,
       ffi.nullptr,
       0,
@@ -157,7 +219,7 @@ class WindowsBleCentral extends BleCentralPlatform {
     try {
       ifaceData.ref.cbSize = ffi.sizeOf<SpDeviceInterfaceData>();
       var index = 0;
-      while (_lib.enumDeviceInterfaces(
+      while (lib.enumDeviceInterfaces(
             devInfo,
             ffi.nullptr,
             guid,
@@ -167,7 +229,7 @@ class WindowsBleCentral extends BleCentralPlatform {
           0) {
         index++;
         // First call sizes the detail buffer; second reads the path.
-        _lib.getDeviceInterfaceDetail(
+        lib.getDeviceInterfaceDetail(
           devInfo,
           ifaceData,
           ffi.nullptr,
@@ -180,7 +242,7 @@ class WindowsBleCentral extends BleCentralPlatform {
         final detail = calloc<ffi.Uint8>(size);
         try {
           detail.cast<ffi.Uint32>().value = spDeviceInterfaceDetailCbSize64;
-          if (_lib.getDeviceInterfaceDetail(
+          if (lib.getDeviceInterfaceDetail(
                 devInfo,
                 ifaceData,
                 detail,
@@ -201,7 +263,7 @@ class WindowsBleCentral extends BleCentralPlatform {
       }
       return null;
     } finally {
-      _lib.destroyDeviceInfoList(devInfo);
+      lib.destroyDeviceInfoList(devInfo);
       calloc
         ..free(guid)
         ..free(ifaceData)

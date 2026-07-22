@@ -52,11 +52,10 @@ const int lupFlushCache = 0x1000; // LUP_FLUSHCACHE: run a fresh radio inquiry
 const int wsaEFault = 10014; // WSAEFAULT: result buffer too small
 // End-of-enumeration is signalled by WSA_E_NO_MORE (10110) or, on older
 // stacks, WSAENOMORE (10102); the inquiry loop treats ANY non-WSAEFAULT error
-// as "done", so no constants are needed for them. The two below matter for
-// End-ownership: they mean the lookup was ALREADY ended from another thread.
-const int wsaInvalidHandle = 6; // WSA_INVALID_HANDLE
-const int wsaECancelled =
-    10111; // WSA_E_CANCELLED (blocked Next aborted by End)
+// — including WSA_E_CANCELLED (10111) and WSA_INVALID_HANDLE (6) from a
+// main-isolate WSALookupServiceEnd — as "done", so no constants are needed
+// for them. The worker never Ends the handle itself: the main isolate owns
+// every End (see `_endLookup` in windows_platform.dart).
 
 /// `INVALID_SOCKET` is `(SOCKET)(~0)`; SOCKET is `UINT_PTR` (64-bit on x64).
 final int invalidSocket = -1; // all-ones when read as a pointer-sized int

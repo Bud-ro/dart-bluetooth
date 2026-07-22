@@ -23,9 +23,15 @@ import '../platform_interface.dart';
 class LinuxBleCentral extends BleCentralPlatform {
   LinuxBleCentral({DBusClient? bus, String adapter = 'hci0'})
     : _bus = bus ?? DBusClient.system(),
+      _ownsBus = bus == null,
       _adapterName = adapter;
 
   final DBusClient _bus;
+
+  /// Whether [dispose] may close [_bus]: only when this backend created it. A
+  /// caller-injected client is theirs to manage (mirrors the rfcomm backend).
+  final bool _ownsBus;
+
   final String _adapterName;
 
   static const String _service = 'org.bluez';
@@ -151,6 +157,106 @@ class LinuxBleCentral extends BleCentralPlatform {
     return result;
   }
 
+  /// Filter of the scan currently driving the BlueZ inquiry (one shared client
+  /// has one filter), kept so a suspend/resume recovery can re-issue the same
+  /// StartDiscovery.
+  List<Uuid>? _activeFilter;
+
+  /// Whether this client's BlueZ discovery session is believed to be running.
+  /// Cleared when the adapter powers off (BlueZ silently tears the session
+  /// down on suspend/rfkill) so the recovery path knows to restart it.
+  bool _discovering = false;
+
+  /// Adapter Powered/Discovering watch, armed while local scans are live.
+  /// Signal-driven (no polling): on Powered=false the internal discovering
+  /// flag is cleared; on Powered=true — or on an externally-dropped
+  /// Discovering while scans are live — a serialized restart op re-fires
+  /// SetDiscoveryFilter + StartDiscovery, so a scan stream survives a
+  /// laptop lid-close/open instead of going silently dead.
+  StreamSubscription<DBusPropertiesChangedSignal>? _adapterScanWatch;
+
+  void _armAdapterScanWatch() {
+    _adapterScanWatch ??= _obj(_adapterPath).propertiesChanged.listen(
+      (sig) {
+        if (sig.propertiesInterface != _adapterIface) return;
+        final powered = sig.changedProperties['Powered'];
+        final discovering = sig.changedProperties['Discovering'];
+        if (powered is DBusBoolean && !powered.value) {
+          // Adapter went down: the discovery session is gone with it. Mark it
+          // so the power-on path below restarts, and don't try now (BlueZ
+          // would answer NotReady).
+          _discovering = false;
+          logScan.warning(
+            'adapter powered off during scan; discovery will restart on '
+            'power-on',
+          );
+          return;
+        }
+        final poweredBackOn = powered is DBusBoolean && powered.value;
+        final discoveryDropped =
+            discovering is DBusBoolean && !discovering.value;
+        if (discoveryDropped) _discovering = false;
+        if ((poweredBackOn || discoveryDropped) &&
+            _scanRefs > 0 &&
+            !_discovering) {
+          unawaited(
+            _enqueueScanOp(() async {
+              // Re-checked at execution: the last scan may have cancelled (or
+              // an earlier restart already succeeded) while this op queued.
+              if (_scanRefs <= 0 || _discovering) return;
+              try {
+                await _startBluezDiscovery(_activeFilter);
+                logScan.fine('discovery restarted after adapter power-cycle');
+              } catch (e) {
+                // Powered may still be off mid-transition; the next
+                // Powered=true signal retries.
+                logScan.warning(() => 'discovery restart failed: $e');
+              }
+            }),
+          );
+        }
+      },
+      onError: (Object e) =>
+          logScan.warning(() => 'adapter scan-watch signal error: $e'),
+    );
+  }
+
+  Future<void> _disarmAdapterScanWatch() async {
+    final watch = _adapterScanWatch;
+    _adapterScanWatch = null;
+    await watch?.cancel();
+  }
+
+  /// Configures the discovery filter and starts the BlueZ inquiry. Must run
+  /// inside the serialized scan-op chain.
+  Future<void> _startBluezDiscovery(List<Uuid>? withServices) async {
+    // Restrict to LE and (optionally) the requested services so we don't
+    // surface Classic-only devices on a dual-mode adapter.
+    final filter = <String, DBusValue>{'Transport': const DBusString('le')};
+    if (withServices != null && withServices.isNotEmpty) {
+      filter['UUIDs'] = DBusArray.string(
+        withServices.map((u) => u.value).toList(),
+      );
+    }
+    await _obj(_adapterPath)
+        .callMethod(_adapterIface, 'SetDiscoveryFilter', [
+          DBusDict.stringVariant(filter),
+        ], replySignature: DBusSignature(''))
+        .timeout(_busTimeout);
+    if (_scanRefs <= 0) return;
+    try {
+      await _obj(
+        _adapterPath,
+      ).callMethod(_adapterIface, 'StartDiscovery', []).timeout(_busTimeout);
+    } on DBusMethodResponseException catch (e) {
+      // A discovery already running on this client (a race with a stop
+      // still in flight) reports InProgress — the radio is already doing
+      // what we want, so that's success, not an error.
+      if (e.errorName != 'org.bluez.Error.InProgress') rethrow;
+    }
+    _discovering = true;
+  }
+
   @override
   Stream<BleScanResult> startScan({List<Uuid>? withServices}) {
     late StreamController<BleScanResult> controller;
@@ -218,6 +324,11 @@ class LinuxBleCentral extends BleCentralPlatform {
       // concurrent scan rides the one already running (with its filter — one
       // shared client has one filter).
       if (_scanRefs != 1) return;
+      _activeFilter = withServices;
+      // Watch Powered/Discovering while scans are live, so a suspend/resume
+      // (which silently kills the BlueZ session) restarts discovery instead of
+      // leaving the stream dead.
+      _armAdapterScanWatch();
       await _enqueueScanOp(() async {
         // Cancels that landed while this op was queued — or during the filter
         // call below — must not let StartDiscovery run after StopDiscovery, or
@@ -225,30 +336,7 @@ class LinuxBleCentral extends BleCentralPlatform {
         // refcount (not a per-stream flag) so cancelling this stream doesn't
         // starve a concurrent scan that is riding this StartDiscovery.
         if (_scanRefs <= 0) return;
-        // Restrict to LE and (optionally) the requested services so we don't
-        // surface Classic-only devices on a dual-mode adapter.
-        final filter = <String, DBusValue>{'Transport': const DBusString('le')};
-        if (withServices != null && withServices.isNotEmpty) {
-          filter['UUIDs'] = DBusArray.string(
-            withServices.map((u) => u.value).toList(),
-          );
-        }
-        await _obj(_adapterPath)
-            .callMethod(_adapterIface, 'SetDiscoveryFilter', [
-              DBusDict.stringVariant(filter),
-            ], replySignature: DBusSignature(''))
-            .timeout(_busTimeout);
-        if (_scanRefs <= 0) return;
-        try {
-          await _obj(_adapterPath)
-              .callMethod(_adapterIface, 'StartDiscovery', [])
-              .timeout(_busTimeout);
-        } on DBusMethodResponseException catch (e) {
-          // A discovery already running on this client (a race with a stop
-          // still in flight) reports InProgress — the radio is already doing
-          // what we want, so that's success, not an error.
-          if (e.errorName != 'org.bluez.Error.InProgress') rethrow;
-        }
+        await _startBluezDiscovery(withServices);
         logScan.fine('scan started');
       });
     }
@@ -276,9 +364,12 @@ class LinuxBleCentral extends BleCentralPlatform {
         await changedSub?.cancel();
         addedSub = null;
         changedSub = null;
-        // Only the LAST local scan stops the radio inquiry.
+        // Only the LAST local scan stops the radio inquiry (and drops the
+        // adapter watch — disarmed FIRST, so our own StopDiscovery's
+        // Discovering=false signal can't be mistaken for a dropped session).
         if (_scanRefs <= 0) {
           _scanRefs = 0;
+          await _disarmAdapterScanWatch();
           await _enqueueScanOp(_stopBluezDiscovery);
         }
       },
@@ -306,6 +397,7 @@ class LinuxBleCentral extends BleCentralPlatform {
   }
 
   Future<void> _stopBluezDiscovery() async {
+    _discovering = false;
     try {
       await _obj(
         _adapterPath,
@@ -337,7 +429,12 @@ class LinuxBleCentral extends BleCentralPlatform {
 
   @override
   Future<void> dispose() async {
-    await _bus.close();
+    await _disarmAdapterScanWatch();
+    // Vacate the platform-level singleton slot so a later default construction
+    // gets a fresh backend, not this disposed one.
+    BleCentralPlatform.detachInstance(this);
+    // A caller-injected bus is theirs to manage; only close one we created.
+    if (_ownsBus) await _bus.close();
   }
 
   // --- Helpers -------------------------------------------------------------
@@ -358,6 +455,26 @@ class LinuxBleCentral extends BleCentralPlatform {
     }
     if (e is DBusUnknownObjectException) {
       throw DeviceNotFoundException('Unknown object during $op', cause: e);
+    }
+    if (e is DBusMethodResponseException) {
+      throw switch (e.errorName) {
+        // Adapter powered off — the retry story is "wait for the adapter",
+        // exactly what BleDisabledException documents.
+        'org.bluez.Error.NotReady' => BleDisabledException(
+          'Bluetooth adapter is powered off',
+          cause: e,
+        ),
+        'org.bluez.Error.NotAuthorized' ||
+        'org.bluez.Error.AuthenticationRejected' => BlePermissionException(
+          'Not authorized during $op',
+          cause: e,
+        ),
+        'org.bluez.Error.DoesNotExist' => DeviceNotFoundException(
+          'Unknown device during $op',
+          cause: e,
+        ),
+        _ => BleException('BlueZ error during $op', cause: e),
+      };
     }
     throw BleException('D-Bus error during $op', cause: e);
   }
@@ -413,8 +530,14 @@ class LinuxBleCentral extends BleCentralPlatform {
     final mfg = props['ManufacturerData'];
     if (mfg is DBusDict) {
       mfg.children.forEach((k, v) {
-        final company = (k as DBusUint16).value;
-        manufacturerData[company] = _bytesOf((v as DBusVariant).value);
+        // Guard per entry (like serviceUuids/serviceData): one malformed
+        // peer-supplied entry must not discard the whole sighting.
+        if (k is! DBusUint16) return;
+        try {
+          manufacturerData[k.value] = _bytesOf((v as DBusVariant).value);
+        } catch (_) {
+          // Skip a malformed manufacturer-data entry.
+        }
       });
     }
 
@@ -887,6 +1010,28 @@ class LinuxGattConnection implements GattConnection {
     }
     if (e is FormatException) {
       throw BleGattException('malformed data during $op', cause: e);
+    }
+    if (e is DBusMethodResponseException) {
+      // BlueZ's typed errors carry the real story (mirrors the rfcomm Linux
+      // mapper): NotReady is the adapter being off (isTransient=false — park
+      // on adapterStateChanges, don't hammer BlueZ in a retry loop), and
+      // DoesNotExist is an unknown device.
+      throw switch (e.errorName) {
+        'org.bluez.Error.NotReady' => BleDisabledException(
+          'Bluetooth adapter is powered off',
+          cause: e,
+        ),
+        'org.bluez.Error.NotAuthorized' ||
+        'org.bluez.Error.AuthenticationRejected' => BlePermissionException(
+          'Not authorized during $op',
+          cause: e,
+        ),
+        'org.bluez.Error.DoesNotExist' => DeviceNotFoundException(
+          'Unknown device during $op',
+          cause: e,
+        ),
+        _ => BleConnectionException('BlueZ error during $op', cause: e),
+      };
     }
     throw BleConnectionException('D-Bus error during $op', cause: e);
   }

@@ -102,9 +102,18 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
 @property(nonatomic) NSUInteger pendingChars;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingReads;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingWrites;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingSubscribes;
 @property(nonatomic, strong) NSMutableSet<NSString *> *subscribed;
+// Write-without-response payloads waiting for CoreBluetooth's outgoing queue
+// to have room. Confined to the central's serial queue. Unbounded on purpose:
+// mirroring the rfcomm macOS write queue's contract, nothing is ever silently
+// dropped or silently bounded — pending entries either get submitted (op
+// completes 0) or failed on teardown (op completes -1).
+@property(nonatomic, strong) NSMutableArray<NSDictionary *> *pendingWwr;
 - (CBCharacteristic *)charForService:(NSString *)svc characteristic:(NSString *)chr;
 - (void)emitServices;
+- (void)drainWwr;
+- (void)failPendingWwr;
 @end
 
 @implementation BLEPeripheral
@@ -113,7 +122,9 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   if ((self = [super init])) {
     _pendingReads = [NSMutableDictionary dictionary];
     _pendingWrites = [NSMutableDictionary dictionary];
+    _pendingSubscribes = [NSMutableDictionary dictionary];
     _subscribed = [NSMutableSet set];
+    _pendingWwr = [NSMutableArray array];
   }
   return self;
 }
@@ -216,6 +227,58 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
     [self.pendingWrites removeObjectForKey:key];
     if (g_op) g_op(reqId.longLongValue, error ? -1 : 0, NULL, NULL, 0);
   }
+}
+
+// Submits queued write-without-response payloads while CoreBluetooth reports
+// room in its outgoing queue, completing each op only once its write was
+// actually handed over. CoreBluetooth silently DISCARDS writeValue: calls of
+// type WithoutResponse issued while that queue is full, so every WWR is gated
+// on canSendWriteWithoutResponse (macOS 10.13+/iOS 11+; on older systems the
+// gate is unavailable and writes go straight through, matching the previous
+// behavior). Runs on the central's serial queue.
+- (void)drainWwr {
+  while (self.pendingWwr.count) {
+    if (@available(macOS 10.13, iOS 11.0, *)) {
+      if (!self.peripheral.canSendWriteWithoutResponse) return;
+    }
+    NSDictionary *item = self.pendingWwr.firstObject;
+    [self.pendingWwr removeObjectAtIndex:0];
+    [self.peripheral writeValue:item[@"payload"]
+              forCharacteristic:item[@"char"]
+                           type:CBCharacteristicWriteWithoutResponse];
+    if (g_op) g_op([item[@"req"] longLongValue], 0, NULL, NULL, 0);
+  }
+}
+
+// CoreBluetooth's "queue has room again" signal — the other half of the
+// canSendWriteWithoutResponse gate in drainWwr.
+- (void)peripheralIsReadyToSendWriteWithoutResponse:(CBPeripheral *)peripheral {
+  (void)peripheral;
+  [self drainWwr];
+}
+
+// Fails every not-yet-submitted write-without-response op (teardown path):
+// their bytes never reached CoreBluetooth, and per the no-silent-drop contract
+// that must be reported, not swallowed.
+- (void)failPendingWwr {
+  for (NSDictionary *item in self.pendingWwr) {
+    if (g_op) g_op([item[@"req"] longLongValue], -1, NULL, NULL, 0);
+  }
+  [self.pendingWwr removeAllObjects];
+}
+
+- (void)peripheral:(CBPeripheral *)peripheral
+    didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)characteristic
+                                          error:(NSError *)error {
+  (void)peripheral;
+  NSString *key = char_key(characteristic);
+  // A failed enable must not leave the key routing notifications that will
+  // never come (and the Dart stream is about to error out anyway).
+  if (error) [self.subscribed removeObject:key];
+  NSNumber *reqId = self.pendingSubscribes[key];
+  if (!reqId) return;
+  [self.pendingSubscribes removeObjectForKey:key];
+  if (g_op) g_op(reqId.longLongValue, error ? -1 : 0, NULL, NULL, 0);
 }
 
 @end
@@ -332,6 +395,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   (void)error;
   BLEPeripheral *w = [self wrapperForPeripheral:peripheral];
   if (w) {
+    [w failPendingWwr];
     if (g_state) g_state(w.token, 0);
     [self.connections removeObjectForKey:@(w.token)];
   }
@@ -344,6 +408,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   (void)error;
   BLEPeripheral *w = [self wrapperForPeripheral:peripheral];
   if (w) {
+    [w failPendingWwr];
     if (g_state) g_state(w.token, 0);
     [self.connections removeObjectForKey:@(w.token)];
   }
@@ -419,6 +484,17 @@ void ble_stop_scan(void) {
     c.wantScan = NO;
     c.scanning = NO;
     [c.manager stopScan];
+    // A long scan accumulates one strongly-retained CBPeripheral per unique
+    // advertiser identity (privacy address rotation mints new identities all
+    // day); drop them now rather than only on the NEXT start, keeping just the
+    // peripherals a live connection still references. Connect-after-stop still
+    // works: ble_connect falls back to retrievePeripheralsWithIdentifiers.
+    NSMutableDictionary<NSString *, CBPeripheral *> *keep =
+        [NSMutableDictionary dictionary];
+    for (BLEPeripheral *w in c.connections.allValues) {
+      keep[w.peripheral.identifier.UUIDString] = w.peripheral;
+    }
+    [c.peripherals setDictionary:keep];
   });
 }
 
@@ -461,6 +537,15 @@ void ble_disconnect(int64_t conn_token) {
   dispatch_async(c.queue, ^{
     BLEPeripheral *w = c.connections[@(conn_token)];
     if (!w) return;
+    // Remove the wrapper HERE, not (only) in the delegate: cancelling a
+    // still-PENDING connect yields NO didDisconnect/didFailToConnect callback,
+    // so waiting for one leaks the wrapper — and a leaked wrapper can shadow a
+    // live one in wrapperForPeripheral:. The Dart side tears its connection
+    // state down alongside every ble_disconnect, and a later delegate event
+    // for this peripheral finds no wrapper and is a no-op.
+    [w failPendingWwr];
+    w.peripheral.delegate = nil;
+    [c.connections removeObjectForKey:@(conn_token)];
     [c.manager cancelPeripheralConnection:w.peripheral];
   });
 }
@@ -518,10 +603,15 @@ void ble_write(int64_t req_id, int64_t conn_token, const char *service,
       return;
     }
     if (without_response) {
-      [w.peripheral writeValue:payload
-             forCharacteristic:ch
-                          type:CBCharacteristicWriteWithoutResponse];
-      if (g_op) g_op(req_id, 0, NULL, NULL, 0);
+      // Queue-and-drain (see drainWwr): the op completes only once the write
+      // was actually submitted to CoreBluetooth — issuing writeValue: while
+      // the WWR queue is full would silently discard the payload.
+      [w.pendingWwr addObject:@{
+        @"req" : @(req_id),
+        @"payload" : payload,
+        @"char" : ch,
+      }];
+      [w drainWwr];
     } else {
       w.pendingWrites[char_key(ch)] = @(req_id);
       [w.peripheral writeValue:payload
@@ -546,6 +636,36 @@ void ble_subscribe(int64_t conn_token, const char *service,
     } else {
       [w.subscribed removeObject:key];
     }
+    [w.peripheral setNotifyValue:(enable ? YES : NO) forCharacteristic:ch];
+  });
+}
+
+void ble_set_notify(int64_t req_id, int64_t conn_token, const char *service,
+                    const char *characteristic, int32_t enable) {
+  BLECentral *c = [BLECentral shared];
+  NSString *svc = @(service), *chr = @(characteristic);
+  dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
+    CBCharacteristic *ch = [w charForService:svc characteristic:chr];
+    if (!ch) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
+    NSString *key = char_key(ch);
+    if (enable) {
+      [w.subscribed addObject:key];
+    } else {
+      [w.subscribed removeObject:key];
+    }
+    // A pending toggle for the same characteristic being superseded must not
+    // leave its op hanging forever — fail it before tracking the new one.
+    NSNumber *old = w.pendingSubscribes[key];
+    if (old && g_op) g_op(old.longLongValue, -1, NULL, NULL, 0);
+    w.pendingSubscribes[key] = @(req_id);
     [w.peripheral setNotifyValue:(enable ? YES : NO) forCharacteristic:ch];
   });
 }
@@ -582,8 +702,9 @@ void ble_reset(void) {
       w.peripheral.delegate = nil;
       [c.manager cancelPeripheralConnection:w.peripheral];
     }
-    // Dropping the wrappers also drops their op-tracking state
-    // (pendingReads/pendingWrites/subscribed).
+    // Dropping the wrappers also drops their op-tracking state (pendingReads/
+    // pendingWrites/pendingSubscribes/pendingWwr/subscribed); g_op is already
+    // NULL, so there is no one left to notify.
     [c.connections removeAllObjects];
     [c.peripherals removeAllObjects];
   });

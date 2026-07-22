@@ -2,20 +2,43 @@
 
 ## 0.1.1
 
-Reliability fixes from two deep review passes — no API changes beyond new
+Reliability fixes from three deep review passes — no API changes beyond new
 `BleLoggers.root` / `.loggers` / `.setLevel(...)` logging conveniences.
 
-- Android: enabling notifications no longer collides with the next GATT op
-  (the CCCD write is now a tracked op) — the everyday "listen then write"
-  serial flow works. Needs `bluetooth_le_flutter` >= 0.1.1.
+- Apple: write-without-response no longer reports success while CoreBluetooth
+  silently drops chunks — writes are gated on `canSendWriteWithoutResponse`
+  and queued until the peripheral is ready, so bulk `BleSerial` sends arrive
+  intact. A failed notify enable now errors the subscribe stream instead of
+  going silently dead; connecting with the adapter off throws
+  `BleDisabledException` instead of hanging; cancelled pending connects no
+  longer leak native wrappers; stopping a scan releases the peripherals a
+  long scan accumulated.
 - Apple: fixed a thread-safety race in the native connection bookkeeping that
   could crash on disconnect; hot restarts can no longer crash on stale native
   callbacks (new quiesce-on-construction/dispose).
+- Android: enabling notifications no longer collides with the next GATT op
+  (the CCCD write is now a tracked op) — the everyday "listen then write"
+  serial flow works. `connect()` now throws `BleDisabledException` /
+  `BlePermissionException` for adapter-off / missing-permission failures
+  instead of a transient `DeviceNotFoundException` that invited endless
+  retries. Needs `bluetooth_le_flutter` >= 0.1.1.
 - Linux: concurrent scans no longer stop each other; streams can be
   re-listened after cancelling; a link drop during subscribe setup no longer
-  kills the process.
-- `BleSerial.input`: the last listener cancelling now really disables
-  notifications, and re-listening re-enables them.
+  kills the process. Scans now survive suspend/resume (a Powered/Discovering
+  watch restarts discovery on power-on); BlueZ `NotReady` / `DoesNotExist`
+  errors map to `BleDisabledException` / `DeviceNotFoundException`; one
+  malformed manufacturer-data entry no longer hides a whole sighting; and
+  `dispose()` no longer closes a caller-supplied `DBusClient`.
+- Windows: `connect()` now runs its blocking Win32 calls on a worker isolate
+  and honours the `timeout` parameter.
+- `BleSerial.input`: bytes arriving while nobody listens are buffered (1 MiB
+  bound, replayed in order to the next listener); notifications stay enabled
+  until `close()` releases them; a backend whose subscribe throws (Windows)
+  errors the stream instead of crashing the process.
+- Lifecycle: `BleCentral.dispose()` disposes only a caller-injected platform
+  (the process-shared backend survives the facade), and a backend's own
+  `dispose()` vacates the shared platform slot so later use gets a fresh
+  backend instead of a disposed, silent one.
 
 ## 0.1.0
 

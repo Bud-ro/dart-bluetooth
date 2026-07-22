@@ -213,9 +213,12 @@ for (var off = 0; off < payload.length; off += chunkSize) {
 await conn.drain(); // fully handed to the OS (throws if the link died first)
 ```
 
-`drain(belowBytes: 0)` is exact and poll-free on Windows/Linux/Android (it
-rides `flush`); elsewhere, and for `belowBytes > 0`, the queue is polled every
-~5 ms — plenty precise for pacing.
+`drain(belowBytes: 0)` rides `flush` (exact on Windows/Linux/Android, drains
+the native queue on macOS); for `belowBytes > 0` the queue is polled every
+~5 ms with an automatic `flush` fallback when the gauge shows no progress
+(Linux reports an upper bound that only `flush` refreshes) — pacing converges
+on every platform. `drain` throws if queued bytes were discarded (link death
+or `close()`) rather than reporting a lie of success.
 
 **Why is there no `bitsPerSecond`?** Unlike a UART, Bluetooth Classic
 advertises **no throughput number anywhere** — no OS API reports a data rate

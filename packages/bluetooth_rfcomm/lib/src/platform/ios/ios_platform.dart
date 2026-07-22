@@ -14,6 +14,7 @@ import '../../models/discovery_result.dart';
 import '../../models/enums.dart';
 import '../../models/uuid.dart';
 import '../platform_interface.dart';
+import '../transport_stats.dart';
 import 'ios_bindings.dart';
 
 // Additive binding for the transport-introspection C export. Declared here
@@ -224,7 +225,7 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 }
 
-class _IosEaTransport implements RfcommTransport {
+class _IosEaTransport implements RfcommTransport, TransportStats {
   _IosEaTransport(this._token);
 
   final int _token;
@@ -237,6 +238,16 @@ class _IosEaTransport implements RfcommTransport {
   final Completer<void> _connected = Completer<void>();
   ConnectionState _current = ConnectionState.connecting;
   bool _closed = false;
+
+  /// Bytes still in the native outBuffer when the session tore down — latched
+  /// BEFORE close zeroes the gauge, so the loss stays reportable (flush
+  /// throws; stats expose it) per the lossless-send contract, even though
+  /// this transport self-closes on the native state callback before the
+  /// connection layer can observe the queue.
+  int _droppedTxBytes = 0;
+
+  @override
+  Map<String, int> nativeStats() => {'txDroppedBytes': _droppedTxBytes};
 
   void bindHandle(int handle) => _handle = handle;
 
@@ -315,11 +326,23 @@ class _IosEaTransport implements RfcommTransport {
     while (!_closed && _handle != 0 && _btcEaPending(_handle) > 0) {
       await Future<void>.delayed(const Duration(milliseconds: 5));
     }
+    // A teardown that discarded queued bytes must be reported, matching
+    // every other platform's flush semantics.
+    if (_droppedTxBytes > 0) {
+      throw BluetoothWriteException(
+        'flush failed — $_droppedTxBytes bytes discarded at disconnect',
+      );
+    }
   }
 
   @override
   Future<void> close() async {
     if (_closed) return;
+    // Latch the loss before the native close discards the outBuffer.
+    if (_handle != 0) {
+      final pend = _btcEaPending(_handle);
+      if (pend > 0) _droppedTxBytes += pend;
+    }
     _closed = true;
     final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;

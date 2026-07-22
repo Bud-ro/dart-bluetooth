@@ -141,6 +141,10 @@ class FakeGattConnection implements GattConnection {
   /// assert the enable-on-first / disable-on-last contract.
   final Map<Uuid, bool> notifyEnabled = {};
 
+  /// If set, [subscribe] throws this synchronously (mimicking e.g. the Windows
+  /// backend's `BleUnsupportedException`).
+  Object? subscribeError;
+
   final Map<Uuid, StreamController<Uint8List>> _notify = {};
   final StreamController<BleConnectionState> _state =
       StreamController<BleConnectionState>.broadcast();
@@ -184,6 +188,8 @@ class FakeGattConnection implements GattConnection {
 
   @override
   Stream<Uint8List> subscribe(Uuid service, Uuid characteristic) {
+    final err = subscribeError;
+    if (err != null) throw err;
     final c = _notify.putIfAbsent(
       characteristic,
       () => StreamController<Uint8List>.broadcast(

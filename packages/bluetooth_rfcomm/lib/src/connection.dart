@@ -259,8 +259,11 @@ class BluetoothConnection {
   ///    [pendingWriteBytes] is below a cap, then `await drain(belowBytes: …)`.
   ///
   /// Empty payloads are ignored. Throws [BluetoothWriteException] if [data]
-  /// exceeds the platform's 32-bit length limit, or if the connection is already
-  /// closed / has dropped (check [isConnected] if you need to avoid that).
+  /// exceeds the platform's 32-bit length limit, if the connection is already
+  /// closed / has dropped (check [isConnected] if you need to avoid that), or
+  /// if a platform-side safety cap rejects the write (macOS bounds its native
+  /// backlog at 4 MiB — only reachable by ignoring the pacing guidance
+  /// above). A throw always means ZERO bytes of this call were accepted.
   /// Payloads larger than [maxPayloadSize] are fine — transports split them
   /// into OS-sized writes; the limit is per *native write*, not per [add].
   void add(Uint8List data) {
@@ -315,8 +318,12 @@ class BluetoothConnection {
   /// Bytes accepted by [add]/[write] but not yet handed to the OS — the
   /// current depth of the unbounded outbound queue. 0 means fully drained.
   ///
-  /// Poll it to window bulk transfers (see [drain]) or to surface a
-  /// "sending…" indicator; it is accurate on every platform.
+  /// Precision varies by platform: live on Windows (small reporting
+  /// granularity), macOS, iOS and Android; on Linux it is an UPPER BOUND that
+  /// only [flush] resets (dart:io sockets hide their internal buffer).
+  /// [drain] compensates automatically — it falls back to a flush when the
+  /// gauge shows no progress — so pacing works everywhere; treat the raw
+  /// value on Linux as "at most this much still queued".
   int get pendingWriteBytes => _transport.pendingWriteBytes;
 
   /// Completes once [pendingWriteBytes] is at or below [belowBytes] — the
@@ -331,13 +338,25 @@ class BluetoothConnection {
   /// (~5 ms) — ample for pacing, not for hard real-time.
   ///
   /// Throws [BluetoothWriteException] if the connection drops (or [close]
-  /// discards the queue) while more than [belowBytes] bytes remain — queued
-  /// bytes were lost, and per this package's no-silent-drop contract that is
-  /// always reported. Completes normally, without waiting, whenever the
-  /// condition already holds — even after disconnect.
+  /// discards the queue) while bytes this call was waiting on were lost —
+  /// detected via the discard accounting, so a teardown that zeroes the
+  /// gauge cannot masquerade as a successful drain. Completes normally,
+  /// without waiting, whenever the condition already holds and nothing was
+  /// discarded since the call began — even after disconnect.
   Future<void> drain({int belowBytes = 0}) async {
     RangeError.checkNotNegative(belowBytes, 'belowBytes');
+    final discardedAtStart = _txDiscardedBytes;
+    var lastPending = -1;
+    var stalePolls = 0;
     while (true) {
+      // Discards are checked FIRST: transports zero their gauge on teardown,
+      // so "pending dropped to 0" alone cannot be trusted as delivery.
+      final lost = _txDiscardedBytes - discardedAtStart;
+      if (lost > 0) {
+        throw BluetoothWriteException(
+          '$lost queued bytes were discarded before delivery',
+        );
+      }
       final pending = _transport.pendingWriteBytes;
       if (pending <= belowBytes) return;
       if (_state == ConnectionState.disconnected) {
@@ -346,10 +365,29 @@ class BluetoothConnection {
         );
       }
       if (belowBytes == 0) {
-        // Poll-free where the platform acknowledges drains; on macOS/iOS
-        // flush resolves immediately and we fall through to the poll.
+        // Poll-free where the platform acknowledges drains (Windows, Linux,
+        // Android, and macOS via its native pending gauge). The delay guards
+        // against a tight loop on any platform whose flush can resolve
+        // without fully draining.
         await flush();
-        if (_transport.pendingWriteBytes == 0) return;
+        if (_transport.pendingWriteBytes > 0) {
+          await Future<void>.delayed(_drainPollInterval);
+        }
+        continue; // re-run the loss check before declaring success
+      }
+      // Windowed waits poll — but on platforms whose gauge only updates at
+      // flush boundaries (Linux reports an upper bound), polling alone would
+      // never observe progress. A short no-progress watchdog falls back to a
+      // real flush so the wait always converges.
+      if (pending == lastPending) {
+        if (++stalePolls >= 8) {
+          stalePolls = 0;
+          await flush();
+          continue;
+        }
+      } else {
+        lastPending = pending;
+        stalePolls = 0;
       }
       await Future<void>.delayed(_drainPollInterval);
     }

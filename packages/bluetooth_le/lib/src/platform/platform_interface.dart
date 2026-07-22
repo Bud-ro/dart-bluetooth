@@ -21,6 +21,14 @@ abstract class BleCentralPlatform {
 
   static set instance(BleCentralPlatform platform) => _instance = platform;
 
+  /// Detaches [platform] from the shared [instance] slot if it currently
+  /// occupies it, so the next [instance] read builds a fresh backend instead
+  /// of handing out a disposed one. Platform implementations call this from
+  /// their `dispose()`; a no-op when [platform] is not the shared instance.
+  static void detachInstance(BleCentralPlatform platform) {
+    if (identical(_instance, platform)) _instance = null;
+  }
+
   Future<bool> isSupported();
 
   Future<BluetoothAdapterState> adapterState();

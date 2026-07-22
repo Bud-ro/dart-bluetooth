@@ -71,6 +71,9 @@ void main() {
   );
 
   tearDownAll(() async {
-    await ble.dispose();
+    // BleCentral.dispose() leaves the process-shared backend running (it only
+    // disposes a caller-injected platform); tear the backend down directly so
+    // the native callables release their isolate pin and the runner exits.
+    await BleCentralPlatform.instance.dispose();
   });
 }

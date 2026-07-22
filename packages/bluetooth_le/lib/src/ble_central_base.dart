@@ -24,13 +24,24 @@ import 'platform/platform_interface.dart';
 /// ```
 class BleCentral {
   /// Creates a facade over [platform], or the auto-selected host backend.
-  BleCentral({BleCentralPlatform? platform})
-    : _platform = platform ?? BleCentralPlatform.instance;
+  ///
+  /// Ownership: a facade constructed WITHOUT an explicit [platform] shares the
+  /// process-wide backend with every other default-constructed facade
+  /// (including [instance]) — its [dispose] leaves that shared backend
+  /// running. A facade given an explicit [platform] owns it, and [dispose]
+  /// disposes it.
+  BleCentral({BleCentralPlatform? platform}) : _injected = platform;
 
   /// Shared instance backed by the host's default platform.
   static final BleCentral instance = BleCentral();
 
-  final BleCentralPlatform _platform;
+  final BleCentralPlatform? _injected;
+
+  // Resolved per call (not captured at construction) so a shared facade
+  // follows the live BleCentralPlatform.instance — if the backend disposes
+  // itself and vacates the slot, the next use gets a fresh backend instead of
+  // the disposed one.
+  BleCentralPlatform get _platform => _injected ?? BleCentralPlatform.instance;
 
   /// Whether this host can do BLE at all.
   Future<bool> isSupported() => _platform.isSupported();
@@ -97,6 +108,15 @@ class BleCentral {
     }
   }
 
-  /// Releases resources held by the backend.
-  Future<void> dispose() => _platform.dispose();
+  /// Releases resources held by a caller-injected backend.
+  ///
+  /// Only disposes the platform when it was passed to the constructor. The
+  /// process-shared singleton backend must survive this facade — other facades
+  /// (and any constructed later) share it; dispose it directly via
+  /// `BleCentralPlatform.instance.dispose()` if you really mean to tear the
+  /// whole backend down.
+  Future<void> dispose() async {
+    final injected = _injected;
+    if (injected != null) await injected.dispose();
+  }
 }

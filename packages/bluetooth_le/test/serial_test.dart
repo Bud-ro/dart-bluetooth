@@ -38,32 +38,66 @@ void main() {
     expect(received, [1, 2, 3, 4, 5]);
   });
 
-  test('input disables notifications when the last listener cancels', () async {
+  test('notifications stay enabled across a listener gap; close() releases '
+      'them', () async {
     final (_, gatt, serial) = await openSerial();
     final sub = serial.input.listen((_) {});
     await Future<void>.delayed(Duration.zero);
     expect(gatt.notifyEnabled[Uuid.nordicUartTx], isTrue);
     await sub.cancel();
     await Future<void>.delayed(Duration.zero);
+    // Still enabled: data in the gap is buffered, not lost at the peripheral.
+    expect(gatt.notifyEnabled[Uuid.nordicUartTx], isTrue);
+    await serial.close();
     expect(gatt.notifyEnabled[Uuid.nordicUartTx], isFalse);
   });
 
-  test('input can be re-listened after a full cancel (re-enables '
-      'notifications)', () async {
+  test('bytes received in a listen gap are buffered and replayed to the '
+      're-listener', () async {
     final (_, gatt, serial) = await openSerial();
     final first = serial.input.listen((_) {});
     await Future<void>.delayed(Duration.zero);
     await first.cancel();
+    // Data arriving while nobody listens must not vanish.
+    gatt.deliver(Uuid.nordicUartTx, [7]);
     await Future<void>.delayed(Duration.zero);
 
     final received = <int>[];
     serial.input.listen(received.addAll);
     await Future<void>.delayed(Duration.zero);
-    expect(gatt.notifyEnabled[Uuid.nordicUartTx], isTrue);
     gatt.deliver(Uuid.nordicUartTx, [9, 8]);
     await Future<void>.delayed(Duration.zero);
-    expect(received, [9, 8]);
+    expect(received, [7, 9, 8]); // gap bytes first, in order
   });
+
+  test('gap buffer is bounded at 1 MiB, dropping oldest first', () async {
+    final (_, gatt, serial) = await openSerial();
+    final sub = serial.input.listen((_) {});
+    await Future<void>.delayed(Duration.zero);
+    await sub.cancel();
+    gatt.deliver(Uuid.nordicUartTx, List.filled(1 << 20, 0xaa));
+    gatt.deliver(Uuid.nordicUartTx, [1, 2, 3]);
+    await Future<void>.delayed(Duration.zero);
+
+    final received = <List<int>>[];
+    serial.input.listen(received.add);
+    await Future<void>.delayed(Duration.zero);
+    expect(received.single, [1, 2, 3]); // the oldest (1 MiB) chunk was dropped
+  });
+
+  test(
+    'a synchronous subscribe throw surfaces on the stream, not the zone',
+    () async {
+      final (_, gatt, serial) = await openSerial();
+      gatt.subscribeError = const BleUnsupportedException(
+        'notifications unavailable',
+      );
+      final errors = <Object>[];
+      serial.input.listen((_) {}, onError: errors.add);
+      await Future<void>.delayed(Duration.zero);
+      expect(errors.single, isA<BleUnsupportedException>());
+    },
+  );
 
   test('write targets the RX characteristic, without response', () async {
     final (_, gatt, serial) = await openSerial();

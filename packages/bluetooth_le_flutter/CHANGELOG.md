@@ -3,8 +3,10 @@
 ## 0.1.1
 
 - Android native fixes for `bluetooth_le` 0.1.1 (tracked CCCD writes, scan
-  cleanup, hot-restart quiesce hook). Use with `bluetooth_le` >= 0.1.1; no API
-  changes here.
+  cleanup, hot-restart quiesce hook). `connect()` now returns distinct codes
+  for adapter-off (-2) and missing BLUETOOTH_CONNECT (-3) so the Dart side can
+  throw the right exception (additive; older Dart treats them as failure).
+  Use with `bluetooth_le` >= 0.1.1; no API changes here.
 
 ## 0.1.0
 

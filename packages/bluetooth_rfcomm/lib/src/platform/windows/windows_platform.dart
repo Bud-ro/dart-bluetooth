@@ -117,6 +117,20 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
   /// Begin completes), so [stopDiscovery] can abort and close all of them.
   final Map<StreamController<BluetoothDiscoveryResult>, int?> _inquiries = {};
 
+  /// Test hook: replaces the inquiry worker spawn (the real one runs
+  /// `WSALookupService*` on a worker isolate, unrunnable off-Windows). The
+  /// replacement receives the activation's [SendPort] and drives the worker
+  /// protocol itself: optional `{'handle': int}` / `{'error': int}` maps,
+  /// sighting maps, then a terminal `null`.
+  @visibleForTesting
+  Future<void> Function(SendPort port)? debugSpawnInquiry;
+
+  /// Test hook: observes every main-isolate lookup End (called just before
+  /// the `WSALookupServiceEnd` FFI call, which off-Windows fails and is
+  /// swallowed by [_endLookup]'s catch).
+  @visibleForTesting
+  void Function(int handle)? debugOnLookupEnd;
+
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() {
     // A REAL radio inquiry (WSALookupService with LUP_FLUSHCACHE, ~10s per
@@ -126,6 +140,15 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     // WSALookupServiceEnd, which unblocks the worker's WSALookupServiceNext.
     late StreamController<BluetoothDiscoveryResult> controller;
     var cancelled = false;
+    // Activation identity, bumped on every onListen. A rapid cancel→re-listen
+    // leaves the OLD worker's messages (its terminal null, its onExit null,
+    // even its late 'handle') still in flight when the new activation
+    // registers; without an identity check the stale null would close the
+    // controller and delete the NEW activation's _inquiries slot, and a stale
+    // handle would clobber it. A stale message may only close its own
+    // ReceivePort (and End its own orphaned handle) — never touch the
+    // controller or a newer activation's registration.
+    var generation = 0;
 
     void endThisLookup() {
       final handle = _inquiries.remove(controller);
@@ -139,7 +162,18 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
         // would be aborted the moment its handle arrives. The handle slot in
         // _inquiries is likewise reset by the re-registration below.
         cancelled = false;
+        final myGeneration = ++generation;
         _inquiries[controller] = null;
+        // Hold a main-isolate Winsock init for the platform's lifetime: the
+        // terminal-null path below Ends the lookup from THIS isolate after
+        // the worker has already balanced its own WSAStartup with WSACleanup,
+        // so without this the process refcount could hit zero in between and
+        // tear the still-open handle down with Winsock itself. Best-effort:
+        // if Winsock can't load, Begin fails in the worker and surfaces as an
+        // inquiry error. (Same lazy init as the _ws getter.)
+        try {
+          _bindings ??= WinsockBindings()..startup();
+        } catch (_) {}
         // Paired set (instant registry read) so sightings of bonded devices
         // carry the right bond state and a name even before the inquiry's
         // remote-name request resolves.
@@ -155,7 +189,14 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
             // Worker's terminal null, or its onExit notification (whichever
             // arrives first) — either way the inquiry is over.
             rp.close();
-            _inquiries.remove(controller);
+            // Stale activation: a newer onListen owns the controller and the
+            // _inquiries slot now — this null may touch neither.
+            if (myGeneration != generation) return;
+            // The worker never Ends the handle itself (see _inquiryEntry), so
+            // End any handle still registered here. Cancel/stopDiscovery End
+            // on this same event loop and remove the entry as they do, so
+            // exactly one End ever runs per handle.
+            _endLookup(_inquiries.remove(controller));
             if (!controller.isClosed) unawaited(controller.close());
             return;
           }
@@ -163,7 +204,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
             // Uncaught error in the worker isolate (delivered via onError).
             // Surface it; the paired onExit null closes the stream right after.
             logDiscovery.warning(() => 'inquiry isolate error: ${msg[0]}');
-            if (!controller.isClosed) {
+            if (myGeneration == generation && !controller.isClosed) {
               controller.addError(
                 BluetoothDiscoveryException(
                   'Windows inquiry failed',
@@ -176,8 +217,9 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
           final m = msg as Map;
           if (m.containsKey('handle')) {
             final handle = m['handle'] as int;
-            if (cancelled) {
-              // Cancel won the race with the worker's Begin: abort now.
+            if (myGeneration != generation || cancelled) {
+              // Stale activation (superseded by a re-listen), or cancel won
+              // the race with the worker's Begin: abort now.
               _endLookup(handle);
             } else if (_inquiries.containsKey(controller)) {
               _inquiries[controller] = handle;
@@ -187,7 +229,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
             }
           } else if (m.containsKey('error')) {
             logDiscovery.warning(() => 'inquiry failed: wsa=${m['error']}');
-            if (!controller.isClosed) {
+            if (myGeneration == generation && !controller.isClosed) {
               controller.addError(
                 BluetoothDiscoveryException(
                   'Windows inquiry failed',
@@ -213,7 +255,7 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
                     bondState: BluetoothBondState.none,
                   );
             logDiscovery.finer(() => 'inquiry sighting: ${device.id}');
-            if (!controller.isClosed) {
+            if (myGeneration == generation && !controller.isClosed) {
               controller.add(
                 BluetoothDiscoveryResult(
                   device: device,
@@ -224,23 +266,28 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
             }
           }
         });
-        // Never kill this isolate: it must run its cleanup path (End +
-        // WSACleanup + the final null that closes rp) or the open ReceivePort
+        // Never kill this isolate: it must run its cleanup path (WSACleanup +
+        // the final null that closes rp) or the open ReceivePort
         // would keep the main isolate alive. Cancellation is delivered by
         // aborting the lookup handle instead. onExit/onError guarantee the
         // terminal null (and the error) still arrive if the worker dies on an
         // uncaught throw before its own cleanup runs — without them rp would
         // stay open and the facade's scan cycle would hang forever.
-        Isolate.spawn(
-          _inquiryEntry,
-          [rp.sendPort],
-          onExit: rp.sendPort,
-          onError: rp.sendPort,
-        ).then(
+        final spawnInquiry = debugSpawnInquiry;
+        final Future<Object?> spawned = spawnInquiry != null
+            ? spawnInquiry(rp.sendPort)
+            : Isolate.spawn(
+                _inquiryEntry,
+                [rp.sendPort],
+                onExit: rp.sendPort,
+                onError: rp.sendPort,
+              );
+        spawned.then(
           (_) {},
           onError: (Object e) {
             rp.close();
-            if (!controller.isClosed) {
+            if (myGeneration == generation && !controller.isClosed) {
+              _inquiries.remove(controller);
               controller.addError(
                 BluetoothDiscoveryException('inquiry spawn failed', cause: e),
               );
@@ -252,7 +299,8 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
       onCancel: () {
         cancelled = true;
         // Aborts the blocked WSALookupServiceNext; the worker then runs its
-        // cleanup path (End + WSACleanup) and sends the final null itself.
+        // cleanup path (WSACleanup, never a second End) and sends the final
+        // null itself.
         endThisLookup();
       },
     );
@@ -270,11 +318,18 @@ class WindowsBluetoothRfcomm extends BluetoothRfcommPlatform {
     _inquiries.clear();
   }
 
-  /// Aborts an in-flight inquiry: `WSALookupServiceEnd` from this isolate
-  /// unblocks the worker's `WSALookupServiceNext` — the documented
-  /// cross-thread cancel mechanism.
+  /// Ends a lookup: `WSALookupServiceEnd` from this isolate unblocks a
+  /// worker's blocked `WSALookupServiceNext` — the documented cross-thread
+  /// cancel mechanism — and also closes a naturally-completed lookup (the
+  /// terminal-null path). This is the ONLY place End is called (the worker
+  /// never Ends its own handle), and every caller runs on this isolate's
+  /// event loop and removes the handle's _inquiries entry in the same
+  /// synchronous step — so a handle can never be Ended twice, which matters
+  /// because handle values are recycled and a double End could abort an
+  /// unrelated fresh inquiry that reused the value.
   void _endLookup(int? handle) {
     if (handle == null) return;
+    debugOnLookupEnd?.call(handle);
     try {
       _ws.lookupServiceEnd(handle);
     } catch (e) {
@@ -733,6 +788,15 @@ int _wsaError(int err) => err == 0 ? -1 : err;
 /// `WSALookupServiceEnd` (the documented cross-thread cancel); on Begin failure
 /// sends `{'error': int}` instead. The final `null` is sent on EVERY exit path —
 /// the main isolate's ReceivePort stays open until it arrives.
+///
+/// This worker NEVER calls `WSALookupServiceEnd`, not even on natural
+/// completion: handle values are recycled, and a worker-side End racing a
+/// main-side cancel/stopDiscovery End could leave one of the two aborting an
+/// unrelated fresh inquiry that reused the value. Instead the terminal `null`
+/// tells the main isolate to End any handle still registered for this inquiry
+/// — all Ends are thereby serialized on the main isolate's event loop (see
+/// `_endLookup`). The main isolate holds its own WSAStartup for the platform's
+/// lifetime, so the handle survives this worker's balanced `WSACleanup` below.
 void _inquiryEntry(List<Object?> args) {
   final sendPort = args[0] as SendPort;
   final ws = WinsockBindings()..startup();
@@ -763,10 +827,6 @@ void _inquiryEntry(List<Object?> args) {
   var bufSize = 4096;
   var buf = calloc<ffi.Uint8>(bufSize);
   final size = calloc<ffi.Uint32>();
-  // Whether the main isolate already ended this lookup (cancel/stopDiscovery).
-  // If so we must NOT End it again here: lookup handle values are recycled, so
-  // a second End could kill a brand-new unrelated inquiry that reused it.
-  var endedExternally = false;
   try {
     while (true) {
       size.value = bufSize;
@@ -786,12 +846,11 @@ void _inquiryEntry(List<Object?> args) {
           buf = calloc<ffi.Uint8>(bufSize);
           continue;
         }
-        // WSA_E_CANCELLED (blocked Next aborted by a cross-thread End) and
-        // WSA_INVALID_HANDLE (End completed before this Next) both mean the
-        // main isolate owns the End for this handle.
-        endedExternally = err == wsaECancelled || err == wsaInvalidHandle;
-        // Everything else (WSA_E_NO_MORE / WSAENOMORE / real errors) ends the
-        // scan with the handle still ours to close.
+        // WSA_E_CANCELLED (blocked Next aborted by the main isolate's End),
+        // WSA_INVALID_HANDLE (End completed before this Next), natural
+        // completion (WSA_E_NO_MORE / WSAENOMORE) and real errors all end the
+        // scan identically: the main isolate owns every End (see the doc
+        // comment above), so there is nothing to close here.
         break;
       }
       final result = buf.cast<WsaQuerySetW>().ref;
@@ -815,7 +874,6 @@ void _inquiryEntry(List<Object?> args) {
   } finally {
     calloc.free(buf);
     calloc.free(size);
-    if (!endedExternally) ws.lookupServiceEnd(handle);
     ws.wsaCleanup();
     sendPort.send(null);
   }
@@ -980,6 +1038,74 @@ const Duration _sendRetryDelay = Duration(milliseconds: 5);
 const int _consumedReportBytes = 16 * 1024;
 const int _consumedReportMs = 25;
 
+/// Accumulates the writer isolate's consumed-byte count and decides when to
+/// report it (the [_consumedReportBytes]/[_consumedReportMs] gate). When the
+/// gate suppresses a report, a trailing-edge timer is armed so the LAST bytes
+/// of a burst still get reported once the queue goes idle — message receipt is
+/// the only other trigger, so without the timer `pendingWriteBytes` would
+/// stick at a stale nonzero value after a sub-gate burst until the next write
+/// or flush (and `drain(belowBytes: n)`, which polls it without flushing,
+/// would never complete). Extracted from `_writeEntry` so the trailing-report
+/// behaviour is unit-testable on any host.
+@visibleForTesting
+class ConsumedReporter {
+  ConsumedReporter(
+    this._send, {
+    int reportBytes = _consumedReportBytes,
+    Duration reportInterval = const Duration(milliseconds: _consumedReportMs),
+  }) : _reportBytes = reportBytes,
+       _reportInterval = reportInterval;
+
+  /// Sends a cumulative consumed total to the main isolate.
+  final void Function(int total) _send;
+  final int _reportBytes;
+  final Duration _reportInterval;
+  final Stopwatch _gap = Stopwatch()..start();
+  Timer? _trailing;
+  int _total = 0;
+  int _unreported = 0;
+
+  /// Cumulative bytes consumed so far (reported or not) — the exact value the
+  /// flush ack carries.
+  int get total => _total;
+
+  /// Records [bytes] more consumed bytes and reports if the gate allows.
+  void add(int bytes) {
+    _total += bytes;
+    _unreported += bytes;
+    report();
+  }
+
+  /// Reports the current total unless gated (small AND recent); [force]
+  /// bypasses the gate. A gated call arms the trailing-edge timer.
+  void report({bool force = false}) {
+    if (_unreported == 0) return;
+    if (!force &&
+        _unreported < _reportBytes &&
+        _gap.elapsed < _reportInterval) {
+      // Suppressed: arm the trailing report in case no further message (the
+      // usual re-trigger) ever arrives to flush the tail.
+      _trailing ??= Timer(_reportInterval, () {
+        _trailing = null;
+        report(force: true);
+      });
+      return;
+    }
+    _trailing?.cancel();
+    _trailing = null;
+    _send(_total);
+    _unreported = 0;
+    _gap.reset();
+  }
+
+  /// Flushes any unreported tail and cancels the trailing timer (writer exit).
+  void dispose() {
+    report(force: true);
+    _trailing?.cancel();
+    _trailing = null;
+  }
+}
+
 void _writeEntry(List<Object?> args) {
   final socket = args[0] as int;
   final mainPort = args[1] as SendPort;
@@ -1004,29 +1130,21 @@ void _writeEntry(List<Object?> args) {
   // transmitting message N+1 would put a silent hole in a reliable stream.
   var fatalWsa = 0;
   // Cumulative bytes consumed (handed to the OS, or dropped after the link
-  // died — the transport is closing then anyway) for pendingWriteBytes.
-  var consumedTotal = 0;
-  var unreportedConsumed = 0;
-  final reportGap = Stopwatch()..start();
-  void reportConsumed({bool force = false}) {
-    if (unreportedConsumed == 0) return;
-    if (!force &&
-        unreportedConsumed < _consumedReportBytes &&
-        reportGap.elapsedMilliseconds < _consumedReportMs) {
-      return;
-    }
-    mainPort.send(<String, Object>{
-      'event': _evtConsumed,
-      'total': consumedTotal,
-    });
-    unreportedConsumed = 0;
-    reportGap.reset();
-  }
+  // died — the transport is closing then anyway) for pendingWriteBytes. The
+  // reporter's trailing timer runs on this isolate's event loop, which stays
+  // live between messages (rp is open until the exit-null).
+  final consumed = ConsumedReporter(
+    (total) =>
+        mainPort.send(<String, Object>{'event': _evtConsumed, 'total': total}),
+  );
 
   rp.listen((msg) {
     if (msg == null) {
-      // Announce exit BEFORE cleanup: after this message the writer will never
-      // touch the socket again, so close() may safely closesocket.
+      // Final consumed report (dispose flushes any gated tail and cancels the
+      // trailing timer), then announce exit BEFORE cleanup: after that
+      // message the writer will never touch the socket again, so close() may
+      // safely closesocket.
+      consumed.dispose();
       mainPort.send(<String, Object>{'event': _evtWriterExit});
       rp.close();
       calloc.free(buf);
@@ -1042,8 +1160,7 @@ void _writeEntry(List<Object?> args) {
         // Link already failed mid-stream — never transmit past a hole. Count
         // the bytes consumed so pendingWriteBytes drains while the transport
         // tears down (close() discards unflushed bytes by contract).
-        consumedTotal += bytes.length;
-        unreportedConsumed += bytes.length;
+        consumed.add(bytes.length);
       } else {
         if (bytes.length > bufCap) {
           calloc.free(buf);
@@ -1058,8 +1175,7 @@ void _writeEntry(List<Object?> args) {
         final sw = Stopwatch()..start();
         final err = _sendAll(ws, socket, buf, bytes.length);
         sw.stop();
-        consumedTotal += bytes.length;
-        unreportedConsumed += bytes.length;
+        consumed.add(bytes.length);
         if (err != 0) {
           // _sendAll already retried transient errors; any error here means
           // bytes may be missing from the stream — the link is done for.
@@ -1077,12 +1193,11 @@ void _writeEntry(List<Object?> args) {
           });
         }
       }
-      reportConsumed();
     }
     // The flush ack carries the first byte-losing error (0 = every byte handed
     // to the OS) plus the up-to-date consumed total, so a flush after a failed
     // send reports the loss and pendingWriteBytes is exact after a flush.
-    ack?.send(<int>[fatalWsa, consumedTotal]);
+    ack?.send(<int>[fatalWsa, consumed.total]);
   });
 }
 
@@ -1228,6 +1343,22 @@ class _WindowsRfcommTransport implements RfcommTransport {
     _writerControlPort = control;
     control.listen((msg) {
       if (msg is SendPort) {
+        if (_closed) {
+          // close() won the startup race: its exit-null (teardown step 2) had
+          // nowhere to go while _writerSend was still null, so deliver it now
+          // — otherwise close() sits out its full 2s bound waiting for a
+          // writer exit that was never requested. The queued writes are
+          // dropped, not forwarded (close() discards unflushed bytes by
+          // contract). The writer hasn't touched the socket since the
+          // setsockopt that PRECEDED this SendPort and never will (the
+          // exit-null is the only message it gets), so it is already safe to
+          // closesocket — complete _writerExited directly rather than wait
+          // for a _evtWriterExit that a spawn-race kill may have prevented.
+          _pendingWrites.clear();
+          msg.send(null);
+          if (!_writerExited.isCompleted) _writerExited.complete();
+          return;
+        }
         _writerSend = msg;
         for (final w in _pendingWrites) {
           msg.send(w);
@@ -1303,7 +1434,10 @@ class _WindowsRfcommTransport implements RfcommTransport {
   /// Granularity: the writer isolate reports its consumed total at most every
   /// [_consumedReportBytes] bytes / [_consumedReportMs] ms, and a [flush] ack
   /// carries an exact total — so this can briefly OVER-state the backlog by up
-  /// to that window, never under-state it. Returns 0 once closed.
+  /// to that window, never under-state it. A trailing-edge report (see
+  /// [ConsumedReporter]) guarantees convergence to the true backlog within
+  /// ~2× [_consumedReportMs] of the writer going idle, without needing a
+  /// flush. Returns 0 once closed.
   @override
   int get pendingWriteBytes {
     if (_closed) return 0;
@@ -1391,6 +1525,10 @@ class _WindowsRfcommTransport implements RfcommTransport {
     }
     //  2. Tell the writer to exit; it announces _evtWriterExit when done. The
     //     reader notices the shutdown within its SO_RCVTIMEO slice and exits.
+    //     If the writer's SendPort hasn't arrived yet this no-ops — the
+    //     control handler sends the exit-null (and completes _writerExited)
+    //     itself when the port shows up, so this close() isn't left waiting
+    //     out the full step-3 bound.
     _writerSend?.send(null);
     //  3. Wait (bounded — a wedged isolate must not hang close forever).
     await Future.any<Object?>([

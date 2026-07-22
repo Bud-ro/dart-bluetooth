@@ -144,6 +144,24 @@ class AppleBleCentral extends BleCentralPlatform {
 
   @override
   Future<GattConnection> connect(DeviceId id, {Duration? timeout}) async {
+    // CoreBluetooth quietly drops connectPeripheral: on a non-poweredOn
+    // manager ("API MISUSE" log only), which would hang a timeout-less connect
+    // forever and mislabel a timed one as BleTimeoutException. Fail fast with
+    // the accurate domain error instead. `unknown` (manager still powering up)
+    // deliberately passes through — CoreBluetooth queues that case correctly.
+    switch (_AdapterCode.toEnum(bleAdapterState())) {
+      case BluetoothAdapterState.off:
+      case BluetoothAdapterState.unavailable:
+        throw const BleDisabledException(
+          'Bluetooth adapter is off or unavailable; cannot connect',
+        );
+      case BluetoothAdapterState.unauthorized:
+        throw const BlePermissionException(
+          'Bluetooth permission denied; cannot connect',
+        );
+      default:
+        break;
+    }
     final token = _nextConnToken++;
     final conn = AppleGattConnection(token);
     _connections[token] = conn;
@@ -187,6 +205,10 @@ class AppleBleCentral extends BleCentralPlatform {
     bleReset();
     _setCallablesKeepAlive(false);
     _instance = null;
+    // Also vacate the platform-level singleton slot: without this,
+    // BleCentralPlatform.instance (and every default-constructed BleCentral)
+    // would keep handing out THIS disposed backend — silent scans forever.
+    BleCentralPlatform.detachInstance(this);
   }
 
   // --- native callback dispatch --------------------------------------------
@@ -478,11 +500,26 @@ class AppleGattConnection implements GattConnection {
       late StreamController<Uint8List> c;
       c = StreamController<Uint8List>.broadcast(
         onListen: () {
-          _setNotify(service, characteristic, enable: true);
+          // Surface a failed enable on the stream (mirrors the Android CCCD
+          // fix) — subscribers otherwise wait forever on notifications that
+          // were never switched on (wrong UUID, undiscovered services, a
+          // characteristic without notify, or a CoreBluetooth error).
+          unawaited(
+            _setNotify(service, characteristic, enable: true).catchError((
+              Object e,
+            ) {
+              if (!c.isClosed) c.addError(e);
+            }),
+          );
           logGatt.fine(() => 'subscribe ${characteristic.value} conn $_token');
         },
         onCancel: () {
-          _setNotify(service, characteristic, enable: false);
+          // Disable is best-effort — the link may already be gone.
+          unawaited(
+            _setNotify(service, characteristic, enable: false).catchError(
+              (Object e) => logGatt.fine(() => 'notify disable failed: $e'),
+            ),
+          );
           // Drop AND close the (now listener-less) controller so a later
           // subscribe starts a fresh one and a re-listen on the old stream gets
           // a terminal done instead of silently-lost events.
@@ -495,15 +532,32 @@ class AppleGattConnection implements GattConnection {
     return controller.stream;
   }
 
-  void _setNotify(Uuid service, Uuid characteristic, {required bool enable}) {
-    final sPtr = service.value.toNativeUtf8();
-    final cPtr = characteristic.value.toNativeUtf8();
-    try {
-      bleSubscribe(_token, sPtr.cast(), cPtr.cast(), enable ? 1 : 0);
-    } finally {
-      calloc.free(sPtr);
-      calloc.free(cPtr);
-    }
+  Future<void> _setNotify(
+    Uuid service,
+    Uuid characteristic, {
+    required bool enable,
+  }) {
+    // A tracked op (ble_set_notify completes it from
+    // didUpdateNotificationStateForCharacteristic:), routed through the op
+    // chain like every other GATT op so ordering stays simple.
+    return _enqueue(() async {
+      final r = await _runOp((reqId) {
+        final sPtr = service.value.toNativeUtf8();
+        final cPtr = characteristic.value.toNativeUtf8();
+        try {
+          bleSetNotify(reqId, _token, sPtr.cast(), cPtr.cast(), enable ? 1 : 0);
+        } finally {
+          calloc.free(sPtr);
+          calloc.free(cPtr);
+        }
+      });
+      if (r.status != 0) {
+        throw BleGattException(
+          '${enable ? 'enable' : 'disable'} notify failed',
+          code: r.status,
+        );
+      }
+    });
   }
 
   @override

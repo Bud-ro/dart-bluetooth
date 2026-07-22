@@ -240,10 +240,25 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
       );
       if (handle == 0) {
         _transports.remove(token);
+        // An SDP miss is only meaningful if the radio could actually run the
+        // query: with the adapter off (or the device unreachable) the same
+        // handle==0 comes back, and mislabeling that as "service not found"
+        // (isTransient=false) would stop a caller's legitimate retry loop.
+        if (_AdapterStateCode.toEnum(btcAdapterState()) !=
+            BluetoothAdapterState.on) {
+          throw const BluetoothDisabledException(
+            'Bluetooth adapter is off or unavailable',
+          );
+        }
         if (channel == null) {
-          // No explicit channel and SDP resolved none for this service.
+          // No explicit channel and SDP resolved none for this service. Note
+          // an out-of-range device with no CACHED SDP record surfaces here
+          // too — the message says so, and retrying near the device (or with
+          // an explicit channel) is the fix.
           throw ServiceNotFoundException(
-            'No RFCOMM channel for $serviceUuid on ${device.address}',
+            'No RFCOMM channel for $serviceUuid on ${device.address} '
+            '(no SDP record — the device may also be out of range; retry in '
+            'range or pass an explicit channel)',
           );
         }
         throw BluetoothConnectionException(

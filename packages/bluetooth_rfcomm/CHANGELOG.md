@@ -74,6 +74,16 @@ Fixed — two adversarial review passes over the whole stack; highlights:
 - Linux: connect timeouts bound BlueZ's own page timeout, BlueZ errors map to
   the right exception types, and discovery start/stop is refcounted so
   concurrent streams can't kill each other's inquiry.
+- Long-tail sweep fixes: concurrent same-UUID connects on Linux can no longer
+  cross-wire two devices' links (one shared BlueZ profile with per-device fd
+  routing); scanning recovers after system suspend/resume on Linux; drain()
+  converges on every platform and reports discarded bytes instead of lying;
+  a facade's dispose() no longer breaks the process-shared backend for other
+  facades; Windows inquiry restart races and the stuck pending-bytes gauge
+  fixed; macOS no longer mislabels adapter-off as "service not found"; iOS
+  reports teardown-discarded bytes; Android builds align for 16 KB pages
+  (Android 15+); malformed addresses and hostile peer data are rejected with
+  domain errors instead of raw throws.
 - Hot-restart safety: new native reset entry points quiesce every native
   event source at construction and dispose, so a restarted app can't crash on
   callbacks into the dead isolate — and CLIs now exit without `exit()`.

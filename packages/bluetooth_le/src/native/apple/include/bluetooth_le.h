@@ -77,7 +77,11 @@ void ble_read(int64_t req_id, int64_t conn_token, const char *service,
               const char *characteristic);
 
 // Writes `len` bytes to a characteristic. With `without_response`, fires `op_cb`
-// (status 0) immediately; otherwise after the acknowledged write completes.
+// (status 0) once the write has actually been submitted to CoreBluetooth —
+// payloads are queued (unbounded) while its outgoing WWR queue is full and
+// drained on peripheralIsReadyToSendWriteWithoutResponse; queued-but-unsent
+// payloads fail (status != 0) on disconnect/teardown, never silently dropped.
+// Without `without_response`, fires after the acknowledged write completes.
 void ble_write(int64_t req_id, int64_t conn_token, const char *service,
                const char *characteristic, const uint8_t *data, int32_t len,
                int32_t without_response);
@@ -87,6 +91,14 @@ void ble_write(int64_t req_id, int64_t conn_token, const char *service,
 // lowercase 128-bit UUIDs).
 void ble_subscribe(int64_t conn_token, const char *service,
                    const char *characteristic, int32_t enable);
+
+// Like ble_subscribe, but tracked: completes `op_cb` with `req_id` once the
+// peripheral acknowledges the notification-state change (status 0), or with
+// status != 0 when the connection/characteristic is unknown or CoreBluetooth
+// reports an error — so a failed enable surfaces instead of silently never
+// notifying. Additive; ble_subscribe remains for ABI compatibility.
+void ble_set_notify(int64_t req_id, int64_t conn_token, const char *service,
+                    const char *characteristic, int32_t enable);
 
 // Returns the usable ATT MTU (max write payload + 3) for the connection.
 int32_t ble_max_write_len(int64_t conn_token, int32_t without_response);

@@ -44,11 +44,14 @@ flush, repeat"). Rejected as the *only* surface for three reasons:
   windows leaves the link idle for one round-trip per window (stop-and-wait).
   `drain(belowBytes: window ~/ 2)` refills while bytes are still in flight —
   the queue never runs dry, so the radio never starves.
-- **`flush` is best-effort on macOS/iOS.** IOBluetooth and ExternalAccessory
-  give no drain acknowledgement, so `flush` there resolves immediately and
-  paces nothing. `pendingWriteBytes` is accurate on every platform (each
-  transport does its own accounting at the seam where bytes leave Dart), so
-  `drain` works everywhere.
+- **Gauge precision varies by platform, and `drain` compensates.** The
+  pending gauge is live on Windows/macOS/iOS/Android; on Linux it is an
+  UPPER BOUND that only `flush` resets (dart:io sockets hide their internal
+  buffer), and `flush` is exact on Windows/Linux/Android and drains the
+  native queue on macOS while iOS remains best-effort. `drain` therefore
+  watches for progress and falls back to a real `flush` when the gauge
+  stalls — so pacing converges on every platform regardless of which
+  primitive is precise there.
 - **Visibility is useful by itself.** `pendingWriteBytes` also answers "is it
   safe to power the peer down?" and drives progress UI, with no waiting
   involved.

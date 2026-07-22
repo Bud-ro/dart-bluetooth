@@ -183,7 +183,22 @@ class AndroidBleCentral extends BleCentralPlatform {
     }
     if (rc != 0) {
       _connections.remove(token);
-      throw DeviceNotFoundException('Cannot connect to ${id.value}', code: rc);
+      // The Kotlin side reports distinct codes (additively — older natives
+      // still return -1): -2 adapter missing/off, -3 SecurityException
+      // (missing BLUETOOTH_CONNECT). Don't collapse those into a transient
+      // not-found, or a retry-while-isTransient loop spins forever on a
+      // permission/power problem it can never fix.
+      throw switch (rc) {
+        -2 => BleDisabledException(
+          'Bluetooth adapter is off or unavailable',
+          code: rc,
+        ),
+        -3 => BlePermissionException(
+          'Missing BLUETOOTH_CONNECT permission',
+          code: rc,
+        ),
+        _ => DeviceNotFoundException('Cannot connect to ${id.value}', code: rc),
+      };
     }
     try {
       await conn.waitConnected(timeout);
@@ -209,6 +224,9 @@ class AndroidBleCentral extends BleCentralPlatform {
     _lib.reset();
     _setCallablesKeepAlive(false);
     _instance = null;
+    // Also vacate the platform-level singleton slot so a later default
+    // construction gets a fresh backend, not this disposed one.
+    BleCentralPlatform.detachInstance(this);
   }
 
   // --- native callback dispatch --------------------------------------------
