@@ -190,6 +190,19 @@ class BluetoothRfcomm {
   @visibleForTesting
   Duration get debugEffectiveRescanDelay => _effectiveRescanDelay;
 
+  /// Test hook: the engine's internal accounting, for invariant checking in
+  /// the schedule fuzzer. Every value must be >= 0 at ALL times, and all must
+  /// be 0 after dispose() (except a still-requested scan flag is impossible
+  /// post-dispose by construction).
+  @visibleForTesting
+  Map<String, int> get debugEngineCounters => {
+    'scanHolds': _scanHolds,
+    'nearbyListeners': _nearbyListeners,
+    'activeDiscoveries': _activeDiscoveries,
+    'activeConnects': _activeConnects,
+    'streamIntervals': _streamScanIntervals.length,
+  };
+
   /// The cadence the engine actually runs at: the most demanding (shortest) of
   /// all active requests; the default when nobody stated a preference.
   Duration get _effectiveRescanDelay {

@@ -44,6 +44,12 @@ Fixed — two adversarial review passes over the whole stack; highlights:
   loss in request/response testing), and a short-but-successful write
   discarded the unsent tail. Completions are now sequence-matched via refcon
   and partial writes resubmit their remainder.
+- New test infrastructure that prevents bug classes rather than instances: a
+  reusable transport contract-conformance checker (exported from
+  `testing.dart`, runs against the fake in CI and against real backends on
+  hardware rigs), a seeded random-schedule fuzzer for the facade state
+  machines, and clang static analysis of the native sources in CI. See
+  `doc/testing.md`.
 - New diagnostics: `BluetoothConnection.stats` — hop-by-hop TX/RX counters
   (Dart + native on macOS) that attribute any loss to an exact hop — and a
   `btc bench` command in the example CLI: a CRC-framed, sequence-numbered
