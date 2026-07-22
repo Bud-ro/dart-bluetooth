@@ -1,8 +1,36 @@
 import 'dart:typed_data';
 
 import 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart';
+// The optional transport capability probed by BluetoothConnection.stats; not
+// part of the public API surface, so imported straight from src.
+import 'package:bluetooth_rfcomm/src/platform/transport_stats.dart';
 import 'package:bluetooth_rfcomm/testing.dart';
 import 'package:test/test.dart';
+
+/// A fake that ALSO implements [TransportStats], modeling the macOS backend.
+class _StatsFakeTransport extends FakeRfcommTransport
+    implements TransportStats {
+  _StatsFakeTransport()
+    : super(
+        device: DeviceId.address('00:11:22:33:44:55'),
+        channel: 1,
+        serviceUuid: Uuid.spp,
+      );
+
+  /// If set, [nativeStats] throws it — models a broken native introspection.
+  Object? statsError;
+
+  @override
+  Map<String, int> nativeStats() {
+    final err = statsError;
+    if (err != null) throw err;
+    var enqueued = 0;
+    for (final chunk in sent) {
+      enqueued += chunk.length;
+    }
+    return {'txEnqueuedBytes': enqueued, 'rxEvents': 5};
+  }
+}
 
 void main() {
   late FakeBluetoothRfcommPlatform fake;
@@ -298,6 +326,126 @@ void main() {
       throwsA(isA<BluetoothWriteException>()),
     );
     expect(conn.txBytes, 3); // the rejected write is not counted
+  });
+
+  group('stats', () {
+    test('exposes exactly the Dart counters on a transport without '
+        'TransportStats (native keys omitted, stats still works)', () async {
+      final (conn, transport) = await open();
+      conn.add(Uint8List.fromList([1, 2, 3]));
+      transport.deliver([9, 9]);
+      await Future<void>.delayed(Duration.zero);
+      expect(conn.stats, {
+        'txAcceptedBytes': 3,
+        'txRejectedBytes': 0,
+        'txDiscardedBytes': 0,
+        'rxDeliveredBytes': 2,
+        // No input listener yet: held for replay, and visible as such.
+        'rxBufferedBytes': 2,
+        'rxBufferOverflowBytes': 0,
+      });
+    });
+
+    test('rxBufferedBytes falls to 0 once a listener replays it', () async {
+      final (conn, transport) = await open();
+      transport.deliver([1, 2, 3]);
+      await Future<void>.delayed(Duration.zero);
+      expect(conn.stats['rxBufferedBytes'], 3);
+      conn.input.listen((_) {});
+      await Future<void>.delayed(Duration.zero);
+      expect(conn.stats['rxBufferedBytes'], 0);
+      expect(conn.stats['rxDeliveredBytes'], 3);
+    });
+
+    test('rejected writes are counted, not only thrown', () async {
+      final (conn, transport) = await open();
+      transport.dropPeer();
+      await Future<void>.delayed(Duration.zero);
+      expect(
+        () => conn.add(Uint8List.fromList([1, 2, 3, 4])),
+        throwsA(isA<BluetoothWriteException>()),
+      );
+      final stats = conn.stats;
+      expect(stats['txRejectedBytes'], 4);
+      expect(stats['txAcceptedBytes'], 0); // rejected bytes never accepted
+    });
+
+    test('close() records queued-but-unsent bytes as discarded', () async {
+      final (conn, transport) = await open();
+      conn.add(Uint8List.fromList(List.filled(42, 0)));
+      expect(transport.pendingWriteBytes, 42);
+      await conn.close(); // discards, does not flush
+      expect(conn.stats['txDiscardedBytes'], 42);
+      // finish()/close() afterwards must not double-count the same bytes.
+      await conn.finish();
+      expect(conn.stats['txDiscardedBytes'], 42);
+    });
+
+    test('a peer drop with queued bytes records the discard too', () async {
+      final (conn, transport) = await open();
+      transport.flushDrains = false;
+      conn.add(Uint8List.fromList([1, 2, 3, 4, 5, 6, 7]));
+      transport.dropPeer();
+      await Future<void>.delayed(Duration.zero);
+      expect(conn.stats['txDiscardedBytes'], 7);
+    });
+
+    test('replay-buffer overflow is counted, oldest first', () async {
+      final (conn, transport) = await open();
+      final chunk = List<int>.filled(600 * 1024, 0);
+      transport.deliver(chunk);
+      transport.deliver(chunk); // 1.2 MiB total, cap is 1 MiB
+      await Future<void>.delayed(Duration.zero);
+      final stats = conn.stats;
+      expect(stats['rxDeliveredBytes'], 1200 * 1024); // all bytes were seen
+      expect(stats['rxBufferOverflowBytes'], 600 * 1024); // oldest dropped
+      expect(stats['rxBufferedBytes'], 600 * 1024); // newest still held
+    });
+
+    test('residual rxBufferedBytes after disconnect exposes bytes no listener '
+        'ever received; a late listener neither crashes nor replays', () async {
+      final (conn, transport) = await open();
+      transport.deliver([1, 2, 3]);
+      await Future<void>.delayed(Duration.zero);
+      transport.dropPeer();
+      await Future<void>.delayed(Duration.zero);
+      final got = <int>[];
+      var done = false;
+      conn.input.listen(got.addAll, onDone: () => done = true);
+      await Future<void>.delayed(Duration.zero);
+      expect(got, isEmpty); // post-teardown listen: clean done, no replay
+      expect(done, isTrue);
+      final stats = conn.stats;
+      expect(stats['rxDeliveredBytes'], 3);
+      expect(stats['rxBufferedBytes'], 3); // the undelivered residue
+    });
+
+    test('merges native counters from a TransportStats transport', () async {
+      final transport = _StatsFakeTransport();
+      final conn = BluetoothConnection.wrap(
+        FakeBluetoothRfcommPlatform.sampleDevice(),
+        transport,
+      );
+      conn.add(Uint8List.fromList([1, 2]));
+      final stats = conn.stats;
+      expect(stats['txAcceptedBytes'], 2); // Dart side
+      expect(stats['txEnqueuedBytes'], 2); // native side, merged in
+      expect(stats['rxEvents'], 5);
+      await conn.close();
+    });
+
+    test('a throwing nativeStats degrades to Dart counters only', () async {
+      final transport = _StatsFakeTransport()..statsError = StateError('boom');
+      final conn = BluetoothConnection.wrap(
+        FakeBluetoothRfcommPlatform.sampleDevice(),
+        transport,
+      );
+      conn.add(Uint8List.fromList([1]));
+      final stats = conn.stats; // must not throw
+      expect(stats['txAcceptedBytes'], 1);
+      expect(stats.containsKey('txEnqueuedBytes'), isFalse);
+      await conn.close();
+    });
   });
 
   test('every API is crash-free after the peer drops', () async {

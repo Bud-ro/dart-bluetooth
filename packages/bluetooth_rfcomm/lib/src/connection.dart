@@ -8,6 +8,7 @@ import 'logging.dart';
 import 'models/bluetooth_device.dart';
 import 'models/enums.dart';
 import 'platform/platform_interface.dart';
+import 'platform/transport_stats.dart';
 
 /// An open RFCOMM serial connection to a device.
 ///
@@ -100,6 +101,10 @@ class BluetoothConnection {
 
   int _rxBytes = 0;
   int _txBytes = 0;
+  int _txRejectedBytes = 0;
+  int _txDiscardedBytes = 0;
+  int _rxBufferOverflowBytes = 0;
+  bool _txDiscardChecked = false;
 
   /// Total bytes received from the peer over this connection's lifetime
   /// (including any still buffered awaiting the first [input] listener).
@@ -109,12 +114,82 @@ class BluetoothConnection {
   /// Total bytes accepted by [add]/[write] over this connection's lifetime.
   int get txBytes => _txBytes;
 
+  /// Hop-by-hop delivery counters — a **diagnostic surface** for attributing
+  /// message loss to a specific hop. Keys and availability are
+  /// platform-dependent and NOT covered by semver; log the whole map rather
+  /// than parsing individual keys in production logic.
+  ///
+  /// Always present (counted in Dart, on every platform):
+  ///
+  ///  * `txAcceptedBytes` — accepted by [add]/[write] (== [txBytes]).
+  ///  * `txRejectedBytes` — refused by the transport with a
+  ///    [BluetoothWriteException] (dead link / native backlog full). These
+  ///    bytes were never queued; the throw said so, this counts it.
+  ///  * `txDiscardedBytes` — queued but unsent when [close] (or a peer drop)
+  ///    discarded the outbound queue.
+  ///  * `rxDeliveredBytes` — received from the transport (== [rxBytes]);
+  ///    includes bytes still awaiting the first [input] listener.
+  ///  * `rxBufferedBytes` — currently held for replay because nothing is
+  ///    listening to [input]. Nonzero AFTER disconnect means bytes arrived
+  ///    that no listener ever received.
+  ///  * `rxBufferOverflowBytes` — dropped from that replay buffer (only
+  ///    reachable when the app never listens and >1 MiB accrues).
+  ///
+  /// Where the transport can introspect its native layer (currently macOS),
+  /// the map additionally carries native counters — on macOS:
+  /// `txEnqueuedBytes`, `txSubmittedBytes`, `txCompletedBytes`,
+  /// `txRetriedChunks`, `txFailedChunks`, `txDroppedBytes`, `rxEvents`,
+  /// `rxBytes`, `rxDroppedEvents` (native side) plus `rxDartEvents`,
+  /// `rxDartBytes`, `rxDroppedClosedBytes`, `rxUnroutedEvents`,
+  /// `rxUnroutedBytes`, `rxOversizeEvents` (FFI-boundary side).
+  ///
+  /// Attribution — read the differentials outermost-in; the first nonzero
+  /// gap names the lossy hop:
+  ///
+  /// | Differential                              | Implicates                                     |
+  /// |-------------------------------------------|------------------------------------------------|
+  /// | app sends − `txAcceptedBytes`             | app-side (a swallowed [add] throw)             |
+  /// | `txAcceptedBytes` − `txEnqueuedBytes`     | FFI write boundary (should be 0)               |
+  /// | `txEnqueuedBytes` − `txSubmittedBytes`    | native queue backlog (stalled, not lost — yet) |
+  /// | `txSubmittedBytes` − `txCompletedBytes`   | OS/controller in flight or unacknowledged      |
+  /// | `txFailedChunks` / `txDroppedBytes`       | native write failures / teardown discards      |
+  /// | `txRejectedBytes` / `txDiscardedBytes`    | Dart-side refusals / eaten queue on close      |
+  /// | peer sends − `rxBytes` (native)           | radio / peer / OS (Dart never saw it)          |
+  /// | `rxDroppedEvents` (native)                | native→Dart forwarding failure                 |
+  /// | `rxBytes` − `rxDartBytes` − `rxUnroutedBytes` − `rxDroppedClosedBytes` | NativeCallable port hop (should be 0) |
+  /// | `rxDartBytes` − `rxDeliveredBytes`        | transport→connection stream (should be 0)      |
+  /// | `rxDeliveredBytes` − app receives         | `rxBufferOverflowBytes`, residual `rxBufferedBytes`, or app framing |
+  ///
+  /// The snapshot stays meaningful after disconnect (transports capture their
+  /// native counters during teardown), so read it post-mortem when a session
+  /// under-delivers.
+  Map<String, int> get stats {
+    final out = <String, int>{
+      'txAcceptedBytes': _txBytes,
+      'txRejectedBytes': _txRejectedBytes,
+      'txDiscardedBytes': _txDiscardedBytes,
+      'rxDeliveredBytes': _rxBytes,
+      'rxBufferedBytes': _rxBufferBytes,
+      'rxBufferOverflowBytes': _rxBufferOverflowBytes,
+    };
+    if (_transport case final TransportStats transport) {
+      try {
+        out.addAll(transport.nativeStats());
+      } catch (e) {
+        // Diagnostics must never break the thing they diagnose.
+        logConnection.warning(() => 'native stats failed ${device.id}: $e');
+      }
+    }
+    return out;
+  }
+
   void _bufferRx(Uint8List bytes) {
     _rxBuffer.add(bytes);
     _rxBufferBytes += bytes.length;
     while (_rxBufferBytes > _maxRxBufferBytes && _rxBuffer.isNotEmpty) {
       final dropped = _rxBuffer.removeAt(0);
       _rxBufferBytes -= dropped.length;
+      _rxBufferOverflowBytes += dropped.length;
       logConnection.warning(
         () =>
             'input buffer overflow: dropped ${dropped.length}B received '
@@ -124,7 +199,10 @@ class BluetoothConnection {
   }
 
   void _drainRxBuffer() {
-    if (_rxBuffer.isEmpty) return;
+    // A listener attaching after teardown must not trip an add-after-close
+    // (whatever is still buffered then is undeliverable; `stats` reports it
+    // as a residual rxBufferedBytes).
+    if (_rxBuffer.isEmpty || _inputController.isClosed) return;
     logData.fine(
       () =>
           'replaying ${_rxBufferBytes}B received before/without an input '
@@ -195,6 +273,10 @@ class BluetoothConnection {
       _transport.send(data);
       _txBytes += data.length;
     } on BluetoothWriteException catch (e) {
+      // Rejected, never queued (dead link, or a bounded native backlog said
+      // no). Counted so a sender that swallows the throw still sees the loss
+      // in [stats].
+      _txRejectedBytes += data.length;
       logConnection.warning(() => 'write failed ${device.id}: ${e.message}');
       rethrow;
     }
@@ -203,10 +285,11 @@ class BluetoothConnection {
   /// Waits until all previously [add]ed bytes have been handed to the OS, and
   /// throws [BluetoothWriteException] where the platform can tell that queued
   /// bytes were lost to a dead link (Windows, Linux, Android). On macOS and
-  /// iOS this is best-effort: bytes are queued to the native layer and there
-  /// is no drain acknowledgement, so flush resolves immediately — use [drain]
-  /// there when you need the queue verifiably empty ([pendingWriteBytes] is
-  /// accurate on every platform).
+  /// iOS this is best-effort: macOS waits for the native queue to empty but
+  /// cannot distinguish "delivered" from "discarded by a disconnect" (check
+  /// [stats]' `txDroppedBytes` for that), and iOS resolves immediately — use
+  /// [drain] there when you need the queue verifiably empty
+  /// ([pendingWriteBytes] is accurate on every platform).
   Future<void> flush() => _transport.flush();
 
   /// Convenience: [add] then [flush] — the natural request/response rhythm
@@ -285,8 +368,37 @@ class BluetoothConnection {
     if (done != null) return done;
     logConnection.fine(() => 'close ${device.id}');
     _state = ConnectionState.disconnecting;
+    // Capture the queue depth BEFORE the transport zeroes it, or the discard
+    // is invisible (a reconnecting app that closes eagerly would silently eat
+    // its own queued tx). close() documents the discard, so it logs FINE;
+    // an unrequested loss (peer drop) logs WARNING via _doCleanup.
+    _noteDiscardedTx(requested: true);
     await _transport.close();
     await _cleanup();
+  }
+
+  /// Records (once) any bytes still queued toward the OS as discarded, so
+  /// [stats] — and, for unrequested losses, a warning log — make an eaten tx
+  /// queue observable even when the caller never awaited [drain]/[flush].
+  void _noteDiscardedTx({required bool requested}) {
+    if (_txDiscardChecked) return;
+    _txDiscardChecked = true;
+    final int pending;
+    try {
+      pending = _transport.pendingWriteBytes;
+    } catch (_) {
+      return; // a transport that can't answer post-mortem has nothing to add
+    }
+    if (pending > 0) {
+      _txDiscardedBytes += pending;
+      String message() =>
+          'discarding ${pending}B queued but unsent tx ${device.id}';
+      if (requested) {
+        logConnection.fine(message);
+      } else {
+        logConnection.warning(message);
+      }
+    }
   }
 
   /// Flushes pending writes, then closes. Prefer this for graceful shutdown.
@@ -329,6 +441,11 @@ class BluetoothConnection {
   Future<void> _doCleanup() async {
     logConnection.fine(() => 'disconnected ${device.id}');
     _state = ConnectionState.disconnected;
+    // Peer-initiated drops reach teardown without passing through close();
+    // record any queued-but-unsent tx before it evaporates (no-op if close()
+    // already checked, or if the transport zeroed its queue first — native
+    // layers count that side themselves, e.g. macOS txDroppedBytes).
+    _noteDiscardedTx(requested: false);
     await _inputSub.cancel();
     await _stateSub.cancel();
     if (!_stateController.isClosed) {

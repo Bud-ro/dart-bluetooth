@@ -38,6 +38,17 @@ Fixed — two adversarial review passes over the whole stack; highlights:
   writes fail with `BluetoothWriteException`, teardown is idempotent, and
   `flush()` reports lost bytes honestly (Windows previously acked success on
   a dead link; Android could report a clean flush after a failed write).
+- macOS: fixed two silent-loss bugs in the write queue — a duplicate write
+  completion could advance the queue past a chunk that was never transmitted
+  (one lost message per duplicate; the likely cause of steady percent-level
+  loss in request/response testing), and a short-but-successful write
+  discarded the unsent tail. Completions are now sequence-matched via refcon
+  and partial writes resubmit their remainder.
+- New diagnostics: `BluetoothConnection.stats` — hop-by-hop TX/RX counters
+  (Dart + native on macOS) that attribute any loss to an exact hop — and a
+  `btc bench` command in the example CLI: a CRC-framed, sequence-numbered
+  loss-measurement harness that distinguishes lost / late / corrupted /
+  never-sent.
 - `input` no longer loses bytes that arrive while nothing is listening:
   a peer that responds before your first `listen()` attaches (or during a
   cancel/re-listen gap) is buffered and replayed in order. New `rxBytes` /

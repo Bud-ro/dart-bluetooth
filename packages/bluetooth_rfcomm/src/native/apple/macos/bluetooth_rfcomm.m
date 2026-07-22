@@ -9,6 +9,7 @@
 
 #import <Foundation/Foundation.h>
 #import <IOBluetooth/IOBluetooth.h>
+#import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
 
@@ -221,6 +222,61 @@ static BTCSDPQuery *g_sdp_query = nil;
 }
 @end
 
+#pragma mark - Per-channel transfer counters
+
+// Monotonic per-channel counters, maintained on the worker thread only (no
+// locks needed — every mutation happens on that one thread) and read via
+// btc_rfcomm_stats_json (which hops to the worker, so reads are coherent).
+// They live in a plain calloc'd struct so the data hot paths increment fields
+// with zero allocations, and the struct is OWNED BY A SIDE REGISTRY keyed by
+// handle — not by the BTCChannel — so the numbers remain readable AFTER
+// teardown: a disconnect/reconnect cycle that purges a write queue must stay
+// attributable post-mortem, not vanish with the channel object.
+//
+// Differential semantics (each byte is counted at the hop it crosses):
+//   txEnqueuedBytes  - txSubmittedBytes  = accepted but not yet handed to
+//                                          writeAsync (growing while connected
+//                                          and idle => queue stall)
+//   txSubmittedBytes - txCompletedBytes  = handed to the OS but no completion
+//                                          processed (growing => completions
+//                                          not arriving / being rejected)
+//   txDroppedBytes  > 0                  = bytes discarded (teardown purge or
+//                                          a guard bail) — never silent
+//   rxBytes vs Dart-side received bytes  = native->Dart delivery loss
+//                                          (rxDroppedEvents says how often)
+typedef struct {
+  int64_t txEnqueuedBytes;  // accepted by btc_rfcomm_write (returned 0)
+  int64_t txSubmittedBytes; // handed to writeAsync, rc == success (a retry
+                            // re-counts the suffix/chunk it resubmits; with
+                            // txRetriedChunks == 0 no byte is double-counted)
+  int64_t txCompletedBytes; // confirmed by a write-complete (incl. the
+                            // delivered prefix of a partial write)
+  int64_t txRetriedChunks;  // transient-error retry attempts
+  int64_t txFailedChunks;   // chunks abandoned by a fatal write failure
+  int64_t txDroppedBytes;   // bytes discarded for ANY reason
+  int64_t rxEvents;         // rfcommChannelData delegate deliveries
+  int64_t rxBytes;          // bytes the stack handed us (counted before any
+                            // drop, so a drop never hides inbound volume)
+  int64_t rxDroppedEvents;  // deliveries whose payload was discarded (malloc
+                            // fail, oversize, post-teardown, no callback)
+} btc_channel_stats;
+
+// handle -> btc_channel_stats* (boxed in NSValue). Entries outlive their
+// channel (post-mortem reads) and are freed only by eviction or btc_reset.
+static NSMutableDictionary<NSNumber *, NSValue *> *g_stats(void) {
+  static NSMutableDictionary *d;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    d = [NSMutableDictionary new];
+  });
+  return d;
+}
+
+// Cap on retained stats entries: past this, entries whose channel is gone are
+// evicted oldest-handle-first at open, so an app that reconnects forever
+// cannot grow the registry without bound. Live channels are never evicted.
+static const NSUInteger kBTCStatsCap = 1024;
+
 #pragma mark - RFCOMM channel delegate
 
 @interface BTCChannel : NSObject <IOBluetoothRFCOMMChannelDelegate>
@@ -244,6 +300,17 @@ static BTCSDPQuery *g_sdp_query = nil;
 // delayed retry is already queued on the worker run loop.
 @property(nonatomic) int retryAttempts;
 @property(nonatomic) BOOL retryScheduled;
+// Borrowed pointer into the g_stats() registry (which owns and frees it).
+// NULLed synchronously in teardown so a late delegate callback can never touch
+// a struct the registry may since have freed. May be NULL if calloc failed at
+// open; every increment site checks.
+@property(nonatomic) btc_channel_stats *stats;
+// Monotonic (never-zero) sequence tagged onto each writeAsync submission as
+// its refcon; inFlightRefcon holds the tag of the CURRENT outstanding write
+// (0 = none). Completions must echo the tag to be honored — see
+// _writeCompleteStatus for why this is load-bearing.
+@property(nonatomic) uintptr_t writeSeq;
+@property(nonatomic) uintptr_t inFlightRefcon;
 - (void)enqueueWrite:(NSData *)data;
 - (int64_t)pendingBytes;
 - (void)teardown;
@@ -302,7 +369,13 @@ static BOOL btc_write_status_is_transient(IOReturn rc) {
 // transient-retry logic below exists precisely so a credit/queue stall during
 // such a wake never tears the connection down.
 - (void)enqueueWrite:(NSData *)data {
-  if (!self.channel || self.tornDown) return;
+  if (!self.channel || self.tornDown) {
+    // btc_rfcomm_write vets the handle before calling, so this bail should be
+    // unreachable — but if it ever fires the caller was already told "queued"
+    // (result 0) and the bytes are gone. Count them; never lose silently.
+    if (self.stats) self.stats->txDroppedBytes += (int64_t)data.length;
+    return;
+  }
   if (!self.writeQueue) self.writeQueue = [NSMutableArray new];
   NSUInteger mtu = self.mtu;
   if (mtu == 0 && self.channel) mtu = [self.channel getMTU];
@@ -337,16 +410,30 @@ static BOOL btc_write_status_is_transient(IOReturn rc) {
     return;
   }
   NSData *chunk = self.writeQueue.firstObject; // stays queued until complete
+  // Tag this submission with a unique nonzero refcon. writeAsync echoes the
+  // refcon back in the completion delegate, which lets _writeCompleteStatus
+  // reject any completion that is not for THIS write (duplicate selector
+  // variant, or a straggler for a submission we already classified as failed).
+  self.writeSeq += 1;
+  if (self.writeSeq == 0) self.writeSeq = 1; // keep 0 = "nothing in flight"
+  uintptr_t refcon = self.writeSeq;
   self.writeInFlight = YES;
+  self.inFlightRefcon = refcon;
   IOReturn rc = [self.channel writeAsync:(void *)chunk.bytes
                                   length:(UInt16)chunk.length
-                                  refcon:NULL];
+                                  refcon:(void *)refcon];
   if (rc != kIOReturnSuccess) {
-    // Submission failed: no write-complete is coming for this attempt. The
+    // Submission failed: no write-complete is coming for this attempt. Retire
+    // the refcon too, so if some OS build DOES deliver a completion for a
+    // failed submission it is ignored instead of being attributed to the
+    // retry's write and advancing the queue past an untransmitted chunk. The
     // chunk is still at the queue head; classify and retry or fail.
     self.writeInFlight = NO;
+    self.inFlightRefcon = 0;
     [self _writeErrored:rc bytesWritten:0];
+    return;
   }
+  if (self.stats) self.stats->txSubmittedBytes += (int64_t)chunk.length;
 }
 // A write attempt failed with `rc` (submission return or completion status);
 // the affected chunk is still at the queue head. Transient statuses back off
@@ -359,11 +446,16 @@ static BOOL btc_write_status_is_transient(IOReturn rc) {
   if (btc_write_status_is_transient(rc) &&
       self.retryAttempts < kBTCMaxWriteRetries) {
     self.retryAttempts++;
+    if (self.stats) self.stats->txRetriedChunks++;
     if (bytesWritten > 0 && self.writeQueue.count > 0) {
       NSData *head = self.writeQueue[0];
+      // The delivered prefix DID reach the stack: it counts as completed, and
+      // trimming it here is exactly what stops the retry from re-sending it.
       if (bytesWritten >= head.length) {
+        if (self.stats) self.stats->txCompletedBytes += (int64_t)head.length;
         [self.writeQueue removeObjectAtIndex:0];
       } else {
+        if (self.stats) self.stats->txCompletedBytes += (int64_t)bytesWritten;
         self.writeQueue[0] = [head
             subdataWithRange:NSMakeRange(bytesWritten,
                                          head.length - bytesWritten)];
@@ -401,6 +493,10 @@ static BOOL btc_write_status_is_transient(IOReturn rc) {
 // drop the last strong reference; the deferred block's capture of self keeps
 // the object alive until it has run. Worker thread only.
 - (void)teardown {
+  // Idempotent: a second entry (e.g. rfcommChannelClosed arriving after a
+  // _writeFailed-initiated teardown, before the deferred delegate-nil has run)
+  // must not re-run the purge accounting below.
+  if (self.tornDown) return;
   self.tornDown = YES;
   // Cancel any delayed _retryNow still queued on the worker run loop so it
   // cannot fire into a dead channel (it would no-op on tornDown, but the
@@ -408,6 +504,22 @@ static BOOL btc_write_status_is_transient(IOReturn rc) {
   [NSObject cancelPreviousPerformRequestsWithTarget:self];
   self.retryScheduled = NO;
   self.writeInFlight = NO;
+  self.inFlightRefcon = 0;
+  // Every byte still queued is now LOST — including the in-flight head chunk:
+  // writeAsync may have accepted it, but its completion will never be
+  // processed, so whether any of it reached the peer is unknowable. Count the
+  // purge so a disconnect/reconnect cycle that eats the queue shows up as
+  // txDroppedBytes instead of vanishing (this was previously silent loss).
+  if (self.stats) {
+    int64_t purged = 0;
+    for (NSData *d in self.writeQueue) purged += (int64_t)d.length;
+    self.stats->txDroppedBytes += purged;
+  }
+  // Detach from the stats struct NOW (not in the deferred block): the registry
+  // owns it and may free it (eviction/btc_reset) once this channel is torn
+  // down, and delegate callbacks can still arrive until the deferred
+  // delegate-nil below runs — they must find NULL, never a dangling pointer.
+  self.stats = NULL;
   [self.writeQueue removeAllObjects];
   [self.channel closeChannel];
   [[BTCWorker shared] runAsync:^{
@@ -424,25 +536,66 @@ static BOOL btc_write_status_is_transient(IOReturn rc) {
 // IOBluetoothRFCOMMChannel is not orphaned with a dangling delegate. Transient
 // conditions never reach here — see _writeErrored.
 - (void)_writeFailed {
+  // The failing chunk is still at the queue head, so the teardown purge below
+  // counts its bytes into txDroppedBytes; this counter records the EVENT.
+  if (self.stats) self.stats->txFailedChunks++;
   if (self.state) self.state(self.token, BTC_CONN_DISCONNECTED);
   [self teardown];
 }
 // Shared handler for both write-complete delegate variants. `haveBytes` is YES
-// only for the bytesWritten: variant. The writeInFlight guard makes a
-// duplicate or post-teardown delivery a no-op (a failed submission never gets
-// a completion, so nothing legitimate is swallowed).
+// only for the bytesWritten: variant. Two guards make a duplicate, stale, or
+// post-teardown delivery a no-op:
+//   1. writeInFlight — nothing outstanding means nothing to complete.
+//   2. refcon match — every submission carries a unique nonzero refcon, and a
+//      completion is honored only if it echoes the CURRENT in-flight one. This
+//      is load-bearing: guard 1 alone does NOT stop a duplicate delivery. If
+//      an OS build invoked BOTH write-complete selector variants for one
+//      write, the first delivery advances the queue and (inside this very
+//      call) submits the next chunk, flipping writeInFlight back to YES — so
+//      the second delivery would pass guard 1, be attributed to that next
+//      chunk, and advance the queue past a chunk that was NEVER transmitted:
+//      one silently lost chunk per write. With the refcon guard the second
+//      delivery still carries the OLD tag and is discarded. The same guard
+//      kills a straggler completion for a submission whose writeAsync return
+//      code already failed it (that refcon was retired in _sendNextChunk).
+//      A NULL refcon (a framework build that doesn't echo it) falls back to
+//      guard 1 alone — identical to the old behavior, so no build can make
+//      the queue stall by failing to echo.
 - (void)_writeCompleteStatus:(IOReturn)error
+                      refcon:(void *)refcon
                 bytesWritten:(size_t)bytesWritten
                    haveBytes:(BOOL)haveBytes {
   if (!self.writeInFlight) return;
+  if (refcon != NULL && (uintptr_t)refcon != self.inFlightRefcon) return;
   self.writeInFlight = NO;
+  self.inFlightRefcon = 0;
   if (error != kIOReturnSuccess) {
     [self _writeErrored:error bytesWritten:haveBytes ? bytesWritten : 0];
     return;
   }
   self.retryAttempts = 0;
-  // Chunk delivered; its NSData may be released now. Send the next one.
-  if (self.writeQueue.count > 0) [self.writeQueue removeObjectAtIndex:0];
+  // The queue head is necessarily the chunk this completion is for: it cannot
+  // have been mutated while in flight (enqueueWrite only appends, error trims
+  // only run after a failure, and teardown would have cleared writeInFlight).
+  if (self.writeQueue.count > 0) {
+    NSData *head = self.writeQueue[0];
+    if (haveBytes && bytesWritten > 0 && bytesWritten < head.length) {
+      // Short SUCCESSFUL write: only a prefix reached the stack. Previously
+      // the whole chunk was dequeued here, silently discarding the unsent
+      // suffix. Keep the suffix at the head and resubmit it. (bytesWritten of
+      // 0 on success is treated as "field not populated" and advances
+      // normally, so an OS build that never fills it in can't make us loop
+      // resubmitting — and can't be told apart from full delivery anyway.)
+      if (self.stats) self.stats->txCompletedBytes += (int64_t)bytesWritten;
+      self.writeQueue[0] = [head
+          subdataWithRange:NSMakeRange(bytesWritten,
+                                       head.length - bytesWritten)];
+    } else {
+      // Chunk delivered; its NSData may be released now.
+      if (self.stats) self.stats->txCompletedBytes += (int64_t)head.length;
+      [self.writeQueue removeObjectAtIndex:0];
+    }
+  }
   [self _sendNextChunk];
 }
 // IOBluetoothRFCOMMChannelDelegate declares TWO write-complete selectors:
@@ -452,19 +605,23 @@ static BOOL btc_write_status_is_transient(IOReturn rc) {
 // whichever variant it finds (newer SDKs prefer the bytesWritten one).
 // Implement BOTH so completions arrive regardless of which the installed OS
 // probes for — if neither matched, the one-in-flight queue would stall forever
-// after the first chunk and every later message would look "dropped". The
-// refcon is the opaque value passed to writeAsync (NULL here — legal; it is
-// only echoed back, never interpreted) and is deliberately not matched on.
+// after the first chunk and every later message would look "dropped".
+// The refcon is the opaque per-submission tag passed to writeAsync; the shared
+// handler matches it against the in-flight write so that if an OS build ever
+// delivers BOTH variants for one write, only the first advances the queue.
 - (void)rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel
                             refcon:(void *)refcon
                             status:(IOReturn)error {
-  [self _writeCompleteStatus:error bytesWritten:0 haveBytes:NO];
+  [self _writeCompleteStatus:error refcon:refcon bytesWritten:0 haveBytes:NO];
 }
 - (void)rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel
                             refcon:(void *)refcon
                             status:(IOReturn)error
                       bytesWritten:(size_t)bytesWritten {
-  [self _writeCompleteStatus:error bytesWritten:bytesWritten haveBytes:YES];
+  [self _writeCompleteStatus:error
+                      refcon:refcon
+                bytesWritten:bytesWritten
+                   haveBytes:YES];
 }
 // The framework's own "you may write again" signals. After a transient
 // kIOReturnNoResources-style failure these fire as soon as the outgoing queue
@@ -479,15 +636,33 @@ static BOOL btc_write_status_is_transient(IOReturn rc) {
     (IOBluetoothRFCOMMChannel *)rfcommChannel {
   [self _sendNextChunk];
 }
+// Inbound data. Counters first — rxEvents/rxBytes record what the STACK handed
+// us, before any drop decision, so the native->Dart differential is exact.
+// Every discard path increments rxDroppedEvents; previously a malloc failure
+// (or an oversize delivery) vanished without a trace, indistinguishable from
+// the peer never sending.
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)rfcommChannel
                      data:(void *)dataPointer
                    length:(size_t)dataLength {
-  if (self.data && dataLength > 0 && dataLength <= INT32_MAX) {
-    uint8_t *copy = malloc(dataLength);
-    if (!copy) return;
-    memcpy(copy, dataPointer, dataLength);
-    self.data(self.token, copy, (int32_t)dataLength);
+  btc_channel_stats *st = self.stats;
+  if (st) {
+    st->rxEvents++;
+    st->rxBytes += (int64_t)dataLength;
   }
+  if (dataLength == 0) return; // nothing to forward; not a drop
+  if (self.tornDown || !self.data || dataLength > INT32_MAX) {
+    // Post-teardown stragglers (Dart already saw the disconnect and closed the
+    // stream), a cleared callback, or a payload the int32 ABI can't carry.
+    if (st) st->rxDroppedEvents++;
+    return;
+  }
+  uint8_t *copy = malloc(dataLength);
+  if (!copy) {
+    if (st) st->rxDroppedEvents++;
+    return;
+  }
+  memcpy(copy, dataPointer, dataLength);
+  self.data(self.token, copy, (int32_t)dataLength);
 }
 - (void)rfcommChannelOpenComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel
                            status:(IOReturn)error {
@@ -660,6 +835,27 @@ int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
     ch.channel = rf;
     handle = g_next_handle++;
     ch.handle = handle;
+    // Per-channel counters: one calloc at open (never on the data hot paths).
+    // Registered in g_stats() — which owns the struct — so they stay readable
+    // after teardown; the channel only borrows the pointer.
+    btc_channel_stats *stats = calloc(1, sizeof(btc_channel_stats));
+    if (stats) {
+      NSMutableDictionary<NSNumber *, NSValue *> *sm = g_stats();
+      if (sm.count >= kBTCStatsCap) {
+        // Evict post-mortem entries oldest-handle-first (handles are issued
+        // monotonically and never reused). Never a live channel's.
+        NSArray<NSNumber *> *keys =
+            [[sm allKeys] sortedArrayUsingSelector:@selector(compare:)];
+        for (NSNumber *k in keys) {
+          if (sm.count < kBTCStatsCap) break;
+          if (g_channels()[k]) continue;
+          free([sm[k] pointerValue]); // safe: torn-down channels detached
+          [sm removeObjectForKey:k];
+        }
+      }
+      sm[@(handle)] = [NSValue valueWithPointer:stats];
+      ch.stats = stats;
+    }
     g_channels()[@(handle)] = ch;
   }];
   return handle;
@@ -682,6 +878,9 @@ int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len) {
       result = -2; // backlog full: peer has stalled for a long time
       return;
     }
+    // Counted before enqueueWrite so every accepted byte is in txEnqueuedBytes
+    // (a rejected -1/-2 write is REPORTED to the caller and counted nowhere).
+    if (ch.stats) ch.stats->txEnqueuedBytes += len;
     [ch enqueueWrite:bytes];
     result = 0;
   }];
@@ -709,6 +908,35 @@ int64_t btc_rfcomm_pending(int64_t handle) {
   return result;
 }
 
+char *btc_rfcomm_stats_json(int64_t handle) {
+  __block char *result = NULL;
+  // runSync: the counters are mutated exclusively on the worker thread, so
+  // reading them there yields one coherent snapshot. The JSON is built by hand
+  // (fixed field order, no Obj-C collections) — this path is cold, but there
+  // is no reason to allocate more than the one output string.
+  [[BTCWorker shared] runSync:^{
+    NSValue *v = g_stats()[@(handle)];
+    if (!v) {
+      result = strdup("{\"error\":\"unknown handle\"}");
+      return;
+    }
+    const btc_channel_stats *s = [v pointerValue];
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"txEnqueuedBytes\":%lld,\"txSubmittedBytes\":%lld,"
+             "\"txCompletedBytes\":%lld,\"txRetriedChunks\":%lld,"
+             "\"txFailedChunks\":%lld,\"txDroppedBytes\":%lld,"
+             "\"rxEvents\":%lld,\"rxBytes\":%lld,\"rxDroppedEvents\":%lld}",
+             (long long)s->txEnqueuedBytes, (long long)s->txSubmittedBytes,
+             (long long)s->txCompletedBytes, (long long)s->txRetriedChunks,
+             (long long)s->txFailedChunks, (long long)s->txDroppedBytes,
+             (long long)s->rxEvents, (long long)s->rxBytes,
+             (long long)s->rxDroppedEvents);
+    result = strdup(buf);
+  }];
+  return result;
+}
+
 int32_t btc_rfcomm_close(int64_t handle) {
   [[BTCWorker shared] runSync:^{
     BTCChannel *ch = g_channels()[@(handle)];
@@ -725,5 +953,12 @@ void btc_reset(void) {
       [ch teardown];
     }
     [g_channels() removeAllObjects];
+    // Stats intentionally outlive their channels for post-mortem reads, but
+    // reset is the isolate boundary (fresh construction / dispose): nothing
+    // will read them again. Safe to free: every teardown above detached its
+    // channel's borrowed pointer synchronously, so no late delegate callback
+    // can touch these structs afterwards.
+    for (NSValue *v in [g_stats() allValues]) free([v pointerValue]);
+    [g_stats() removeAllObjects];
   }];
 }

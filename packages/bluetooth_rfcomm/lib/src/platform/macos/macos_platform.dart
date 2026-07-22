@@ -14,6 +14,7 @@ import '../../models/discovery_result.dart';
 import '../../models/enums.dart';
 import '../../models/uuid.dart';
 import '../platform_interface.dart';
+import '../transport_stats.dart';
 import 'macos_bindings.dart';
 
 // Additive bindings for the transport-introspection C exports. Declared here
@@ -30,6 +31,16 @@ external int _btcRfcommMtu(int handle);
   assetId: 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart',
 )
 external int _btcRfcommPending(int handle);
+
+/// Per-channel delivery counters as a malloc'd JSON object (freed with
+/// [btcFree]): txEnqueuedBytes, txSubmittedBytes, txCompletedBytes,
+/// txRetriedChunks, txFailedChunks, txDroppedBytes, rxEvents, rxBytes,
+/// rxDroppedEvents. Returns null for an unknown handle.
+@ffi.Native<ffi.Pointer<ffi.Char> Function(ffi.Int64)>(
+  symbol: 'btc_rfcomm_stats_json',
+  assetId: 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart',
+)
+external ffi.Pointer<ffi.Char> _btcRfcommStatsJson(int handle);
 
 /// macOS backend over IOBluetooth.
 ///
@@ -66,6 +77,20 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   static int _nextToken = 1;
   static final Map<int, _MacRfcommTransport> _transports = {};
+
+  // Process-wide rx-drop counters for events that can no longer be attributed
+  // to a live transport. Surfaced through every transport's [nativeStats] so
+  // an app can see them without a platform-specific import.
+  //
+  // Unrouted = the token looked up nothing: the transport was closed/removed
+  // while data events were still queued behind the NativeCallable port. Bytes
+  // counted natively as rxBytes but never reaching Dart show up here.
+  static int _rxUnroutedEvents = 0;
+  static int _rxUnroutedBytes = 0;
+
+  /// Events discarded because native reported a length above
+  /// [_maxInboundChunk] (corruption guard). Should stay 0 forever.
+  static int _rxOversizeEvents = 0;
   static final Map<int, StreamController<BluetoothDiscoveryResult>>
   _discoveries = {};
 
@@ -270,7 +295,22 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {
     final transport = _transports[token];
     try {
-      if (transport != null && len > 0 && len <= _maxInboundChunk) {
+      if (len <= 0) return; // no payload — nothing to lose
+      if (transport == null) {
+        // Token lookup miss: the transport was closed while this event was
+        // still queued behind the NativeCallable port. The bytes are gone —
+        // count them so native rxBytes vs Dart delivery can be reconciled.
+        _rxUnroutedEvents++;
+        _rxUnroutedBytes += len;
+        logNative.fine(
+          () => 'dropped ${len}B rx for unknown token $token (closed?)',
+        );
+      } else if (len > _maxInboundChunk) {
+        _rxOversizeEvents++;
+        logNative.warning(
+          () => 'dropped implausible ${len}B rx chunk (corrupt length?)',
+        );
+      } else {
         transport._deliver(Uint8List.fromList(data.asTypedList(len)));
       }
     } finally {
@@ -378,11 +418,20 @@ abstract final class _AdapterStateCode {
 }
 
 /// RFCOMM transport backed by a native IOBluetoothRFCOMMChannel handle.
-class _MacRfcommTransport implements RfcommTransport {
+class _MacRfcommTransport implements RfcommTransport, TransportStats {
   _MacRfcommTransport(this._token);
 
   final int _token;
   int _handle = 0;
+
+  // Dart-side hop counters (see [nativeStats]).
+  int _rxDartEvents = 0;
+  int _rxDartBytes = 0;
+  int _rxDroppedClosedBytes = 0;
+
+  /// Native counters captured just before [close] releases the handle, so
+  /// post-mortem [nativeStats] still reflects the channel's full life.
+  Map<String, int>? _finalNativeStats;
 
   final StreamController<Uint8List> _incoming = StreamController<Uint8List>(
     sync: false,
@@ -410,7 +459,17 @@ class _MacRfcommTransport implements RfcommTransport {
   }
 
   void _deliver(Uint8List bytes) {
-    if (!_incoming.isClosed) _incoming.add(bytes);
+    if (_incoming.isClosed) {
+      // Data raced the teardown: the channel closed after native queued this
+      // event. Count it — native rxBytes minus rxDartBytes minus this must
+      // be zero, or the port hop itself is losing events.
+      _rxDroppedClosedBytes += bytes.length;
+      logNative.fine(() => 'dropped ${bytes.length}B rx delivered after close');
+      return;
+    }
+    _rxDartEvents++;
+    _rxDartBytes += bytes.length;
+    _incoming.add(bytes);
   }
 
   void _onState(ConnectionState state) {
@@ -490,6 +549,58 @@ class _MacRfcommTransport implements RfcommTransport {
     }
   }
 
+  /// Dart-side hop counters merged with the native channel counters.
+  ///
+  /// Native keys (from `btc_rfcomm_stats_json`): txEnqueuedBytes,
+  /// txSubmittedBytes, txCompletedBytes, txRetriedChunks, txFailedChunks,
+  /// txDroppedBytes, rxEvents, rxBytes, rxDroppedEvents. Dart-side keys:
+  /// rxDartEvents / rxDartBytes (events that made it across the
+  /// NativeCallable port into the incoming stream), rxDroppedClosedBytes
+  /// (arrived after this transport closed), and the process-wide
+  /// rxUnroutedEvents / rxUnroutedBytes / rxOversizeEvents. Native keys are
+  /// omitted (never faked) when the loaded dylib predates the stats export.
+  @override
+  Map<String, int> nativeStats() {
+    final out = <String, int>{
+      'rxDartEvents': _rxDartEvents,
+      'rxDartBytes': _rxDartBytes,
+      'rxDroppedClosedBytes': _rxDroppedClosedBytes,
+      'rxUnroutedEvents': MacosBluetoothRfcomm._rxUnroutedEvents,
+      'rxUnroutedBytes': MacosBluetoothRfcomm._rxUnroutedBytes,
+      'rxOversizeEvents': MacosBluetoothRfcomm._rxOversizeEvents,
+    };
+    final native = _finalNativeStats ?? _readNativeStats();
+    if (native != null) out.addAll(native);
+    return out;
+  }
+
+  Map<String, int>? _readNativeStats() {
+    if (_handle == 0) return null;
+    final ffi.Pointer<ffi.Char> ptr;
+    try {
+      ptr = _btcRfcommStatsJson(_handle);
+    } on Object catch (e) {
+      // Symbol missing: an older native library. Diagnostics degrade to the
+      // Dart-side counters; never let stats introspection throw.
+      logNative.fine(() => 'native stats unavailable: $e');
+      return null;
+    }
+    if (ptr == ffi.nullptr) return null;
+    try {
+      final map =
+          jsonDecode(ptr.cast<Utf8>().toDartString()) as Map<String, dynamic>;
+      return {
+        for (final MapEntry(:key, :value) in map.entries)
+          if (value is num) key: value.toInt(),
+      };
+    } catch (e) {
+      logNative.warning(() => 'malformed native stats payload: $e');
+      return null;
+    } finally {
+      btcFree(ptr.cast());
+    }
+  }
+
   @override
   Future<void> close() async {
     if (_closed) return;
@@ -497,6 +608,9 @@ class _MacRfcommTransport implements RfcommTransport {
     final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
     if (_handle != 0) {
+      // Snapshot the channel's counters while the handle is still valid so
+      // stats read AFTER a disconnect (the usual diagnostic moment) work.
+      _finalNativeStats = _readNativeStats();
       btcRfcommClose(_handle);
       _handle = 0;
     }

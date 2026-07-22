@@ -89,6 +89,22 @@ int32_t btc_rfcomm_mtu(int64_t handle);
 // unknown/closed handle.
 int64_t btc_rfcomm_pending(int64_t handle);
 
+// Returns a malloc'd UTF-8 JSON object of monotonic per-channel transfer
+// counters for `handle` (caller frees via btc_free), with exactly the fields:
+//   {"txEnqueuedBytes","txSubmittedBytes","txCompletedBytes",
+//    "txRetriedChunks","txFailedChunks","txDroppedBytes",
+//    "rxEvents","rxBytes","rxDroppedEvents"}
+// all int64, counted at the hop each name implies: enqueued = accepted by
+// btc_rfcomm_write; submitted = handed to the OS (writeAsync accepted);
+// completed = confirmed by a write-complete; dropped = discarded for any
+// reason, including a teardown purging the queue; rxEvents/rxBytes = what the
+// stack delivered natively; rxDroppedEvents = deliveries whose payload was
+// discarded before reaching Dart (e.g. allocation failure). Counters survive
+// disconnect — they remain readable after the channel is torn down (until
+// btc_reset) so post-mortem loss stays attributable. For an unknown handle
+// returns {"error":"unknown handle"}.
+char *btc_rfcomm_stats_json(int64_t handle);
+
 // Closes `handle`. Returns 0 on success.
 int32_t btc_rfcomm_close(int64_t handle);
 
