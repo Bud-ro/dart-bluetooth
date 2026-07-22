@@ -35,10 +35,23 @@ import 'platform/platform_interface.dart';
 class BluetoothConnection {
   BluetoothConnection._(this.device, this._transport) {
     logConnection.fine(() => 'opened ${device.id}');
+    _inputController = StreamController<Uint8List>.broadcast(
+      onListen: _drainRxBuffer,
+    );
     _inputSub = _transport.incoming.listen(
       (bytes) {
         logData.finest(() => 'rx ${device.id} ${describeBytes(bytes)}');
-        _inputController.add(bytes);
+        _rxBytes += bytes.length;
+        if (_inputController.hasListener) {
+          _inputController.add(bytes);
+        } else {
+          // A broadcast stream DROPS events with no listener — and inbound
+          // bytes can legally arrive before the app's first input.listen()
+          // (the peer greets right after connect) or between a cancel and a
+          // re-listen. Losing them would be silent data loss on a reliable
+          // protocol, so buffer (bounded) and replay on the next listen.
+          _bufferRx(bytes);
+        }
       },
       onError: _inputController.addError,
       // Peer-initiated disconnect: the transport closes its incoming stream.
@@ -68,8 +81,7 @@ class BluetoothConnection {
   final BluetoothDevice device;
 
   final RfcommTransport _transport;
-  final StreamController<Uint8List> _inputController =
-      StreamController<Uint8List>.broadcast();
+  late final StreamController<Uint8List> _inputController;
   final StreamController<ConnectionState> _stateController =
       StreamController<ConnectionState>.broadcast();
   late final StreamSubscription<Uint8List> _inputSub;
@@ -78,8 +90,65 @@ class BluetoothConnection {
   ConnectionState _state = ConnectionState.connected;
   Future<void>? _cleanupFuture;
 
+  /// Bytes received while [input] had no listener, replayed (in order) to the
+  /// next listener. Bounded by [_maxRxBufferBytes]; beyond that the OLDEST
+  /// data is discarded with a WARNING (only reachable when the app never
+  /// listens at all).
+  final List<Uint8List> _rxBuffer = [];
+  int _rxBufferBytes = 0;
+  static const int _maxRxBufferBytes = 1 << 20; // 1 MiB
+
+  int _rxBytes = 0;
+  int _txBytes = 0;
+
+  /// Total bytes received from the peer over this connection's lifetime
+  /// (including any still buffered awaiting the first [input] listener).
+  /// With [txBytes], lets an app attribute apparent message loss to a side.
+  int get rxBytes => _rxBytes;
+
+  /// Total bytes accepted by [add]/[write] over this connection's lifetime.
+  int get txBytes => _txBytes;
+
+  void _bufferRx(Uint8List bytes) {
+    _rxBuffer.add(bytes);
+    _rxBufferBytes += bytes.length;
+    while (_rxBufferBytes > _maxRxBufferBytes && _rxBuffer.isNotEmpty) {
+      final dropped = _rxBuffer.removeAt(0);
+      _rxBufferBytes -= dropped.length;
+      logConnection.warning(
+        () =>
+            'input buffer overflow: dropped ${dropped.length}B received '
+            'while nothing was listening to input',
+      );
+    }
+  }
+
+  void _drainRxBuffer() {
+    if (_rxBuffer.isEmpty) return;
+    logData.fine(
+      () =>
+          'replaying ${_rxBufferBytes}B received before/without an input '
+          'listener',
+    );
+    for (final chunk in _rxBuffer) {
+      _inputController.add(chunk);
+    }
+    _rxBuffer.clear();
+    _rxBufferBytes = 0;
+  }
+
   /// Inbound data. Broadcast: multiple listeners see the same bytes. Closes
   /// when the connection drops, so `await for` / `onDone` cleanly terminates.
+  ///
+  /// Bytes that arrive while NO listener is attached (before your first
+  /// `listen`, or between a cancel and a re-listen) are buffered — bounded at
+  /// 1 MiB — and replayed in order to the next listener, so a peer that
+  /// responds faster than your `listen()` attaches loses nothing.
+  ///
+  /// This is a BYTE stream, not a message stream: one event may carry several
+  /// of your protocol's messages (they bunch when the link stalls briefly,
+  /// e.g. waking from sniff mode) or a partial one. Frame by content, never
+  /// by event boundaries.
   Stream<Uint8List> get input => _inputController.stream;
 
   /// Connection-state transitions for this connection. A [BluetoothConnection]
@@ -124,6 +193,7 @@ class BluetoothConnection {
     logData.finest(() => 'tx ${device.id} ${describeBytes(data)}');
     try {
       _transport.send(data);
+      _txBytes += data.length;
     } on BluetoothWriteException catch (e) {
       logConnection.warning(() => 'write failed ${device.id}: ${e.message}');
       rethrow;

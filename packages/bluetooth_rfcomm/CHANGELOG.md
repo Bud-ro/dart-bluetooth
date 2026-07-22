@@ -38,6 +38,10 @@ Fixed — two adversarial review passes over the whole stack; highlights:
   writes fail with `BluetoothWriteException`, teardown is idempotent, and
   `flush()` reports lost bytes honestly (Windows previously acked success on
   a dead link; Android could report a clean flush after a failed write).
+- `input` no longer loses bytes that arrive while nothing is listening:
+  a peer that responds before your first `listen()` attaches (or during a
+  cancel/re-listen gap) is buffered and replayed in order. New `rxBytes` /
+  `txBytes` counters make loss attributable to a side.
 - Sending is now lossless under load on every platform: transient write
   errors (buffer-full, credit stalls, sniff-mode wakes) retry with backoff
   instead of dropping bytes or tearing the connection down. The macOS write

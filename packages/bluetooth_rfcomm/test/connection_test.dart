@@ -253,6 +253,53 @@ void main() {
     });
   });
 
+  test('bytes received before the first input listener are replayed', () async {
+    final (conn, transport) = await open();
+    // The peer greets immediately after connect, before the app listens.
+    transport.deliver([1, 2, 3]);
+    transport.deliver([4, 5]);
+    await Future<void>.delayed(Duration.zero);
+    final received = <int>[];
+    conn.input.listen(received.addAll);
+    await Future<void>.delayed(Duration.zero);
+    expect(received, [1, 2, 3, 4, 5]); // in order, nothing dropped
+    expect(conn.rxBytes, 5);
+  });
+
+  test(
+    'bytes received in a listen gap are replayed to the re-listener',
+    () async {
+      final (conn, transport) = await open();
+      final first = <int>[];
+      final sub = conn.input.listen(first.addAll);
+      transport.deliver([1]);
+      await Future<void>.delayed(Duration.zero);
+      await sub.cancel();
+      // Data arriving while nobody listens must not vanish.
+      transport.deliver([2, 3]);
+      await Future<void>.delayed(Duration.zero);
+      final second = <int>[];
+      conn.input.listen(second.addAll);
+      await Future<void>.delayed(Duration.zero);
+      expect(first, [1]);
+      expect(second, [2, 3]);
+      expect(conn.rxBytes, 3);
+    },
+  );
+
+  test('txBytes counts accepted bytes only', () async {
+    final (conn, transport) = await open();
+    conn.add(Uint8List.fromList([1, 2, 3]));
+    expect(conn.txBytes, 3);
+    transport.dropPeer();
+    await Future<void>.delayed(Duration.zero);
+    expect(
+      () => conn.add(Uint8List.fromList([9])),
+      throwsA(isA<BluetoothWriteException>()),
+    );
+    expect(conn.txBytes, 3); // the rejected write is not counted
+  });
+
   test('every API is crash-free after the peer drops', () async {
     final (conn, transport) = await open();
     transport.dropPeer();
