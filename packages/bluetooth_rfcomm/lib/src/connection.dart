@@ -484,6 +484,10 @@ class BluetoothConnection {
     // already checked, or if the transport zeroed its queue first — native
     // layers count that side themselves, e.g. macOS txDroppedBytes).
     _noteDiscardedTx(requested: false);
+    // One post-mortem loss ledger per connection: hardware sessions rarely
+    // think to read [stats] before the object is gone. FINE, not INFO — the
+    // package contract is silence at the default level.
+    logConnection.fine(() => 'session stats ${device.id}: $stats');
     await _inputSub.cancel();
     await _stateSub.cancel();
     if (!_stateController.isClosed) {
