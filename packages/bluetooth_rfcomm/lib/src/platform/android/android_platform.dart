@@ -29,10 +29,13 @@ import 'android_bindings.dart';
 /// Requires the app to hold the runtime Bluetooth permissions
 /// (`BLUETOOTH_CONNECT`/`BLUETOOTH_SCAN` on API 31+, location on older).
 class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
-  AndroidBluetoothRfcomm() : _lib = AndroidBindings.open() {
-    // Set before any native callback can fire so the static free-routing in
-    // _onData/_onFound never sees a null binding.
-    _activeLib = _lib;
+  /// Singleton (per isolate): the constructor resets process-global native
+  /// state (closing every open socket) as hot-restart recovery, so a second
+  /// live instance would silently kill the first one's connections. Mirrors
+  /// the BLE backend's guard.
+  factory AndroidBluetoothRfcomm() => _instance ??= AndroidBluetoothRfcomm._();
+
+  AndroidBluetoothRfcomm._() : _lib = AndroidBindings.instance {
     // The callables must pin this isolate while native sources can dial them.
     _setCallablesKeepAlive(true);
     // Order is load-bearing: register FIRST so the process-global callback
@@ -46,8 +49,34 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
       _dataCb.nativeFunction,
       _stateCb.nativeFunction,
     );
-    _lib.init();
+    _initCode = _lib.init();
     _lib.reset();
+  }
+
+  static AndroidBluetoothRfcomm? _instance;
+
+  /// Last `btc_and_init` result: 0 ready, 1 no adapter (genuinely unsupported
+  /// hardware), 2 no Application context yet, 7 JNI bridge failure (no JVM /
+  /// Kotlin class missing — e.g. stripped by R8). Only 0 and 1 are settled
+  /// states; anything else is retried by [_ensureBridge].
+  int _initCode = 0;
+
+  /// Fails loudly when the JNI bridge itself is broken instead of letting
+  /// every API degrade into empty lists and generic connect failures. Retries
+  /// init first: an early construction can legitimately precede the
+  /// Application context.
+  void _ensureBridge() {
+    if (_initCode == 0 || _initCode == 1) return;
+    _initCode = _lib.init();
+    if (_initCode == 0 || _initCode == 1) return;
+    throw BluetoothException(
+      _initCode == 7
+          ? 'Android JNI bridge failed: the native library cannot reach the '
+                'Kotlin backend (is bluetooth_rfcomm_flutter in the app, and '
+                'is BluetoothRfcommAndroid kept by R8/ProGuard?)'
+          : 'Android backend initialization failed: no Application context',
+      code: _initCode,
+    );
   }
 
   static void _setCallablesKeepAlive(bool alive) {
@@ -64,8 +93,6 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
   static final Map<int, _AndroidTransport> _transports = {};
   static final Map<int, StreamController<BluetoothDiscoveryResult>>
   _discoveries = {};
-  // Late-bound so the static callbacks can reach the active backend's bindings.
-  static AndroidBindings? _activeLib;
 
   static final ffi.NativeCallable<FoundCbNative> _foundCb =
       ffi.NativeCallable<FoundCbNative>.listener(_onFound);
@@ -78,13 +105,15 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<bool> isSupported() async {
-    _activeLib = _lib;
+    // Throws on a broken JNI bridge: "false" must mean "this phone has no
+    // Bluetooth", never "the plumbing is broken".
+    _ensureBridge();
     return _lib.adapterState() != _AdapterCode.unavailable;
   }
 
   @override
   Future<BluetoothAdapterState> adapterState() async {
-    _activeLib = _lib;
+    _ensureBridge();
     return _AdapterCode.toEnum(_lib.adapterState());
   }
 
@@ -103,13 +132,31 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<List<BluetoothDevice>> bondedDevices() async {
-    _activeLib = _lib;
+    _ensureBridge();
     final ptr = _lib.bondedJson();
-    if (ptr == ffi.nullptr) return const [];
+    if (ptr == ffi.nullptr) {
+      // The Kotlin side never returns null (worst case an {"error":..}
+      // envelope), so NULL is always a JNI plumbing failure — reporting it as
+      // "no bonded devices" is how bridge bugs stay invisible.
+      throw const BluetoothException('bonded-devices JNI bridge call failed');
+    }
     try {
-      final list = (jsonDecode(ptr.cast<Utf8>().toDartString()) as List)
-          .cast<Map<String, dynamic>>();
+      final decoded = jsonDecode(ptr.cast<Utf8>().toDartString());
+      if (decoded is Map) {
+        throw switch ((decoded['error'] as num?)?.toInt()) {
+          -2 => const BluetoothDisabledException(
+            'Bluetooth adapter unavailable',
+          ),
+          -3 => const BluetoothPermissionException(
+            'BLUETOOTH_CONNECT permission not granted',
+          ),
+          _ => const BluetoothException('enumerating bonded devices failed'),
+        };
+      }
+      final list = (decoded as List).cast<Map<String, dynamic>>();
       return list.map(_deviceFromJson).toList();
+    } on BluetoothException {
+      rethrow;
     } catch (e) {
       logNative.warning(() => 'malformed bonded-devices payload: $e');
       throw BluetoothException('malformed bonded-devices payload', cause: e);
@@ -130,7 +177,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() {
-    _activeLib = _lib;
+    _ensureBridge();
     final token = _nextToken++;
     late StreamController<BluetoothDiscoveryResult> controller;
     controller = StreamController<BluetoothDiscoveryResult>.broadcast(
@@ -199,7 +246,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
         'Android requires a MAC-address DeviceId for RFCOMM connect',
       );
     }
-    _activeLib = _lib;
+    _ensureBridge();
     final token = _nextToken++;
     final transport = _AndroidTransport(token, _lib);
     _transports[token] = transport;
@@ -286,11 +333,15 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
       if (!c.isClosed) await c.close();
     }
     _discoveries.clear();
-    // Quiesce every remaining native event source, then release the isolate
-    // pin: with nothing left that can dial the callables, letting the isolate
-    // exit is safe — a pure-Dart CLI can now terminate without exit().
+    // Quiesce every remaining native event source, then null the process
+    // callback slots: reset() wakes dying Kotlin read loops asynchronously,
+    // and their final nativeOnState must find empty slots (the C shim
+    // null-checks) rather than dialing this isolate's trampolines after the
+    // pin below is released. Only then is letting the isolate exit safe.
     _lib.reset();
+    _lib.register(ffi.nullptr, ffi.nullptr, ffi.nullptr, ffi.nullptr);
     _setCallablesKeepAlive(false);
+    _instance = null;
   }
 
   // --- static callback dispatch --------------------------------------------
@@ -316,7 +367,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
       // Skip a malformed sighting rather than tearing down discovery.
       logNative.fine(() => 'skipped malformed sighting: $e');
     } finally {
-      _activeLib?.free(json.cast());
+      AndroidBindings.instance.free(json.cast());
     }
   }
 
@@ -339,7 +390,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
         t._deliver(Uint8List.fromList(data.asTypedList(len)));
       }
     } finally {
-      _activeLib?.free(data.cast());
+      AndroidBindings.instance.free(data.cast());
     }
   }
 
@@ -369,10 +420,11 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
 /// Runs the blocking native `open` on a helper isolate. Top-level (not a method
 /// closure) so the computation sent to [Isolate.run] captures only its sendable
-/// args. Opens its own bindings (lookups only — the global JNI callbacks were
-/// registered once on the main isolate and still deliver there).
+/// args. Uses the helper isolate's own lazily-created [AndroidBindings.instance]
+/// (lookups only — the global JNI callbacks were registered once on the main
+/// isolate and still deliver there).
 int _androidOpen(int token, String address, int channel, String uuid) {
-  final lib = AndroidBindings.open();
+  final lib = AndroidBindings.instance;
   final addrPtr = address.toNativeUtf8();
   final uuidPtr = uuid.toNativeUtf8();
   try {
@@ -385,7 +437,7 @@ int _androidOpen(int token, String address, int channel, String uuid) {
 
 /// Blocks (up to ~10s in the Kotlin layer) until the per-socket write executor
 /// has drained. Top-level so [Isolate.run] captures only the sendable handle.
-int _androidFlush(int handle) => AndroidBindings.open().flush(handle);
+int _androidFlush(int handle) => AndroidBindings.instance.flush(handle);
 
 abstract final class _AdapterCode {
   static const int unavailable = 1;

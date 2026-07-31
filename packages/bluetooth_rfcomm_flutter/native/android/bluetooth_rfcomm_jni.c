@@ -31,6 +31,9 @@ typedef void (*btc_state_cb)(int64_t token, int32_t state);
 static JavaVM *g_vm = NULL;
 static jclass g_class = NULL; // global ref to BluetoothRfcommAndroid
 static int g_natives_registered = 0;
+// Guards g_class/g_natives_registered: btc_and_init can be reached from two
+// isolates at once (dup NewGlobalRef leak / double RegisterNatives otherwise).
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static btc_found_cb g_found = NULL;
 static btc_inquiry_done_cb g_done = NULL;
@@ -302,12 +305,23 @@ BTC_EXPORT void btc_and_register(btc_found_cb found, btc_inquiry_done_cb done,
   g_state = state;
 }
 
+// Returns Kotlin initialize()'s code (0 ok, 1 no adapter, 2 no context) or
+// BTC_INIT_BRIDGE_FAILED when the JNI plumbing itself is broken (no JVM, class
+// not found — e.g. stripped by R8 — or RegisterNatives failed). Distinct so
+// the Dart layer never reports a plumbing failure as "no Bluetooth on this
+// phone".
+#define BTC_INIT_BRIDGE_FAILED 7
+
 BTC_EXPORT int32_t btc_and_init(void) {
   JNIEnv *env = get_env();
-  if (!env) return 1; // unavailable
+  if (!env) return BTC_INIT_BRIDGE_FAILED;
+  pthread_mutex_lock(&g_init_lock);
   if (!g_class) {
     jclass local = find_app_class(env);
-    if (!local) return 1;
+    if (!local) {
+      pthread_mutex_unlock(&g_init_lock);
+      return BTC_INIT_BRIDGE_FAILED;
+    }
     g_class = (jclass)(*env)->NewGlobalRef(env, local);
     (*env)->DeleteLocalRef(env, local);
   }
@@ -322,12 +336,14 @@ BTC_EXPORT int32_t btc_and_init(void) {
     };
     if ((*env)->RegisterNatives(env, g_class, methods, 4) != JNI_OK) {
       (*env)->ExceptionClear(env);
-      return 1;
+      pthread_mutex_unlock(&g_init_lock);
+      return BTC_INIT_BRIDGE_FAILED;
     }
     g_natives_registered = 1;
   }
+  pthread_mutex_unlock(&g_init_lock);
   jmethodID m = static_method(env, "initialize", "()I");
-  if (!m) return 1;
+  if (!m) return BTC_INIT_BRIDGE_FAILED;
   int32_t r = (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
   clear_pending(env);
   return r;
@@ -335,9 +351,9 @@ BTC_EXPORT int32_t btc_and_init(void) {
 
 BTC_EXPORT int32_t btc_and_adapter_state(void) {
   JNIEnv *env = get_env();
-  if (!env) return 1;
+  if (!env) return BTC_INIT_BRIDGE_FAILED;
   jmethodID m = static_method(env, "adapterState", "()I");
-  if (!m) return 1;
+  if (!m) return BTC_INIT_BRIDGE_FAILED;
   int32_t r = (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
   clear_pending(env);
   return r;
@@ -385,6 +401,13 @@ BTC_EXPORT int64_t btc_and_open(int64_t token, const char *address, int32_t chan
   if (!m) return 0;
   jstring jaddr = (*env)->NewStringUTF(env, address);
   jstring juuid = (*env)->NewStringUTF(env, uuid);
+  if (!jaddr || !juuid) {
+    // OOM: a NULL jstring would NPE at Kotlin's non-null parameter check.
+    clear_pending(env);
+    if (jaddr) (*env)->DeleteLocalRef(env, jaddr);
+    if (juuid) (*env)->DeleteLocalRef(env, juuid);
+    return 0;
+  }
   jlong handle = (*env)->CallStaticLongMethod(env, g_class, m, (jlong)token,
                                               jaddr, (jint)channel, juuid);
   clear_pending(env);

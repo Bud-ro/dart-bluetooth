@@ -64,17 +64,21 @@ object BluetoothRfcommAndroid {
     @JvmStatic external fun nativeOnData(token: Long, data: ByteArray)
     @JvmStatic external fun nativeOnState(token: Long, state: Int)
 
+    // 0 = ready, 1 = no Bluetooth adapter (genuinely unsupported hardware),
+    // 2 = no Application context (bridge ran before the app was up). Distinct
+    // so the Dart layer can tell "this phone has no radio" from "the plumbing
+    // is broken" — collapsing them is how infrastructure failures hide.
     @JvmStatic
     fun initialize(): Int {
         return try {
-            val ctx = currentApplication() ?: return 1 // unavailable
+            val ctx = currentApplication() ?: return 2
             context = ctx
             val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE)
                     as? BluetoothManager
             adapter = mgr?.adapter
             if (adapter == null) 1 else 0
         } catch (t: Throwable) {
-            1
+            2
         }
     }
 
@@ -97,20 +101,26 @@ object BluetoothRfcommAndroid {
         }
     }
 
-    // Returns "[]" on any failure (incl. SecurityException when BLUETOOTH_CONNECT
-    // is not granted) so a JNI-pending exception can never abort the VM.
+    // Failures return a JSON *object* envelope ({"error": code}) instead of an
+    // array, so the Dart side can distinguish "genuinely zero bonded devices"
+    // ("[]") from a failure — silently equating the two is how a missing
+    // BLUETOOTH_CONNECT grant masquerades as an empty phone. Never throws
+    // (a JNI-pending exception could abort the VM). Codes mirror connect():
+    // -2 adapter unavailable, -3 permission, -1 anything else.
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun bondedJson(): String {
         return try {
-            val a = adapter ?: return "[]"
+            val a = adapter ?: return """{"error":-2}"""
             val arr = JSONArray()
             for (d in a.bondedDevices.orEmpty()) {
                 arr.put(deviceJson(d, bonded = true))
             }
             arr.toString()
+        } catch (se: SecurityException) {
+            """{"error":-3}"""
         } catch (t: Throwable) {
-            "[]"
+            """{"error":-1}"""
         }
     }
 
@@ -126,7 +136,7 @@ object BluetoothRfcommAndroid {
                 val receiver = object : BroadcastReceiver() {
                     override fun onReceive(c: Context, intent: Intent) {
                         when (intent.action) {
-                            BluetoothDevice.ACTION_FOUND -> {
+                            BluetoothDevice.ACTION_FOUND -> try {
                                 val device = deviceExtra(intent)
                                 val rssi = intent.getShortExtra(
                                     BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE
@@ -141,6 +151,12 @@ object BluetoothRfcommAndroid {
                                     )
                                     nativeOnFound(token, json.toString())
                                 }
+                            } catch (t: Throwable) {
+                                // An uncaught throw in a BroadcastReceiver kills
+                                // the whole process. bondState/name need
+                                // BLUETOOTH_CONNECT, which can be missing while
+                                // BLUETOOTH_SCAN is granted — drop the sighting,
+                                // never crash the app.
                             }
                             BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
                                 // A FINISHED delivered to a STALE receiver (one
@@ -164,7 +180,14 @@ object BluetoothRfcommAndroid {
                 }
                 registerReceiverCompat(ctx, receiver, filter)
                 discoveryReceiver = receiver
-                if (a.startDiscovery()) 0 else -1
+                if (a.startDiscovery()) {
+                    0
+                } else {
+                    // Dart treats -1 as never-started; leaving the receiver
+                    // registered would leak it until the next start/stop/reset.
+                    stopDiscoveryLocked()
+                    -1
+                }
             }
         } catch (t: Throwable) {
             -1
@@ -412,10 +435,13 @@ object BluetoothRfcommAndroid {
     ): JSONObject {
         return JSONObject().apply {
             put("address", d.address)
-            put("name", d.name ?: JSONObject.NULL)
+            // name/bluetoothClass need BLUETOOTH_CONNECT on API 31+; a missing
+            // grant must degrade to an unnamed sighting, not lose the device.
+            put("name", runCatching { d.name }.getOrNull() ?: JSONObject.NULL)
             put("bonded", bonded)
             put("connected", false)
-            d.bluetoothClass?.let { put("classOfDevice", it.deviceClass) }
+            runCatching { d.bluetoothClass }.getOrNull()
+                ?.let { put("classOfDevice", it.deviceClass) }
             if (rssi != null) put("rssi", rssi)
         }
     }

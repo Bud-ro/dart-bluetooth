@@ -103,6 +103,12 @@ class AndroidBindings {
   factory AndroidBindings.open() =>
       AndroidBindings._(ffi.DynamicLibrary.open(_libName));
 
+  /// Per-isolate singleton. The underlying .so and its symbols are
+  /// process-wide, so re-opening per call bought nothing — and the previous
+  /// nullable `_activeLib` plumbing could silently skip `free` (a leak) when
+  /// no backend happened to be constructed yet.
+  static final AndroidBindings instance = AndroidBindings.open();
+
   static const String _libName = 'libbluetooth_rfcomm_android.so';
 
   final ffi.DynamicLibrary _lib;
