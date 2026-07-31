@@ -527,6 +527,13 @@ const String _pairedDevicesKey =
 /// Heavily instrumented (FINER, [BluetoothRfcommLoggers.discovery]) so the time
 /// spent opening the library, opening the key, enumerating, and reading each
 /// device name is visible — to catch any operation that unexpectedly stalls.
+/// Test probe: runs the real registry enumeration and reports how many
+/// paired devices it parsed. Windows-only CI calls this on real runners —
+/// no Bluetooth radio required, so it is the one hardware-true gate for the
+/// registry-parse path (a crash or FFI fault fails the suite).
+@visibleForTesting
+int debugPairedRegistryProbe() => _enumeratePairedFromRegistry().length;
+
 List<_RawDevice> _enumeratePairedFromRegistry() {
   final total = Stopwatch()..start();
   final reg = RegistryBindings();
