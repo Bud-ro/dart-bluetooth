@@ -92,25 +92,10 @@ external void bleWrite(
   int withoutResponse,
 );
 
-@ffi.Native<
-  ffi.Void Function(
-    ffi.Int64,
-    ffi.Pointer<ffi.Char>,
-    ffi.Pointer<ffi.Char>,
-    ffi.Int32,
-  )
->(symbol: 'ble_subscribe')
-external void bleSubscribe(
-  int connToken,
-  ffi.Pointer<ffi.Char> service,
-  ffi.Pointer<ffi.Char> characteristic,
-  int enable,
-);
-
 /// Tracked notify toggle: completes the op callback with [reqId] once the
 /// peripheral acknowledges the change, or status != 0 on failure (missing
-/// connection/characteristic, CoreBluetooth error). Prefer this over
-/// [bleSubscribe], whose fire-and-forget shape can silently no-op.
+/// connection/characteristic, CoreBluetooth error), so a failed enable
+/// surfaces instead of silently never notifying.
 @ffi.Native<
   ffi.Void Function(
     ffi.Int64,

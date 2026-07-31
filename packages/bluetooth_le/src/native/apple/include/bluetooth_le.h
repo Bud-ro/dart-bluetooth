@@ -86,17 +86,13 @@ void ble_write(int64_t req_id, int64_t conn_token, const char *service,
                const char *characteristic, const uint8_t *data, int32_t len,
                int32_t without_response);
 
-// Enables/disables notifications on a characteristic. While enabled, pushed
-// values arrive via `notify_cb` with characteristic = "service|char" (canonical
-// lowercase 128-bit UUIDs).
-void ble_subscribe(int64_t conn_token, const char *service,
-                   const char *characteristic, int32_t enable);
-
-// Like ble_subscribe, but tracked: completes `op_cb` with `req_id` once the
-// peripheral acknowledges the notification-state change (status 0), or with
-// status != 0 when the connection/characteristic is unknown or CoreBluetooth
-// reports an error — so a failed enable surfaces instead of silently never
-// notifying. Additive; ble_subscribe remains for ABI compatibility.
+// Enables/disables notifications on a characteristic (tracked): completes
+// `op_cb` with `req_id` once the peripheral acknowledges the
+// notification-state change (status 0), or with status != 0 when the
+// connection/characteristic is unknown or CoreBluetooth reports an error —
+// so a failed enable surfaces instead of silently never notifying. While
+// enabled, pushed values arrive via `notify_cb` with characteristic =
+// "service|char" (canonical lowercase 128-bit UUIDs).
 void ble_set_notify(int64_t req_id, int64_t conn_token, const char *service,
                     const char *characteristic, int32_t enable);
 

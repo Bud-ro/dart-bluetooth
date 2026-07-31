@@ -112,16 +112,39 @@ class AppleBleCentral extends BleCentralPlatform {
         }
         _scanController = controller;
         _scanToken = token;
-        final csv = (withServices == null || withServices.isEmpty)
-            ? ''
-            : withServices.map((u) => u.value).join(',');
-        final ptr = csv.toNativeUtf8();
-        try {
-          bleStartScan(token, ptr.cast());
-          logScan.fine('scan started');
-        } finally {
-          calloc.free(ptr);
-        }
+        unawaited(() async {
+          // Same gate as connect(): ble_start_scan itself always returns 0
+          // and latches wantScan, so a denied authorization or powered-off
+          // radio would otherwise be a silent, forever-empty stream.
+          final state = await _settledAdapterState();
+          if (controller.isClosed || _scanToken != token) return;
+          final Object? error = switch (state) {
+            BluetoothAdapterState.off ||
+            BluetoothAdapterState.unavailable => const BleDisabledException(
+              'Bluetooth adapter is off or unavailable; cannot scan',
+            ),
+            BluetoothAdapterState.unauthorized => const BlePermissionException(
+              'Bluetooth permission denied; cannot scan',
+            ),
+            _ => null,
+          };
+          if (error != null) {
+            controller.addError(error);
+            _scanController = null;
+            unawaited(controller.close());
+            return;
+          }
+          final csv = (withServices == null || withServices.isEmpty)
+              ? ''
+              : withServices.map((u) => u.value).join(',');
+          final ptr = csv.toNativeUtf8();
+          try {
+            bleStartScan(token, ptr.cast());
+            logScan.fine('scan started');
+          } finally {
+            calloc.free(ptr);
+          }
+        }());
       },
       onCancel: () {
         if (_scanToken == token) {
@@ -142,14 +165,30 @@ class AppleBleCentral extends BleCentralPlatform {
     _scanController = null;
   }
 
+  /// Waits (bounded) for the manager to leave its startup `unknown` state.
+  /// CoreBluetooth discards retrievePeripherals/connectPeripheral calls issued
+  /// before the first centralManagerDidUpdateState ("API MISUSE" log only), so
+  /// the canonical connect-to-stored-id-at-launch flow — where construction to
+  /// connect is milliseconds, especially in a CLI — would misreport as
+  /// "unknown peripheral; scan for it first".
+  static Future<BluetoothAdapterState> _settledAdapterState() async {
+    var state = _AdapterCode.toEnum(bleAdapterState());
+    final deadline = DateTime.now().add(const Duration(seconds: 3));
+    while (state == BluetoothAdapterState.unknown &&
+        DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      state = _AdapterCode.toEnum(bleAdapterState());
+    }
+    return state;
+  }
+
   @override
   Future<GattConnection> connect(DeviceId id, {Duration? timeout}) async {
     // CoreBluetooth quietly drops connectPeripheral: on a non-poweredOn
     // manager ("API MISUSE" log only), which would hang a timeout-less connect
     // forever and mislabel a timed one as BleTimeoutException. Fail fast with
-    // the accurate domain error instead. `unknown` (manager still powering up)
-    // deliberately passes through — CoreBluetooth queues that case correctly.
-    switch (_AdapterCode.toEnum(bleAdapterState())) {
+    // the accurate domain error instead.
+    switch (await _settledAdapterState()) {
       case BluetoothAdapterState.off:
       case BluetoothAdapterState.unavailable:
         throw const BleDisabledException(
@@ -175,10 +214,15 @@ class AppleBleCentral extends BleCentralPlatform {
     }
     if (rc != 0) {
       _connections.remove(token);
-      throw DeviceNotFoundException(
-        'Unknown peripheral ${id.value}; scan for it first',
-        code: rc,
-      );
+      throw rc == -4
+          ? BleConnectionException(
+              'Peripheral ${id.value} is already connected or connecting',
+              code: rc,
+            )
+          : DeviceNotFoundException(
+              'Unknown peripheral ${id.value}; scan for it first',
+              code: rc,
+            );
     }
     try {
       await conn.waitConnected(timeout);
