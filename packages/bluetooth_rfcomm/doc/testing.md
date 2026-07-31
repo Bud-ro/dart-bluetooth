@@ -29,7 +29,9 @@ backend must pass it before it ships.
 Random legal call schedules (scan start/stop, stream listen/cancel, connect/
 disconnect, peer drops, dispose) run against the fake under `runZonedGuarded`,
 with the engine's internal counters checked for invariant violations after
-every operation and full quiescence asserted after dispose. Deterministic:
+every operation, upward-leak guards on the hold/inquiry ledgers, and
+post-dispose quiescence asserted against the PLATFORM's inquiry counters
+(the facade's own counters are force-zeroed by dispose). Deterministic:
 failures print a seed; `FUZZ_SEED=<seed>` reproduces exactly. CI runs 12
 seeds (~2s); soak with `FUZZ_RUNS=500 FUZZ_OPS=200` before releases. New
 facade operations MUST be added to the fuzzer's op table.
@@ -42,8 +44,9 @@ The contract is "never silently drop accepted bytes" — and it's enforced by
 accounting, not by review: every discard path (teardown purges, RX drops,
 rejected writes, buffer overflows) increments a counter surfaced via
 `BluetoothConnection.stats` (Dart + native hops on macOS). A loss report that
-all counters read zero against is a *localizable* loss. `btc bench` (ships
-with the macOS send-path PR; example
+all counters read zero against is a *localizable* loss. `btc bench` (example
+CLI; ships with the macOS send-path PR rather than 0.2.0 — the counters and
+conformance checker below are in this release
 CLI) is the reference load harness: CRC-framed, sequence-numbered, separating
 lost / late / corrupted / never-sent.
 
@@ -82,7 +85,7 @@ marshaling, error taxonomy, no-crash guarantees. Runs on the manual
    `doc/backpressure.md` and the bench verdicts tell you what to measure.
 4. **Parser property tests** — fuzz the pure parsers (native JSON payloads,
    registry name decoding, `WSAQUERYSET` field handling, the bench
-   reassembler already has one) with random/mutated inputs; they're pure
+   reassembler, once the send-path PR lands) with random/mutated inputs; they're pure
    functions, so this is cheap and total.
 5. **Port the whole stack of layers 1–3 to `bluetooth_le`** — the LE package
    has the same architecture and has historically received rfcomm's fixes

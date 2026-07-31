@@ -191,6 +191,7 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
     // Quiesce anything still live natively, then release the isolate pin.
     btcEaReset();
     _setCallablesKeepAlive(false);
+    BluetoothRfcommPlatform.detachInstance(this);
   }
 
   // --- helpers -------------------------------------------------------------
@@ -242,7 +243,9 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {
     final t = _transports[token];
     try {
-      if (t == null) {
+      if (len <= 0) {
+        // Nothing to route or count.
+      } else if (t == null) {
         _rxUnroutedEvents++;
         _rxUnroutedBytes += len;
       } else if (len > _maxInboundChunk) {
@@ -357,7 +360,15 @@ class _IosEaTransport implements RfcommTransport, TransportStats {
     try {
       ptr.asTypedList(data.length).setAll(0, data);
       final rc = btcEaWrite(_handle, ptr, data.length);
-      if (rc != 0) throw BluetoothWriteException('write failed', code: rc);
+      if (rc != 0) {
+        throw BluetoothWriteException(
+          rc == -2
+              ? 'write rejected: native write backlog full (accessory '
+                    'stalled)'
+              : 'write failed: session is not open',
+          code: rc,
+        );
+      }
     } finally {
       calloc.free(ptr);
     }

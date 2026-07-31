@@ -35,7 +35,31 @@ bool isFatalWsaSendError(int wsa) =>
     wsa == wsaeConnAborted ||
     wsa == wsaeConnReset ||
     wsa == wsaeNotConn ||
-    wsa == wsaeShutdown;
+    wsa == wsaeShutdown ||
+    // Handle invalidated out from under us: retrying cannot help, and
+    // burning the retry budget just delays the disconnect report by ~500ms.
+    wsa == wsaeNotSock ||
+    wsa == wsaeInval;
+
+const int wsaeNotSock = 10038; // WSAENOTSOCK
+const int wsaeInval = 10022; // WSAEINVAL
+
+// Inquiry-termination codes that mean "the enumeration simply ended" (natural
+// completion, or a cancel issued by the owning isolate's WSALookupServiceEnd):
+// anything else from WSALookupServiceNext is a REAL mid-scan failure (radio
+// yanked, stack reset) and must surface as a stream error, not a clean finish.
+const int wsaENoMore = 10110; // WSA_E_NO_MORE
+const int wsaeNoMore = 10102; // WSAENOMORE (older stacks)
+const int wsaECancelled = 10111; // WSA_E_CANCELLED
+const int wsaeCancelled = 10103; // WSAECANCELLED (older stacks)
+const int wsaInvalidHandle = 6; // WSA_INVALID_HANDLE (End beat this Next)
+
+bool isBenignInquiryEnd(int wsa) =>
+    wsa == wsaENoMore ||
+    wsa == wsaeNoMore ||
+    wsa == wsaECancelled ||
+    wsa == wsaeCancelled ||
+    wsa == wsaInvalidHandle;
 
 // setsockopt(SOL_SOCKET, SO_RCVTIMEO) — bounds how long recv() blocks (DWORD ms).
 const int solSocket = 0xffff; // SOL_SOCKET

@@ -7,6 +7,7 @@ import '../models/bluetooth_service.dart';
 import '../models/device_id.dart';
 import '../models/discovery_result.dart';
 import '../models/enums.dart';
+import '../platform/transport_stats.dart';
 import '../models/uuid.dart';
 import '../platform/platform_interface.dart';
 
@@ -63,6 +64,13 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
 
   bool discoveryStarted = false;
   bool discoveryStopped = false;
+
+  /// Number of platform inquiries actually started/stopped. The booleans
+  /// above saturate, so they cannot distinguish one inquiry from N — which is
+  /// exactly the defect the facade's shared-inquiry machinery exists to
+  /// prevent. Assert on these.
+  int startDiscoveryCount = 0;
+  int stopDiscoveryCount = 0;
   final List<DeviceId> paired = [];
   final List<DeviceId> unpaired = [];
 
@@ -119,6 +127,8 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
     controller = StreamController<BluetoothDiscoveryResult>.broadcast(
       onListen: () {
         discoveryStarted = true;
+        startDiscoveryCount++;
+        _liveDiscoveries.add(controller);
         for (final r in discoveryResults) {
           controller.add(r);
         }
@@ -129,14 +139,27 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
       },
       onCancel: () {
         discoveryStopped = true;
+        stopDiscoveryCount++;
+        _liveDiscoveries.remove(controller);
       },
     );
     return controller.stream;
   }
 
+  final Set<StreamController<BluetoothDiscoveryResult>> _liveDiscoveries = {};
+
   @override
   Future<void> stopDiscovery() async {
     discoveryStopped = true;
+    stopDiscoveryCount++;
+    // Mirror every real backend (and the interface doc): stopDiscovery aborts
+    // live inquiries, closing their streams. A fake that leaves them open
+    // models a platform that exists nowhere and hides facade coordination
+    // bugs (e.g. _activeDiscoveries stuck > 0 pausing the scan forever).
+    for (final c in _liveDiscoveries.toList()) {
+      if (!c.isClosed) unawaited(c.close());
+    }
+    _liveDiscoveries.clear();
   }
 
   @override
@@ -183,7 +206,7 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
 }
 
 /// A controllable [RfcommTransport] for tests.
-class FakeRfcommTransport implements RfcommTransport {
+class FakeRfcommTransport implements RfcommTransport, TransportStats {
   FakeRfcommTransport({
     required this.device,
     required this.channel,
@@ -252,12 +275,24 @@ class FakeRfcommTransport implements RfcommTransport {
   /// both the state and incoming streams on a peer-initiated disconnect.
   void dropPeer() {
     if (_closed) return;
+    // Real transports zero their pending gauge during teardown and latch the
+    // loss; the fake must behave identically or unit tests exercise a gauge
+    // contract that exists nowhere in production.
+    _txDroppedBytes += _pendingWriteBytes;
+    _pendingWriteBytes = 0;
     _closed = true;
     _current = ConnectionState.disconnected;
     _state.add(ConnectionState.disconnected);
     if (!_state.isClosed) unawaited(_state.close());
     if (!_incoming.isClosed) unawaited(_incoming.close());
   }
+
+  /// Bytes discarded by teardown (dropPeer/close with a non-empty queue),
+  /// latched like every real transport and reported via [nativeStats].
+  int _txDroppedBytes = 0;
+
+  @override
+  Map<String, int> nativeStats() => {'txDroppedBytes': _txDroppedBytes};
 
   @override
   Stream<Uint8List> get incoming => _incoming.stream;
@@ -286,6 +321,8 @@ class FakeRfcommTransport implements RfcommTransport {
   @override
   Future<void> close() async {
     if (_closed) return;
+    _txDroppedBytes += _pendingWriteBytes;
+    _pendingWriteBytes = 0;
     _closed = true;
     final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;

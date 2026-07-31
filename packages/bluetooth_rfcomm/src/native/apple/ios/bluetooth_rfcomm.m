@@ -322,7 +322,10 @@ int32_t btc_ea_write(int64_t handle, const uint8_t *data, int32_t len) {
   [[BTCWorker shared] runSync:^{
     BTCSession *h = g_sessions()[@(handle)];
     if (!h) return; // unknown/closed handle -> -1
-    if (h.outBuffer.length + bytes.length > kBTCWriteBacklogCap) return;
+    if (h.outBuffer.length + bytes.length > kBTCWriteBacklogCap) {
+      result = -2; // backlog full — distinct from closed, matching macOS
+      return;
+    }
     [h enqueue:bytes];
     result = 0;
   }];

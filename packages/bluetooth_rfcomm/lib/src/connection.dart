@@ -345,13 +345,15 @@ class BluetoothConnection {
   /// discarded since the call began — even after disconnect.
   Future<void> drain({int belowBytes = 0}) async {
     RangeError.checkNotNegative(belowBytes, 'belowBytes');
-    final discardedAtStart = _txDiscardedBytes;
+    final discardedAtStart = _discardedTotal();
     var lastPending = -1;
     var stalePolls = 0;
     while (true) {
       // Discards are checked FIRST: transports zero their gauge on teardown,
-      // so "pending dropped to 0" alone cannot be trusted as delivery.
-      final lost = _txDiscardedBytes - discardedAtStart;
+      // so "pending dropped to 0" alone cannot be trusted as delivery. The
+      // total includes the transport's own teardown latch — the only witness
+      // left when a peer drop purges the queue before this loop's next poll.
+      final lost = _discardedTotal() - discardedAtStart;
       if (lost > 0) {
         throw BluetoothWriteException(
           '$lost queued bytes were discarded before delivery',
@@ -415,6 +417,21 @@ class BluetoothConnection {
     await _cleanup();
   }
 
+  /// Total observed tx discards: the Dart-side ledger plus whatever the
+  /// transport latched natively at teardown. The native term is load-bearing
+  /// for the peer-drop path — the transport zeroes its pending gauge during
+  /// its own teardown, BEFORE this layer gets to look, so only the
+  /// transport's latch still knows about the purged bytes.
+  int _discardedTotal() {
+    var total = _txDiscardedBytes;
+    if (_transport case final TransportStats t) {
+      try {
+        total += t.nativeStats()['txDroppedBytes'] ?? 0;
+      } catch (_) {}
+    }
+    return total;
+  }
+
   /// Records (once) any bytes still queued toward the OS as discarded, so
   /// [stats] — and, for unrequested losses, a warning log — make an eaten tx
   /// queue observable even when the caller never awaited [drain]/[flush].
@@ -455,7 +472,10 @@ class BluetoothConnection {
       // race window before the drop was detected). The disconnect is already
       // in motion; graceful shutdown still completes — never throw out of a
       // teardown method. Callers that need delivery confirmation use
-      // write()/flush() directly.
+      // write()/flush() directly. Count the loss NOW, while the transport's
+      // gauge may still be live — after close() it reads zero and the bytes
+      // would vanish from the ledger.
+      _noteDiscardedTx(requested: false);
       logConnection.fine(() => 'flush during finish failed ${device.id}: $e');
     } finally {
       await _transport.close();

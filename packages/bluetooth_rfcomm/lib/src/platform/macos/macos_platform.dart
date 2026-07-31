@@ -325,6 +325,7 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
     // pure-Dart CLI can exit without calling exit() explicitly.
     btcReset();
     _setCallablesKeepAlive(false);
+    BluetoothRfcommPlatform.detachInstance(this);
   }
 
   // --- callback dispatch (static; correlate by token) ----------------------
@@ -588,10 +589,12 @@ class _MacRfcommTransport implements RfcommTransport, TransportStats {
     // The loop also exits when teardown PURGED the queue — those bytes were
     // never transmitted, and per the lossless-send contract (matching iOS,
     // Android, and Windows) a flush over them must fail, not report success.
-    // txDroppedBytes only ever counts teardown purges, so nonzero here means
-    // exactly that.
-    final dropped =
-        (_finalNativeStats ?? _readNativeStats())?['txDroppedBytes'] ?? 0;
+    // Only consult the close-time snapshot: a healthy drain (loop exited on
+    // pending == 0 with the channel open) must NOT do a runSync stats read,
+    // which would block this isolate behind another write's in-progress
+    // writeSync stall.
+    if (!_closed) return;
+    final dropped = _finalNativeStats?['txDroppedBytes'] ?? 0;
     if (dropped > 0) {
       throw BluetoothWriteException(
         '$dropped queued bytes were discarded by disconnect before delivery',
@@ -659,10 +662,13 @@ class _MacRfcommTransport implements RfcommTransport, TransportStats {
     final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
     if (_handle != 0) {
-      // Snapshot the channel's counters while the handle is still valid so
-      // stats read AFTER a disconnect (the usual diagnostic moment) work.
-      _finalNativeStats = _readNativeStats();
+      // Close FIRST, then snapshot: the registry keeps counters readable
+      // after teardown (that is its whole purpose), and closing first means
+      // the snapshot INCLUDES anything this very close purged — a
+      // snapshot-before-close read txDroppedBytes: 0 and made the elaborate
+      // post-mortem machinery unreachable from Dart.
       btcRfcommClose(_handle);
+      _finalNativeStats = _readNativeStats();
       _handle = 0;
     }
     MacosBluetoothRfcomm._transports.remove(_token);

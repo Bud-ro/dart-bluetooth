@@ -17,6 +17,7 @@ import '../../models/discovery_result.dart';
 import '../../models/enums.dart';
 import '../../models/uuid.dart';
 import '../platform_interface.dart';
+import '../transport_stats.dart';
 import 'windows_ffi.dart';
 
 /// Windows backend over Winsock Bluetooth (`AF_BTH` / `BTHPROTO_RFCOMM`).
@@ -853,11 +854,15 @@ void _inquiryEntry(List<Object?> args) {
           buf = calloc<ffi.Uint8>(bufSize);
           continue;
         }
-        // WSA_E_CANCELLED (blocked Next aborted by the main isolate's End),
-        // WSA_INVALID_HANDLE (End completed before this Next), natural
-        // completion (WSA_E_NO_MORE / WSAENOMORE) and real errors all end the
-        // scan identically: the main isolate owns every End (see the doc
-        // comment above), so there is nothing to close here.
+        // Natural completion (WSA_E_NO_MORE/WSAENOMORE) and owner-issued
+        // cancellation (WSA_E_CANCELLED / WSA_INVALID_HANDLE from the main
+        // isolate's End) end the scan cleanly; anything else — the radio
+        // yanked mid-scan, a stack reset — is a REAL failure the app must
+        // see, not a "scan finished, 0 devices". The main isolate owns every
+        // End, so there is nothing to close here either way.
+        if (!isBenignInquiryEnd(err)) {
+          sendPort.send(<String, int>{'error': _wsaError(err)});
+        }
         break;
       }
       final result = buf.cast<WsaQuerySetW>().ref;
@@ -1246,7 +1251,7 @@ int _sendAll(
 /// RFCOMM transport backed by a Winsock socket, with a dedicated reader isolate
 /// (blocking `recv`) and writer isolate (blocking `send` from a FIFO queue) so
 /// the calling isolate never blocks.
-class _WindowsRfcommTransport implements RfcommTransport {
+class _WindowsRfcommTransport implements RfcommTransport, TransportStats {
   _WindowsRfcommTransport({required int socket, required WinsockBindings ws})
     : _socket = socket,
       _ws = ws {
@@ -1504,16 +1509,49 @@ class _WindowsRfcommTransport implements RfcommTransport {
     if (fatal != null && fatal != 0) {
       throw BluetoothWriteException('flush failed — link lost', code: fatal);
     }
+    if (result is! List && _txDroppedBytes > 0) {
+      // close() won the race and the writer never acked: the queue was
+      // discarded, and "no ack" must not read as "all delivered".
+      throw BluetoothWriteException(
+        'flush failed — $_txDroppedBytes queued bytes discarded by teardown',
+      );
+    }
   }
+
+  @override
+  Map<String, int> nativeStats() => {'txDroppedBytes': _txDroppedBytes};
 
   void _onClosedByPeer() {
     if (_closed) return;
     unawaited(close());
   }
 
+  /// Bytes that were accepted by [send] but never consumed by the writer when
+  /// teardown ran — latched at close so the loss stays reportable after the
+  /// gauge zeroes (the connection layer reads it via [nativeStats]).
+  int _txDroppedBytes = 0;
+
+  Completer<void>? _closeDone;
+
+  /// Shared-completion close: EVERY caller gets a future that resolves only
+  /// once the socket is actually closed. An early `return` for the second
+  /// caller would let an app's disconnect handler finish "closing" and
+  /// reconnect while the first close() is still waiting out the worker
+  /// isolates — with the old socket still open, the device's RFCOMM channel
+  /// stays busy and the reconnect fails (the exact failure mode the ordered
+  /// teardown exists to prevent).
   @override
-  Future<void> close() async {
-    if (_closed) return;
+  Future<void> close() {
+    final existing = _closeDone;
+    if (existing != null) return existing.future;
+    final done = _closeDone = Completer<void>();
+    _doClose().whenComplete(done.complete);
+    return done.future;
+  }
+
+  Future<void> _doClose() async {
+    // Latch the undelivered backlog before the gauge zeroes below.
+    _txDroppedBytes = pendingWriteBytes;
     _closed = true;
     final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;
@@ -1538,10 +1576,22 @@ class _WindowsRfcommTransport implements RfcommTransport {
     //     out the full step-3 bound.
     _writerSend?.send(null);
     //  3. Wait (bounded — a wedged isolate must not hang close forever).
-    await Future.any<Object?>([
-      Future.wait([_readerExited.future, _writerExited.future]),
-      Future<void>.delayed(const Duration(seconds: 2)),
+    final exitedInTime = await Future.any<bool>([
+      Future.wait([
+        _readerExited.future,
+        _writerExited.future,
+      ]).then((_) => true),
+      Future<void>.delayed(const Duration(seconds: 2)).then((_) => false),
     ]);
+    if (!exitedInTime) {
+      // The one situation where the ordered-teardown invariant is abandoned:
+      // a stale worker may still touch this SOCKET value after Winsock
+      // recycles it. Must never be invisible.
+      logConnection.warning(
+        'worker isolates did not exit within 2s; closing the socket anyway '
+        '(stale-handle risk)',
+      );
+    }
     //  4. Now the handle is safe to free. Log the result: a failed closesocket
     //     keeps the device's RFCOMM channel busy — the prime suspect for "the
     //     next connect fails until the app restarts".

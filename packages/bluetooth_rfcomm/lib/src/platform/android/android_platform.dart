@@ -105,8 +105,12 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<bool> isSupported() async {
-    // Throws on a broken JNI bridge: "false" must mean "this phone has no
-    // Bluetooth", never "the plumbing is broken".
+    // Code 2 (no Application context YET) is transient — a capability probe
+    // during early startup must answer false like 0.1.x, not throw. Only a
+    // genuinely broken bridge (7: no JVM / class stripped) throws, because
+    // nothing will ever work and "false" would misdiagnose it as no-radio.
+    if (_initCode == 2) _initCode = _lib.init();
+    if (_initCode == 2) return false;
     _ensureBridge();
     return _lib.adapterState() != _AdapterCode.unavailable;
   }
@@ -345,6 +349,10 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     _lib.register(ffi.nullptr, ffi.nullptr, ffi.nullptr, ffi.nullptr);
     _setCallablesKeepAlive(false);
     _instance = null;
+    // Also vacate the interface-level slot: with the callback slots nulled
+    // above, handing this disposed backend to the next default-constructed
+    // facade would silently black-hole every sighting, byte, and disconnect.
+    BluetoothRfcommPlatform.detachInstance(this);
   }
 
   // --- static callback dispatch --------------------------------------------
@@ -565,7 +573,11 @@ class _AndroidTransport implements RfcommTransport {
     // still-open handle means the executor died with writes queued.
     final rc = await spawnAndroidFlush(_handle);
     if (rc != 0 && !_closed) {
-      throw BluetoothWriteException('flush failed — link lost', code: rc);
+      throw BluetoothWriteException(
+        'flush failed (link lost, an earlier write failed, or >10s of '
+        'backlog did not drain)',
+        code: rc,
+      );
     }
   }
 

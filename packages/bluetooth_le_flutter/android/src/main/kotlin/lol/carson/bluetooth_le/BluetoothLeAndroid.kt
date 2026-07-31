@@ -247,7 +247,13 @@ object BluetoothLeAndroid {
             return
         }
         conn.discoverReq = reqId
-        if (!gatt.discoverServices()) nativeOnOp(reqId, GATT_FAILURE, null, null)
+        if (!gatt.discoverServices()) {
+            // Clear the slot before reporting, like every other op's failure
+            // branch — a stale slot lets a later spontaneous
+            // onServicesDiscovered fire a duplicate completion.
+            conn.discoverReq = 0
+            nativeOnOp(reqId, GATT_FAILURE, null, null)
+        }
     }
 
     @SuppressLint("MissingPermission")

@@ -169,11 +169,20 @@ void main() {
         totals.add,
         reportInterval: const Duration(milliseconds: 10),
       );
+      Future<void> until(bool Function() cond) async {
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (!cond() && DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+      }
+
       r.add(10); // gated; arms the trailing timer
-      await Future<void>.delayed(const Duration(milliseconds: 30));
+      // Poll: Windows timer resolution (~15.6ms) makes a fixed 30ms wait a
+      // coin toss against a 10ms interval's trailing edge.
+      await until(() => totals.isNotEmpty && totals.last == 10);
       expect(totals.last, 10); // trailing report fired meanwhile
       r.add(5); // gap was reset by that report -> gated again
-      await Future<void>.delayed(const Duration(milliseconds: 30));
+      await until(() => totals.isNotEmpty && totals.last == 15);
       expect(totals.last, 15);
       r.dispose();
     });

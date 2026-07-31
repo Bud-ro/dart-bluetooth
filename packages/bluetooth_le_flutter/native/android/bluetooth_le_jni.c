@@ -38,11 +38,13 @@ static JavaVM *g_vm = NULL;
 static jclass g_class = NULL; // global ref to BluetoothLeAndroid
 static int g_natives_registered = 0;
 
-static ble_scan_cb g_scan = NULL;
-static ble_state_cb g_state = NULL;
-static ble_op_cb g_op = NULL;
-static ble_notify_cb g_notify = NULL;
-static ble_scan_failed_cb g_scan_failed = NULL;
+// _Atomic: written by the Dart mutator (register/dispose) and read by Kotlin
+// binder/callback threads; see the rfcomm shim for the rationale.
+static _Atomic ble_scan_cb g_scan = NULL;
+static _Atomic ble_state_cb g_state = NULL;
+static _Atomic ble_op_cb g_op = NULL;
+static _Atomic ble_notify_cb g_notify = NULL;
+static _Atomic ble_scan_failed_cb g_scan_failed = NULL;
 // Guards g_class/g_natives_registered against concurrent-isolate init.
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -64,15 +66,21 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
   // plain FindClass resolves the Kotlin class. Cache it now — ble_and_init on
   // a natively-attached Dart thread could otherwise only see the boot
   // classloader (see find_app_class).
+  // Under g_init_lock: this can race a Dart isolate's ble_and_init, and an
+  // unlocked double-cache would leak a global ref.
   JNIEnv *env = NULL;
   if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) == JNI_OK && env) {
-    jclass local = (*env)->FindClass(env, kClassName);
-    if (local) {
-      g_class = (jclass)(*env)->NewGlobalRef(env, local);
-      (*env)->DeleteLocalRef(env, local);
-    } else if ((*env)->ExceptionCheck(env)) {
-      (*env)->ExceptionClear(env);
+    pthread_mutex_lock(&g_init_lock);
+    if (!g_class) {
+      jclass local = (*env)->FindClass(env, kClassName);
+      if (local) {
+        g_class = (jclass)(*env)->NewGlobalRef(env, local);
+        (*env)->DeleteLocalRef(env, local);
+      } else if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+      }
     }
+    pthread_mutex_unlock(&g_init_lock);
   }
   return JNI_VERSION_1_6;
 }
@@ -166,7 +174,11 @@ static void nOnNotify(JNIEnv *env, jclass clazz, jlong token, jstring key,
   char *kcopy = jstring_to_utf8(env, key);
   int32_t len = 0;
   uint8_t *dcopy = data ? jbytes_copy(env, data, &len) : NULL;
-  if (kcopy) g_notify((int64_t)token, kcopy, dcopy, len);
+  if (kcopy) {
+    g_notify((int64_t)token, kcopy, dcopy, len);
+  } else {
+    free(dcopy); // key marshal failed: nothing delivers, nothing may leak
+  }
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -400,6 +412,10 @@ BLE_EXPORT int32_t ble_and_start_scan(int64_t token, const char *csv) {
   jmethodID m = static_method(env, "startScan", "(JLjava/lang/String;)I");
   if (!m) return -1;
   jstring jcsv = (*env)->NewStringUTF(env, csv ? csv : "");
+  if (!jcsv) {
+    clear_pending(env);
+    return -1;
+  }
   int32_t r =
       (int32_t)(*env)->CallStaticIntMethod(env, g_class, m, (jlong)token, jcsv);
   clear_pending(env);
@@ -422,6 +438,10 @@ BLE_EXPORT int32_t ble_and_connect(int64_t conn_token, const char *address) {
   jmethodID m = static_method(env, "connect", "(JLjava/lang/String;)I");
   if (!m) return -1;
   jstring jaddr = (*env)->NewStringUTF(env, address);
+  if (!jaddr) {
+    clear_pending(env);
+    return -1;
+  }
   int32_t r = (int32_t)(*env)->CallStaticIntMethod(env, g_class, m,
                                                    (jlong)conn_token, jaddr);
   clear_pending(env);
@@ -458,6 +478,12 @@ BLE_EXPORT void ble_and_read(int64_t req_id, int64_t conn_token,
   if (!m) return fail_op(req_id);
   jstring jsvc = (*env)->NewStringUTF(env, service);
   jstring jchr = (*env)->NewStringUTF(env, characteristic);
+  if (!jsvc || !jchr) {
+    clear_pending(env);
+    if (jsvc) (*env)->DeleteLocalRef(env, jsvc);
+    if (jchr) (*env)->DeleteLocalRef(env, jchr);
+    return fail_op(req_id);
+  }
   (*env)->CallStaticVoidMethod(env, g_class, m, (jlong)req_id,
                                (jlong)conn_token, jsvc, jchr);
   clear_pending(env);
@@ -508,6 +534,12 @@ BLE_EXPORT void ble_and_subscribe(int64_t req_id, int64_t conn_token,
   if (!m) return fail_op(req_id);
   jstring jsvc = (*env)->NewStringUTF(env, service);
   jstring jchr = (*env)->NewStringUTF(env, characteristic);
+  if (!jsvc || !jchr) {
+    clear_pending(env);
+    if (jsvc) (*env)->DeleteLocalRef(env, jsvc);
+    if (jchr) (*env)->DeleteLocalRef(env, jchr);
+    return fail_op(req_id);
+  }
   (*env)->CallStaticVoidMethod(env, g_class, m, (jlong)req_id,
                                (jlong)conn_token, jsvc, jchr,
                                (jboolean)(enable ? JNI_TRUE : JNI_FALSE));

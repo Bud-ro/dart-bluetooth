@@ -116,8 +116,13 @@ class LinuxBleCentral extends BleCentralPlatform {
       },
       onCancel: () async {
         epoch++;
-        await sub?.cancel();
+        // Snapshot-then-null BEFORE the await: a re-listen completing during
+        // cancel() would otherwise have its fresh subscription nulled-over
+        // and left running with no owner (a D-Bus match-rule leak). Same fix
+        // the rfcomm backend carries.
+        final s = sub;
         sub = null;
+        await s?.cancel();
       },
     );
     return controller.stream;
@@ -652,16 +657,24 @@ class LinuxGattConnection implements GattConnection {
       [],
       replySignature: DBusSignature(''),
     );
+    // ONE deadline covers Connect AND the ServicesResolved wait (a caller's
+    // 10s timeout must not quietly become 20s), and a caller with no timeout
+    // still gets a safety cap — BlueZ Connect against a wedged bluetoothd is
+    // otherwise unbounded. Mirrors the rfcomm backend.
+    final deadline = timeout ?? _connectSafetyTimeout;
+    final started = Stopwatch()..start();
     try {
-      if (timeout != null) {
-        await connect.timeout(timeout);
-      } else {
-        await connect;
-      }
+      await connect.timeout(deadline);
       // BlueZ's Connect usually returns once services are resolved, but for
       // cached/re-connected devices ServicesResolved can briefly lag — making
-      // the first discoverServices() see an empty tree. Wait for it (bounded).
-      await _awaitServicesResolved(timeout);
+      // the first discoverServices() see an empty tree. Wait for it (bounded
+      // by the REMAINDER of the same deadline).
+      final remaining = deadline - started.elapsed;
+      await _awaitServicesResolved(
+        remaining > const Duration(seconds: 1)
+            ? remaining
+            : const Duration(seconds: 1),
+      );
     } on TimeoutException {
       unawaited(close());
       throw BleTimeoutException('connect timed out', timeout: timeout);
@@ -677,6 +690,11 @@ class LinuxGattConnection implements GattConnection {
     }
     _setState(BleConnectionState.connected);
   }
+
+  /// No-caller-timeout safety cap for the whole connect sequence (Connect +
+  /// ServicesResolved): "waits forever on a wedged bluetoothd" is never the
+  /// right default.
+  static const Duration _connectSafetyTimeout = Duration(minutes: 1);
 
   Future<void> _awaitServicesResolved(Duration? timeout) async {
     final device = _obj(_devicePath);
@@ -878,12 +896,20 @@ class LinuxGattConnection implements GattConnection {
       },
       onCancel: () async {
         epoch++;
-        if (sub != null) {
-          _notifySubs.remove(sub);
-          await sub!.cancel();
-          sub = null;
+        // Snapshot-then-null BEFORE the await (see adapterStateChanges).
+        final s = sub;
+        sub = null;
+        if (s != null) {
+          _notifySubs.remove(s);
+          await s.cancel();
         }
         _notifyCtrls.remove(controller);
+        if (sub != null) {
+          // A re-listen re-armed while we were cancelling: leave BlueZ
+          // notifying — StopNotify here would silently kill the live
+          // stream's notifications on the bus side.
+          return;
+        }
         try {
           final path = await _charPath(service, characteristic);
           await _obj(path).callMethod(

@@ -329,8 +329,8 @@ void main() {
   });
 
   group('stats', () {
-    test('exposes exactly the Dart counters on a transport without '
-        'TransportStats (native keys omitted, stats still works)', () async {
+    test('exposes the Dart counters plus the transport teardown latch '
+        '(fake mirrors the real-transport TransportStats contract)', () async {
       final (conn, transport) = await open();
       conn.add(Uint8List.fromList([1, 2, 3]));
       transport.deliver([9, 9]);
@@ -343,6 +343,7 @@ void main() {
         // No input listener yet: held for replay, and visible as such.
         'rxBufferedBytes': 2,
         'rxBufferOverflowBytes': 0,
+        'txDroppedBytes': 0,
       });
     });
 
@@ -387,7 +388,43 @@ void main() {
       conn.add(Uint8List.fromList([1, 2, 3, 4, 5, 6, 7]));
       transport.dropPeer();
       await Future<void>.delayed(Duration.zero);
-      expect(conn.stats['txDiscardedBytes'], 7);
+      // Faithful to every real transport: the teardown zeroes the gauge
+      // before the connection layer can look, so the loss survives ONLY in
+      // the transport's own latch — the Dart-side counter stays 0.
+      expect(conn.stats['txDroppedBytes'], 7);
+      expect(conn.stats['txDiscardedBytes'], 0);
+    });
+
+    test(
+      'drain() throws when a peer drop discards the bytes it waits on',
+      () async {
+        final (conn, transport) = await open();
+        transport.flushDrains = false;
+        transport.flushError = const BluetoothWriteException('link lost');
+        conn.add(Uint8List.fromList(List.filled(64, 0)));
+        final drain = conn.drain(belowBytes: 8);
+        await Future<void>.delayed(const Duration(milliseconds: 12));
+        transport.dropPeer(); // zeroes the gauge, latches the discard
+        // The zeroed gauge satisfies belowBytes — but the latch must win:
+        // a teardown that eats the queue may never read as a successful drain.
+        await expectLater(drain, throwsA(isA<BluetoothWriteException>()));
+      },
+    );
+
+    test('finish() on a dead link records the queued loss', () async {
+      final (conn, transport) = await open();
+      transport.flushDrains = false;
+      transport.flushError = const BluetoothWriteException('link lost');
+      conn.add(Uint8List.fromList(List.filled(100, 0)));
+      await conn.finish(); // flush throws internally; finish never rethrows
+      final stats = conn.stats;
+      final total =
+          (stats['txDiscardedBytes'] ?? 0) + (stats['txDroppedBytes'] ?? 0);
+      expect(
+        total,
+        greaterThanOrEqualTo(100),
+        reason: '100 accepted bytes vanished; the ledger must say so',
+      );
     });
 
     test('replay-buffer overflow is counted, oldest first', () async {

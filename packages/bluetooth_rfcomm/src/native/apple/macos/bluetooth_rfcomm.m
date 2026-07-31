@@ -346,6 +346,17 @@ static const NSUInteger kBTCFallbackChunk = 127;
 // stalled peer.
 static const int64_t kBTCWriteBacklogCap = 4 * 1024 * 1024; // 4 MiB
 
+// Worker-thread-only: the channel's borrowed stats pointer, falling back to
+// the registry once teardown has NULLed it — a mid-write teardown (the COMMON
+// remote-disconnect-during-write sequence) must not make the remainder
+// uncountable.
+static btc_channel_stats *btc_stats_for(BTCChannel *ch) {
+  btc_channel_stats *st = ch.stats;
+  if (st) return st;
+  NSValue *v = g_stats()[@(ch.handle)];
+  return v ? [v pointerValue] : NULL;
+}
+
 @implementation BTCChannel
 
 // The field-proven 0.1.x send path: writeSync blocks THIS worker thread
@@ -367,46 +378,53 @@ static const int64_t kBTCWriteBacklogCap = 4 * 1024 * 1024; // 4 MiB
 // re-check per chunk keeps a dead channel from being written to. Worker
 // thread only.
 - (void)writeBlocking:(NSData *)bytes {
-  // Balance the accept-side increment up front: from here the bytes are
-  // "being written", excluded from the pending gauge exactly as an in-flight
-  // chunk was under the async queue.
-  btc_gauge_add(self.handle, -(int64_t)bytes.length);
   const uint8_t *p = bytes.bytes;
   NSUInteger mtu = self.mtu;
   if (mtu == 0 && self.channel) mtu = [self.channel getMTU];
   if (mtu == 0) mtu = kBTCFallbackChunk;
   size_t offset = 0;
+  // Gauge discipline: the accept-side +len is paid back per chunk as each
+  // writeSync returns, and the remainder in one go on any early exit — so
+  // pendingWriteBytes/flush track what has NOT yet been handed to the OS,
+  // not "0 the moment the worker picked the payload up" (which would let
+  // flush() report success over megabytes still unsent behind a peer stall).
   while (offset < bytes.length) {
     if (self.tornDown || !self.channel) {
       // Channel died between accept and (this part of) the write; the
-      // remainder was never transmitted. Count it — never silent. The stats
-      // pointer is NULLed by teardown, so go through the registry, which
-      // outlives the channel for exactly this kind of post-mortem write.
-      NSValue *v = g_stats()[@(self.handle)];
-      if (v) {
-        ((btc_channel_stats *)[v pointerValue])->txDroppedBytes +=
-            (int64_t)(bytes.length - offset);
-      }
+      // remainder was never transmitted. Count it — never silent. Stats via
+      // the registry, which outlives the channel for exactly this moment.
+      int64_t remainder = (int64_t)(bytes.length - offset);
+      btc_gauge_add(self.handle, -remainder);
+      btc_channel_stats *st = btc_stats_for(self);
+      if (st) st->txDroppedBytes += remainder;
       return;
     }
     size_t chunk = bytes.length - offset;
     if (chunk > mtu) chunk = mtu;
-    if (self.stats) self.stats->txSubmittedBytes += (int64_t)chunk;
+    btc_channel_stats *st = btc_stats_for(self);
+    if (st) st->txSubmittedBytes += (int64_t)chunk;
     IOReturn rc = [self.channel writeSync:(void *)(p + offset)
                                    length:(UInt16)chunk];
+    // writeSync pumps the run loop, so teardown may have run meanwhile and
+    // NULLed self.stats — re-resolve through the registry before counting,
+    // or the common remote-disconnect-during-write loses its accounting.
+    st = btc_stats_for(self);
     if (rc != kIOReturnSuccess) {
       // A mid-stream failure means the link is gone. Surface it as a
       // disconnect instead of silently truncating the byte stream, and count
-      // the untransmitted remainder.
-      if (self.stats) {
-        self.stats->txFailedChunks++;
-        self.stats->txDroppedBytes += (int64_t)(bytes.length - offset);
+      // the untransmitted remainder (this chunk included).
+      int64_t remainder = (int64_t)(bytes.length - offset);
+      btc_gauge_add(self.handle, -remainder);
+      if (st) {
+        st->txFailedChunks++;
+        st->txDroppedBytes += remainder;
       }
       if (self.state) self.state(self.token, BTC_CONN_DISCONNECTED);
       [self teardown];
       return;
     }
-    if (self.stats) self.stats->txCompletedBytes += (int64_t)chunk;
+    btc_gauge_add(self.handle, -(int64_t)chunk);
+    if (st) st->txCompletedBytes += (int64_t)chunk;
     offset += chunk;
   }
 }

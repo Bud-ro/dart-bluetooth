@@ -90,6 +90,16 @@ Fixed — two adversarial review passes over the whole stack; highlights:
   discarded queued bytes; and constructing a second Android backend can no
   longer silently close the first one's sockets.
 
+- Pre-release adversarial review (6 agents over the full diff) closed a last
+  round: discard accounting now survives peer drops and `finish()` (transports
+  latch teardown losses; `drain()`/`stats` consult the latch), concurrent
+  `close()` callers on Windows share one completion, mid-scan radio loss on
+  Windows errors the stream instead of finishing cleanly, Linux discovery
+  restarts after suspend/resume for already-live streams and all BlueZ calls
+  are bounded, a crashed scan loop retries instead of wedging `isScanning`,
+  and Android/Apple lifecycle seams (keep-alive set, disposed-singleton
+  reuse, callback-slot handoff) were closed.
+
 Native changes build on CI for all platforms; runtime behavior still pending
 a hardware pass.
 

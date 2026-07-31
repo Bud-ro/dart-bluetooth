@@ -71,12 +71,15 @@ int32_t btc_stop_discovery(void);
 int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
                         const char *uuid, btc_data_cb data, btc_state_cb state);
 
-// Queues `len` bytes for transmission on `handle`. Returns 0 on success, -1 if
-// the handle is unknown/closed (the payload is NOT silently dropped — callers
-// must surface the error), -2 if the buffered backlog cap (4 MiB) would be
-// exceeded. Non-blocking: bytes are drained via writeAsync on the worker
-// thread; transient write errors (no credits / queue full / sniff-mode wake)
-// are retried with bounded backoff and never tear the connection down.
+// Accepts `len` bytes for transmission on `handle`. Returns 0 on acceptance,
+// -2 if the buffered backlog cap (4 MiB) would be exceeded. Never blocks the
+// caller: bytes are written on the worker thread via blocking writeSync (the
+// field-proven engine; the completion-driven async queue with transient-error
+// retry ships separately). A write that finds the channel already torn down
+// counts its bytes into txDroppedBytes — never a silent drop; the Dart layer
+// fail-fasts on its own closed flag before calling. A mid-stream write error
+// surfaces as a disconnect (state callback) with the untransmitted remainder
+// counted.
 int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len);
 
 // The RFCOMM channel MTU (largest single write payload) negotiated for
@@ -84,9 +87,10 @@ int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len);
 // the handle is closed.
 int32_t btc_rfcomm_mtu(int64_t handle);
 
-// Bytes accepted by btc_rfcomm_write for `handle` but not yet handed to the OS
-// (the in-flight chunk already passed to writeAsync is excluded). 0 for an
-// unknown/closed handle.
+// Bytes accepted by btc_rfcomm_write for `handle` but not yet handed to the
+// OS. Decremented per MTU-sized chunk as writeSync completes, so during a
+// large stalled write it reflects the true unsent remainder. 0 for an
+// unknown/closed handle. Never blocks (lock-guarded gauge; no worker hop).
 int64_t btc_rfcomm_pending(int64_t handle);
 
 // Returns a malloc'd UTF-8 JSON object of monotonic per-channel transfer
@@ -95,8 +99,9 @@ int64_t btc_rfcomm_pending(int64_t handle);
 //    "txRetriedChunks","txFailedChunks","txDroppedBytes",
 //    "rxEvents","rxBytes","rxDroppedEvents"}
 // all int64, counted at the hop each name implies: enqueued = accepted by
-// btc_rfcomm_write; submitted = handed to the OS (writeAsync accepted);
-// completed = confirmed by a write-complete; dropped = discarded for any
+// btc_rfcomm_write; submitted = offered to writeSync; completed = writeSync
+// returned success; retried = always 0 in this engine (the async-queue
+// rework's counter, kept for a stable JSON shape); dropped = discarded for any
 // reason, including a teardown purging the queue; rxEvents/rxBytes = what the
 // stack delivered natively; rxDroppedEvents = deliveries whose payload was
 // discarded before reaching Dart (e.g. allocation failure). Counters survive

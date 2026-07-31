@@ -169,6 +169,15 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
   /// then skip StartDiscovery and be silently starved).
   bool _bluezDiscovering = false;
 
+  /// Backstop so a wedged or restarting bluetoothd can never hang discovery
+  /// control or profile (un)registration forever. Load-bearing here more than
+  /// anywhere: discovery ops are SERIALIZED and profile registration is
+  /// MEMOIZED, so without a bound one hung call starves every later
+  /// startDiscovery/stopDiscovery — and every later connect on that UUID —
+  /// process-wide. (The LE central has carried the same constant, with the
+  /// same rationale, since its hardening pass.)
+  static const Duration _busTimeout = Duration(seconds: 10);
+
   /// Watches Adapter1 for BlueZ dropping our discovery session behind our back
   /// (suspend/resume power-cycles the adapter; bluetoothd also stops discovery
   /// on its own). Without this, [_bluezDiscovering] goes stale-true and every
@@ -188,10 +197,36 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
         if (sig.propertiesInterface != _adapterIface) return;
         final powered = sig.changedProperties['Powered'];
         final discovering = sig.changedProperties['Discovering'];
-        final lost =
-            (powered is DBusBoolean && !powered.value) ||
-            (discovering is DBusBoolean && !discovering.value);
-        if (lost && _bluezDiscovering) _bluezDiscovering = false;
+        final poweredOff = powered is DBusBoolean && !powered.value;
+        final poweredOn = powered is DBusBoolean && powered.value;
+        final dropped = discovering is DBusBoolean && !discovering.value;
+        if ((poweredOff || dropped) && _bluezDiscovering) {
+          _bluezDiscovering = false;
+        }
+        // Clearing the flag only unsticks FUTURE streams; the ones already
+        // live (incl. the facade's long-held background-scan stream) get no
+        // new StartDiscovery unless we issue it. Restart when the adapter
+        // comes back (or the session was dropped with the radio still on).
+        // Safe against echoes of our own stop: the serialized op re-checks
+        // refs and the flag, and our own stop only runs at refs == 0.
+        if ((poweredOn || (dropped && !poweredOff)) && _discoveryRefs > 0) {
+          unawaited(
+            _enqueueDiscoveryOp(() async {
+              if (_bluezDiscovering || _discoveryRefs <= 0) return;
+              try {
+                await _obj(_adapterPath)
+                    .callMethod(_adapterIface, 'StartDiscovery', [])
+                    .timeout(_busTimeout);
+                _bluezDiscovering = true;
+                logDiscovery.info(
+                  'discovery restarted after adapter power-cycle/session drop',
+                );
+              } on Object catch (e) {
+                logDiscovery.warning(() => 'discovery restart failed: $e');
+              }
+            }),
+          );
+        }
       },
       // A malformed signal must not become an unhandled zone error.
       onError: (Object e) =>
@@ -300,9 +335,9 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
         if (_bluezDiscovering) return;
         if (_discoveryRefs <= 0) return; // everyone left while we queued
         try {
-          await _obj(
-            _adapterPath,
-          ).callMethod(_adapterIface, 'StartDiscovery', []);
+          await _obj(_adapterPath)
+              .callMethod(_adapterIface, 'StartDiscovery', [])
+              .timeout(_busTimeout);
         } on DBusMethodResponseException catch (e) {
           if (e.errorName != 'org.bluez.Error.InProgress') rethrow;
         }
@@ -344,7 +379,9 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   Future<void> _stopBluezDiscovery() async {
     try {
-      await _obj(_adapterPath).callMethod(_adapterIface, 'StopDiscovery', []);
+      await _obj(
+        _adapterPath,
+      ).callMethod(_adapterIface, 'StopDiscovery', []).timeout(_busTimeout);
     } catch (_) {
       // Not discovering — ignore.
     }
@@ -459,6 +496,7 @@ class LinuxBluetoothRfcomm extends BluetoothRfcommPlatform {
     _discoveryInvalidation = null;
     // Only close the client we created; a caller-injected bus is theirs.
     if (_ownsBus) await _bus.close();
+    BluetoothRfcommPlatform.detachInstance(this);
   }
 
   // --- Helpers -------------------------------------------------------------
@@ -776,10 +814,9 @@ class _LinuxRfcommProfile implements RfcommTransport {
           'Bluetooth adapter is powered off',
           cause: e,
         ),
-        'org.bluez.Error.NotAuthorized' => BluetoothPermissionException(
-          'Not authorized during $op',
-          cause: e,
-        ),
+        'org.bluez.Error.NotAuthorized' ||
+        'org.bluez.Error.AuthenticationRejected' =>
+          BluetoothPermissionException('Not authorized during $op', cause: e),
         'org.bluez.Error.DoesNotExist' => DeviceNotFoundException(
           'Unknown device during $op',
           cause: e,
@@ -976,6 +1013,9 @@ class _SharedProfile {
     try {
       await (shared._registration ??= shared._register());
     } catch (_) {
+      // Un-memoize: a failed (or timed-out) registration must be retried by
+      // the next connect, not replayed to it.
+      shared._registration = null;
       await shared.release();
       rethrow;
     }
@@ -989,16 +1029,18 @@ class _SharedProfile {
     if (channel != null && channel > 0) {
       options['Channel'] = DBusUint16(channel);
     }
-    await _manager().callMethod(
-      'org.bluez.ProfileManager1',
-      'RegisterProfile',
-      [
-        _object.path,
-        DBusString(_serviceUuid.value),
-        DBusDict.stringVariant(options),
-      ],
-      replySignature: DBusSignature(''),
-    );
+    await _manager()
+        .callMethod(
+          'org.bluez.ProfileManager1',
+          'RegisterProfile',
+          [
+            _object.path,
+            DBusString(_serviceUuid.value),
+            DBusDict.stringVariant(options),
+          ],
+          replySignature: DBusSignature(''),
+        )
+        .timeout(LinuxBluetoothRfcomm._busTimeout);
   }
 
   DBusRemoteObject _manager() => DBusRemoteObject(
@@ -1053,14 +1095,18 @@ class _SharedProfile {
     // instance under the same key — never evict the newcomer.
     if (identical(registry[_key], this)) registry.remove(_key);
     try {
-      await _manager().callMethod(
-        'org.bluez.ProfileManager1',
-        'UnregisterProfile',
-        [_object.path],
-        replySignature: DBusSignature(''),
-      );
+      // Bounded: this is awaited inside transport.close(), and a wedged
+      // bluetoothd must not hang teardown.
+      await _manager()
+          .callMethod(
+            'org.bluez.ProfileManager1',
+            'UnregisterProfile',
+            [_object.path],
+            replySignature: DBusSignature(''),
+          )
+          .timeout(LinuxBluetoothRfcomm._busTimeout);
     } catch (_) {
-      /* already gone / never registered */
+      /* already gone / never registered / timed out */
     }
     try {
       await _bus.unregisterObject(_object);

@@ -37,8 +37,7 @@ object BluetoothRfcommAndroid {
     private var adapter: BluetoothAdapter? = null
     private var context: Context? = null
     private var discoveryReceiver: BroadcastReceiver? = null
-    private var discoveryToken: Long = 0
-    // Guards discoveryReceiver/discoveryToken so receiver swaps are atomic and
+    // Guards discoveryReceiver so receiver swaps are atomic and
     // a stale receiver's FINISHED broadcast can't tear down a newer discovery.
     private val discoveryLock = Any()
 
@@ -132,7 +131,6 @@ object BluetoothRfcommAndroid {
             val ctx = context ?: return -1
             synchronized(discoveryLock) {
                 stopDiscoveryLocked()
-                discoveryToken = token
                 val receiver = object : BroadcastReceiver() {
                     override fun onReceive(c: Context, intent: Intent) {
                         when (intent.action) {
@@ -415,12 +413,15 @@ object BluetoothRfcommAndroid {
     fun reset(): Int {
         synchronized(discoveryLock) {
             stopDiscoveryLocked()
-            // Drain both maps. close() removes each handle from both, so the
-            // dying read loops' own close(handle) calls find nothing to do.
-            for (handle in sockets.keys.toList()) close(handle)
+            // Drain via close() (which removes each handle from every map)
+            // until stable: a plain clear() after one pass could drop a
+            // socket added by a concurrent open() WITHOUT closing it,
+            // leaking a live socket and its read loop.
+            while (sockets.isNotEmpty()) {
+                for (handle in sockets.keys.toList()) close(handle)
+            }
             for (exec in writeExecutors.values) exec.shutdownNow()
             writeExecutors.clear()
-            sockets.clear()
             pendingWrite.clear()
             writeFailed.clear()
         }

@@ -148,6 +148,13 @@ class AppleBleCentral extends BleCentralPlatform {
       },
       onCancel: () {
         if (_scanToken == token) {
+          // Invalidate the token BEFORE anything else: the onListen gate may
+          // still be awaiting the adapter settle, and its post-await check
+          // must see the cancellation — otherwise it would go on to call
+          // bleStartScan with no consumer, re-arming the native wantScan
+          // latch into a phantom scan that drains the battery and
+          // re-accumulates retained peripherals until the next scan.
+          _scanToken = 0;
           bleStopScan();
           _scanController = null;
         }

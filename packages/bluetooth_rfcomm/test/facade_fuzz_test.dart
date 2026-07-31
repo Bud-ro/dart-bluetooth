@@ -38,14 +38,28 @@ void main() {
     final seed = fixedSeed ?? (0xC0DE + run * 7919);
     test('random schedule survives (seed $seed)', () async {
       final unhandled = <Object>[];
-      await runZonedGuarded(
-        () async {
-          await _fuzzOnce(seed, opsPerRun);
-        },
-        (e, st) {
-          unhandled.add(e);
-        },
+      // NOTE: errors cannot cross an error-zone boundary — awaiting the
+      // zoned future directly would hang forever on any failure (masking the
+      // real message as a 30s timeout). Values can cross; complete a parent-
+      // zone completer instead and collect failures explicitly.
+      final done = Completer<void>();
+      unawaited(
+        runZonedGuarded(
+          () async {
+            try {
+              await _fuzzOnce(seed, opsPerRun);
+            } catch (e) {
+              unhandled.add(e);
+            } finally {
+              if (!done.isCompleted) done.complete();
+            }
+          },
+          (e, st) {
+            unhandled.add(e);
+          },
+        ),
       );
+      await done.future;
       expect(
         unhandled,
         isEmpty,
@@ -72,20 +86,53 @@ Future<void> _fuzzOnce(int seed, int ops) async {
   );
   // Mix of stream-open (Linux-style) and stream-completing platforms.
   fake.discoveryCompletes = rand.nextBool();
+  // Fault injection: a slice of runs fuzz the error path (the scan loop must
+  // survive per-cycle stream errors) and slow connects (exercising the
+  // connect-pause poll slice in the engine).
+  if (rand.nextInt(4) == 0) {
+    fake.discoveryError = const BluetoothDiscoveryException('fuzz-injected');
+  }
+  if (rand.nextInt(3) == 0) {
+    fake.connectDelay = Duration(milliseconds: rand.nextInt(60));
+  }
 
   final subs = <StreamSubscription<Object?>>[];
   final conns = <BluetoothConnection>[];
   var disposed = false;
 
   void checkInvariants(String afterOp) {
-    for (final e in bt.debugEngineCounters.entries) {
+    final counters = bt.debugEngineCounters;
+    for (final e in counters.entries) {
       if (e.value < 0) {
         fail(
           'invariant violated after "$afterOp" (seed $seed): '
-          '${e.key} == ${e.value} (must be >= 0). '
-          'Counters: ${bt.debugEngineCounters}',
+          '${e.key} == ${e.value} (must be >= 0). Counters: $counters',
         );
       }
+    }
+    // UPWARD-leak guards — the clamped counters cannot go negative by
+    // construction, so >= 0 alone is unfalsifiable. What a real scan-engine
+    // bug looks like is a hold that never releases or an inquiry per
+    // listener:
+    // Loose upper bounds — every hold/platform inquiry is owned by a live
+    // subscription, the background cycle, or a transient scanDuration window
+    // (the fire-and-forget list ops can stack a handful). The slack absorbs
+    // legitimate stacking; a genuine leak grows past any constant.
+    const slack = 8;
+    final holds = counters['scanHolds'] ?? 0;
+    if (holds > subs.length + slack) {
+      fail(
+        'scanHolds leak after "$afterOp" (seed $seed): $holds holds for '
+        '${subs.length} live subscriptions. Counters: $counters',
+      );
+    }
+    final netInquiries = fake.startDiscoveryCount - fake.stopDiscoveryCount;
+    if (netInquiries > subs.length + slack) {
+      fail(
+        'inquiry leak after "$afterOp" (seed $seed): '
+        '${fake.startDiscoveryCount} starts vs ${fake.stopDiscoveryCount} '
+        'stops with ${subs.length} live subscriptions. Counters: $counters',
+      );
     }
   }
 
@@ -185,5 +232,15 @@ Future<void> _fuzzOnce(int seed, int ops) async {
     bt.isScanning,
     isFalse,
     reason: 'seed $seed: engine idle after dispose',
+  );
+  // dispose() force-zeroes the facade counters, so asserting on them alone is
+  // a tautology. The platform's ledger is the falsifiable part: every started
+  // inquiry must have been stopped by quiescence.
+  final startsAtDispose = fake.startDiscoveryCount;
+  await Future<void>.delayed(const Duration(milliseconds: 80));
+  expect(
+    fake.startDiscoveryCount,
+    startsAtDispose,
+    reason: 'seed $seed: no new platform inquiries may start after dispose',
   );
 }

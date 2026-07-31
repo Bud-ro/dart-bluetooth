@@ -2,6 +2,19 @@ import 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart';
 import 'package:bluetooth_rfcomm/testing.dart';
 import 'package:test/test.dart';
 
+/// Polls [condition] every 10ms until true or [timeout] (generous — the wait
+/// ends the moment the condition holds, so a large bound costs nothing on a
+/// healthy run and only saves flakes on a loaded CI runner).
+Future<void> pollUntil(
+  bool Function() condition, {
+  Duration timeout = const Duration(seconds: 5),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (!condition() && DateTime.now().isBefore(deadline)) {
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+}
+
 void main() {
   late FakeBluetoothRfcommPlatform fake;
   late BluetoothRfcomm bt;
@@ -366,7 +379,9 @@ void main() {
       await connecting;
       // The loop resumes on its own: 50ms rescan park, then the 250ms
       // connect-poll slice(s) while the connect drains, then a fresh cycle.
-      await Future<void>.delayed(const Duration(milliseconds: 600));
+      // Poll rather than sleep a fixed 600ms: the nominal path is ~370ms of
+      // chained timers, which leaves no safe margin on a loaded runner.
+      await pollUntil(() => fake.discoveryStarted);
       expect(fake.discoveryStarted, isTrue);
     });
 
@@ -422,7 +437,9 @@ void main() {
         expect(emissions.last.single.id, paired.id);
         // The user unpairs the device in OS settings.
         fake.bonded.clear();
-        await Future<void>.delayed(const Duration(milliseconds: 120));
+        // Poll for the 30ms bonded re-poll to observe it (fixed 120ms = only
+        // ~4 timer periods of slack on a runner where timers lag).
+        await pollUntil(() => emissions.isNotEmpty && emissions.last.isEmpty);
         await sub.cancel();
         expect(emissions.last, isEmpty);
       },
@@ -483,6 +500,10 @@ void main() {
       // Both listeners fed from a single platform subscription: the fake's
       // broadcast controller ran onListen once, so results arrived once.
       expect(starts, 1);
+      // The load-bearing assertion: the PLATFORM saw exactly one inquiry.
+      // (Counting results seen by one listener would pass even if the facade
+      // wrongly spawned one radio inquiry per listener.)
+      expect(fake.startDiscoveryCount, 1);
     });
 
     test(

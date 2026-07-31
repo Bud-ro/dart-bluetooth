@@ -78,6 +78,7 @@ class AndroidBleCentral extends BleCentralPlatform {
 
   static void _setCallablesKeepAlive(bool alive) {
     _scanCb.keepIsolateAlive = alive;
+    _scanFailedCb.keepIsolateAlive = alive;
     _stateCb.keepIsolateAlive = alive;
     _opCb.keepIsolateAlive = alive;
     _notifyCb.keepIsolateAlive = alive;
@@ -106,8 +107,12 @@ class AndroidBleCentral extends BleCentralPlatform {
 
   @override
   Future<bool> isSupported() async {
-    // Throws on a broken JNI bridge: "false" must mean "no BLE radio",
-    // never "the plumbing is broken".
+    // Code 2 (no Application context YET) is transient — a capability probe
+    // during early startup must answer false like 0.1.x, not throw. Only a
+    // genuinely broken bridge (7: no JVM / class stripped) throws, because
+    // nothing will ever work and "false" would misdiagnose it as no-radio.
+    if (_initCode == 2) _initCode = _lib.init();
+    if (_initCode == 2) return false;
     _ensureBridge();
     return _lib.adapterState() != _AdapterCode.unavailable;
   }

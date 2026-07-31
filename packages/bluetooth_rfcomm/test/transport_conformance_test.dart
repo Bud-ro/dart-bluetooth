@@ -17,6 +17,8 @@ void main() {
           serviceUuid: Uuid.spp,
         ),
         simulatePeerDrop: (t) async => (t as FakeRfcommTransport).dropPeer(),
+        injectIncoming: (t, bytes) async =>
+            (t as FakeRfcommTransport).deliver(bytes),
       );
       expect(violations, isEmpty);
     },

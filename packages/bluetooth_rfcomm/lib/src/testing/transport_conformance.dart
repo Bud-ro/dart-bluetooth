@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import '../exceptions.dart';
 import '../models/enums.dart';
 import '../platform/platform_interface.dart';
+import '../platform/transport_stats.dart';
 
 /// Contract-conformance checker for [RfcommTransport] implementations.
 ///
@@ -30,11 +31,17 @@ import '../platform/platform_interface.dart';
 /// [open] must yield a freshly CONNECTED transport (a new one per call).
 /// [simulatePeerDrop], when provided, must make the peer go away (fakes call
 /// their drop hook; a hardware rig powers the device off) — the peer-loss
-/// checks are skipped without it. Real backends need a live peer, so they run
-/// this from an integration/hardware rig, not unit CI.
+/// checks are skipped without it. [injectIncoming], when provided, must make
+/// the PEER send exactly [bytes] (fakes call their deliver hook; a rig with
+/// an echo device can implement it as an echo round-trip) — it unlocks the
+/// data-delivery check, without which a transport that never moves a byte
+/// could pass on lifecycle choreography alone. Real backends need a live
+/// peer, so they run this from an integration/hardware rig, not unit CI.
 Future<List<String>> checkRfcommTransportConformance({
   required Future<RfcommTransport> Function() open,
   Future<void> Function(RfcommTransport transport)? simulatePeerDrop,
+  Future<void> Function(RfcommTransport transport, Uint8List bytes)?
+  injectIncoming,
 }) async {
   final violations = <String>[];
   void check(bool condition, String rule) {
@@ -134,10 +141,11 @@ Future<List<String>> checkRfcommTransportConformance({
       'maxPayloadSize must be null (unadvertised) or positive (got $max)',
     );
     check(t.pendingWriteBytes >= 0, 'pendingWriteBytes must never be negative');
-    t.send(Uint8List.fromList(List.filled(8, 0)));
+    t.send(Uint8List.fromList(List.filled(256 * 1024, 0)));
     check(
-      t.pendingWriteBytes >= 0,
-      'pendingWriteBytes must never be negative after a send',
+      t.pendingWriteBytes > 0,
+      'a 256 KiB send must be visible in pendingWriteBytes immediately '
+      '(a gauge that never rises makes drain()/backpressure vacuous)',
     );
     await t.flush();
     await t.close();
@@ -145,6 +153,35 @@ Future<List<String>> checkRfcommTransportConformance({
       t.pendingWriteBytes == 0,
       'a closed transport must report pendingWriteBytes == 0',
     );
+  }
+
+  // -- data delivery ---------------------------------------------------------
+  if (injectIncoming != null) {
+    final t = await open();
+    final received = <int>[];
+    final gotBytes = Completer<void>();
+    t.incoming.listen((chunk) {
+      received.addAll(chunk);
+      if (received.length >= 3 && !gotBytes.isCompleted) gotBytes.complete();
+    }, onError: (Object _) {});
+    await injectIncoming(t, Uint8List.fromList([0xA5, 0x5A, 0x42]));
+    try {
+      await gotBytes.future.timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      // fall through; the checks below report it
+    }
+    check(
+      received.length >= 3,
+      'bytes sent by the peer must arrive on incoming '
+      '(got ${received.length} of 3)',
+    );
+    check(
+      received.length < 3 ||
+          (received[0] == 0xA5 && received[1] == 0x5A && received[2] == 0x42),
+      'incoming must deliver the peer\'s bytes unmodified and in order '
+      '(got $received)',
+    );
+    await t.close();
   }
 
   // -- peer loss --------------------------------------------------------------
@@ -206,6 +243,43 @@ Future<List<String>> checkRfcommTransportConformance({
         t.pendingWriteBytes == 0,
         'a dropped transport must report pendingWriteBytes == 0',
       );
+    }
+    {
+      // Bytes queued BEFORE the drop: zeroing the gauge is required (above),
+      // but the loss itself must remain observable — via a throwing flush()
+      // or a TransportStats teardown latch. A transport that zeroes and
+      // forgets makes drain()/stats silently lie about the most common loss
+      // event there is.
+      final t = await open();
+      t.incoming.listen((_) {}, onError: (Object _) {});
+      t.send(Uint8List.fromList(List.filled(64 * 1024, 1)));
+      final queuedAtDrop = t.pendingWriteBytes;
+      await simulatePeerDrop(t);
+      await _settle();
+      var flushThrew = false;
+      try {
+        await t.flush();
+      } on BluetoothWriteException {
+        flushThrew = true;
+      } catch (e) {
+        violations.add(
+          'flush() over dropped bytes threw ${e.runtimeType}, '
+          'not BluetoothWriteException',
+        );
+      }
+      var latched = 0;
+      if (t is TransportStats) {
+        try {
+          latched = (t as TransportStats).nativeStats()['txDroppedBytes'] ?? 0;
+        } catch (_) {}
+      }
+      check(
+        queuedAtDrop == 0 || flushThrew || latched > 0,
+        'bytes queued before a peer drop must be observable as lost: flush() '
+        'must throw or nativeStats must latch txDroppedBytes '
+        '(queued $queuedAtDrop, latched $latched) — silent discard',
+      );
+      await t.close();
     }
   }
 

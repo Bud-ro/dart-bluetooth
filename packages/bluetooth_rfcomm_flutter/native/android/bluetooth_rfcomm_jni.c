@@ -35,10 +35,15 @@ static int g_natives_registered = 0;
 // isolates at once (dup NewGlobalRef leak / double RegisterNatives otherwise).
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static btc_found_cb g_found = NULL;
-static btc_inquiry_done_cb g_done = NULL;
-static btc_data_cb g_data = NULL;
-static btc_state_cb g_state = NULL;
+// _Atomic: written by the Dart mutator (register/dispose) and read by Kotlin
+// read-loop/binder threads. The dispose handoff nulls these BEFORE releasing
+// the isolate pin, and that only quiesces late Kotlin events if the null
+// actually becomes visible to those threads — a plain global gives no such
+// guarantee (a C data race), and the loser would dial a destroyed trampoline.
+static _Atomic btc_found_cb g_found = NULL;
+static _Atomic btc_inquiry_done_cb g_done = NULL;
+static _Atomic btc_data_cb g_data = NULL;
+static _Atomic btc_state_cb g_state = NULL;
 
 static const char *kClassName = "lol/carson/bluetooth_rfcomm/BluetoothRfcommAndroid";
 // Dotted form for ClassLoader.loadClass (which takes binary names, not the
@@ -62,15 +67,21 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
   // plain FindClass resolves the Kotlin class. Cache it now — btc_and_init on
   // a natively-attached Dart thread could otherwise only see the boot
   // classloader (see find_app_class).
+  // Under g_init_lock: this can race a Dart isolate's btc_and_init, and an
+  // unlocked double-cache would leak a global ref.
   JNIEnv *env = NULL;
   if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) == JNI_OK && env) {
-    jclass local = (*env)->FindClass(env, kClassName);
-    if (local) {
-      g_class = (jclass)(*env)->NewGlobalRef(env, local);
-      (*env)->DeleteLocalRef(env, local);
-    } else if ((*env)->ExceptionCheck(env)) {
-      (*env)->ExceptionClear(env);
+    pthread_mutex_lock(&g_init_lock);
+    if (!g_class) {
+      jclass local = (*env)->FindClass(env, kClassName);
+      if (local) {
+        g_class = (jclass)(*env)->NewGlobalRef(env, local);
+        (*env)->DeleteLocalRef(env, local);
+      } else if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+      }
     }
+    pthread_mutex_unlock(&g_init_lock);
   }
   return JNI_VERSION_1_6;
 }

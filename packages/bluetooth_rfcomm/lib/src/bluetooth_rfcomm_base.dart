@@ -330,9 +330,26 @@ class BluetoothRfcomm {
         logDiscovery.severe('background scan loop crashed', e, st);
         _scanRequested = false;
         if (!_scannedUpdates.isClosed) _scannedUpdates.addError(e);
+        // Live holds (stream listeners, scanDuration windows) still expect a
+        // running engine, and nothing about THEM re-triggers an ensure — so
+        // without a retry the engine is wedged: isScanning stays true with no
+        // loop, and every dependent stream goes silently dead forever. Retry
+        // after a beat while anything still holds the engine; if the backend
+        // stays broken, the consumer sees a SEVERE log + stream error per
+        // attempt instead of eternal silence, and a recovered backend heals.
+        if (_scanShouldRun) {
+          unawaited(
+            Future<void>.delayed(_scanCrashRetryDelay).then((_) {
+              if (_scanShouldRun) _ensureScanLoop();
+            }),
+          );
+        }
       }
     });
   }
+
+  /// Pause between retries after the scan loop crashes while holds are live.
+  static const Duration _scanCrashRetryDelay = Duration(seconds: 1);
 
   /// Internal hold on the scan engine (stream listener / scanDuration window).
   void _holdScan() {

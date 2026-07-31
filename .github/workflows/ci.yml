@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'release-*', 'prep-*']
   pull_request:
   workflow_dispatch:
 
@@ -43,15 +43,18 @@ jobs:
         run: |
           set -e
           xcrun clang --analyze -Xanalyzer -analyzer-output=text \
+            -Xanalyzer -analyzer-werror \
             -Wall -Wextra -Werror -fobjc-arc -x objective-c \
             packages/bluetooth_rfcomm/src/native/apple/macos/bluetooth_rfcomm.m \
             -Ipackages/bluetooth_rfcomm/src/native/apple/macos/include
           xcrun --sdk iphoneos clang --analyze -Xanalyzer -analyzer-output=text \
+            -Xanalyzer -analyzer-werror \
             -Wall -Wextra -Werror -fobjc-arc -x objective-c \
             -target arm64-apple-ios13.0 \
             packages/bluetooth_rfcomm/src/native/apple/ios/bluetooth_rfcomm.m \
             -Ipackages/bluetooth_rfcomm/src/native/apple/ios/include
           xcrun clang --analyze -Xanalyzer -analyzer-output=text \
+            -Xanalyzer -analyzer-werror \
             -Wall -Wextra -Werror -fobjc-arc -x objective-c \
             packages/bluetooth_le/src/native/apple/bluetooth_le.m \
             -Ipackages/bluetooth_le/src/native/apple/include

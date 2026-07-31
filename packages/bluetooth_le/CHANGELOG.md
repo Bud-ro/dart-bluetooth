@@ -46,8 +46,11 @@ Reliability fixes from three deep review passes — no API changes beyond new
   on adapter state (a denied permission was a forever-empty scan). A radio
   bounce on Apple no longer wedges connections and op chains (below-poweredOn
   states now fire disconnects and re-arm the scan); reading a subscribed
-  characteristic no longer deadlocks the op chain; GATT ops are bounded by a
-  30 s timeout and fail fast on bridge errors instead of hanging. The Kotlin
+  characteristic no longer deadlocks the op chain; on Android GATT ops are
+  bounded by a 30 s timeout and fail fast on bridge errors instead of
+  hanging. Connecting to a peripheral that is already connected/connecting
+  now throws `BleConnectionException` instead of silently stealing the first
+  connection's callbacks. The Kotlin
   backend survives R8/ProGuard (consumer keep rules) and app-classloader
   loading; a broken JNI bridge throws descriptively instead of degrading
   into empty results.

@@ -361,6 +361,12 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
     if (g_state) g_state(w.token, 0);
   }
   [self.connections removeAllObjects];
+  // Below poweredOn, EVERY CBPeripheral from this manager is invalidated
+  // (Apple's documented contract). A stale cache entry would short-circuit
+  // ble_connect's retrievePeripheralsWithIdentifiers: fallback on the
+  // canonical bounce-recovery reconnect and issue connectPeripheral: on a
+  // dead object — a timeout-less connect then hangs.
+  [self.peripherals removeAllObjects];
 }
 
 - (void)centralManager:(CBCentralManager *)central

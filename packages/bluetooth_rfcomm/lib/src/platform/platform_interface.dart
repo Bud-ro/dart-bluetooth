@@ -77,6 +77,14 @@ abstract class BluetoothRfcommPlatform {
   @visibleForTesting
   static void resetInstance() => _instance = null;
 
+  /// Detaches [platform] from the shared [instance] slot if it currently
+  /// occupies it, so the next [instance] read builds a fresh backend instead
+  /// of handing out a disposed one. Platform implementations call this from
+  /// their `dispose()`; a no-op when [platform] is not the shared instance.
+  static void detachInstance(BluetoothRfcommPlatform platform) {
+    if (identical(_instance, platform)) _instance = null;
+  }
+
   static BluetoothRfcommPlatform _defaultInstance() {
     // Lazily constructed by the dispatcher so that pulling in, say, the dbus
     // backend never happens on Windows. Kept in a separate file to avoid a
@@ -132,5 +140,10 @@ abstract class BluetoothRfcommPlatform {
   Future<void> unpair(DeviceId id);
 
   /// Releases any global resources held by the backend.
-  Future<void> dispose() async {}
+  ///
+  /// Overrides MUST also call [detachInstance] (or super) so the shared
+  /// [instance] slot never hands a disposed backend to the next facade.
+  Future<void> dispose() async {
+    detachInstance(this);
+  }
 }
