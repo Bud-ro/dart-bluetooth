@@ -127,6 +127,11 @@ jobs:
           BIN=$(find build/cli -type f -name 'btc*' ! -name '*.dll' | head -1)
           echo "running: $BIN doctor"
           "$BIN" doctor
+          # `list` exercises the real paired-enumeration path on each OS
+          # (Windows: the registry parse) — radio-less runners legitimately
+          # print empty sections, but a parse/FFI crash fails the job.
+          echo "running: $BIN list"
+          "$BIN" list
 
   # BLE pure-Dart core: analyze + unit tests on every desktop OS. On macOS,
   # `dart test` runs the native-assets build hook, which compiles + links the
