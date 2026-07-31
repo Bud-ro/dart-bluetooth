@@ -259,12 +259,15 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     final address = device.address;
     final uuidValue = serviceUuid.value;
     final ch = channel ?? 0;
-    // Run the blocking open via a top-level function (NOT an inline closure):
-    // the computation sent to Isolate.run must be sendable, and an inline closure
-    // in this method can capture non-sendable context. Mirrors the Windows path.
-    final openFuture = Isolate.run(
-      () => _androidOpen(token, address, ch, uuidValue),
-    );
+    // Spawned via the dedicated top-level helper, NOT an inline lambda in
+    // this method: the VM gives all closures in one scope a
+    // single shared context, and the timeout-cleanup closure below captures
+    // `this` (for `_lib`) — inlining the lambda in this method could drag the
+    // whole platform object (DynamicLibrary included) into the isolate
+    // message and fail the send, which the generic catch would then disguise
+    // as an instant "connect failed". Matches the Windows _spawnConnect
+    // pattern.
+    final openFuture = spawnAndroidOpen(token, address, ch, uuidValue);
 
     final int handle;
     try {
@@ -418,6 +421,21 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 }
 
+/// Spawns [_androidOpen] on a helper isolate from a dedicated top-level
+/// scope. The Isolate.run lambda MUST live in a function containing no other
+/// closures: the VM shares one context object among all closures of a scope,
+/// so a sibling closure capturing `this` (as openRfcomm's timeout cleanup
+/// does for `_lib`) would make the entire platform — DynamicLibrary and all —
+/// part of the sent closure and fail the send with "Illegal argument in
+/// isolate message". Top-level, so `this` cannot even be in scope. Visible
+/// (non-private) so the sendability regression test can exercise it.
+Future<int> spawnAndroidOpen(int token, String address, int ch, String uuid) =>
+    Isolate.run(() => _androidOpen(token, address, ch, uuid));
+
+/// See [spawnAndroidOpen] — same dedicated-scope rule.
+Future<int> spawnAndroidFlush(int handle) =>
+    Isolate.run(() => _androidFlush(handle));
+
 /// Runs the blocking native `open` on a helper isolate. Top-level (not a method
 /// closure) so the computation sent to [Isolate.run] captures only its sendable
 /// args. Uses the helper isolate's own lazily-created [AndroidBindings.instance]
@@ -545,8 +563,7 @@ class _AndroidTransport implements RfcommTransport {
     // Drains the Kotlin per-socket write executor (a blocking marker-task
     // wait), run on a helper isolate so the caller never blocks. -1 on a
     // still-open handle means the executor died with writes queued.
-    final handle = _handle;
-    final rc = await Isolate.run(() => _androidFlush(handle));
+    final rc = await spawnAndroidFlush(_handle);
     if (rc != 0 && !_closed) {
       throw BluetoothWriteException('flush failed — link lost', code: rc);
     }
