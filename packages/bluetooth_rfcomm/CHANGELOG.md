@@ -79,6 +79,11 @@ Fixed — two adversarial review passes over the whole stack; highlights:
 - Hot-restart safety: new native reset entry points quiesce every native
   event source at construction and dispose, so a restarted app can't crash on
   callbacks into the dead isolate — and CLIs now exit without `exit()`.
+- Android 13+: discovery sightings actually arrive again — the discovery
+  receiver must be registered RECEIVER_EXPORTED because ACTION_FOUND is
+  broadcast by the modularized Bluetooth stack's own process (a
+  NOT_EXPORTED receiver silently receives nothing from another UID; the
+  actions are protected broadcasts, so exporting is spoof-safe).
 - Android/Apple hardening pass — infrastructure failures now surface instead
   of masquerading as empty results: the Kotlin backends survive R8/ProGuard
   (consumer keep rules) and load correctly from Dart-attached threads (app

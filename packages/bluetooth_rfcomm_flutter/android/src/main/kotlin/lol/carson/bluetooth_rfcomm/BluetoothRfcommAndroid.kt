@@ -209,7 +209,16 @@ object BluetoothRfcommAndroid {
         filter: IntentFilter,
     ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ctx.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            // RECEIVER_EXPORTED is load-bearing, not a shortcut: since the
+            // Android 13 Bluetooth modularization, ACTION_FOUND and
+            // ACTION_DISCOVERY_FINISHED are broadcast by the Bluetooth
+            // stack's own app process (com.android.bluetooth, its own UID) —
+            // a NOT_EXPORTED receiver silently never receives broadcasts
+            // from another UID, so discovery "runs" and finds nothing.
+            // Exporting is safe here: both actions are protected system
+            // broadcasts that only the system/Bluetooth stack may send, so
+            // they cannot be spoofed by other apps.
+            ctx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             ctx.registerReceiver(receiver, filter)
