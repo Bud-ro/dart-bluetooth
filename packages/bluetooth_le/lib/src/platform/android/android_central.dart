@@ -36,8 +36,7 @@ class AndroidBleCentral extends BleCentralPlatform {
   factory AndroidBleCentral() => _instance ??= AndroidBleCentral._();
   static AndroidBleCentral? _instance;
 
-  AndroidBleCentral._() : _lib = AndroidBindings.open() {
-    _activeLib = _lib;
+  AndroidBleCentral._() : _lib = AndroidBindings.instance {
     // The callables must pin this isolate while native sources can dial them.
     _setCallablesKeepAlive(true);
     // Order is load-bearing: register FIRST so the process-global callback
@@ -51,8 +50,30 @@ class AndroidBleCentral extends BleCentralPlatform {
       _opCb.nativeFunction,
       _notifyCb.nativeFunction,
     );
-    _lib.init();
+    _lib.registerScanFailed(_scanFailedCb.nativeFunction);
+    _initCode = _lib.init();
     _lib.reset();
+  }
+
+  /// Last `ble_and_init` result: 0 ready, 1 no adapter, 2 no Application
+  /// context yet, 7 JNI bridge failure (no JVM / Kotlin class missing — e.g.
+  /// stripped by R8). Only 0 and 1 are settled; anything else is retried.
+  int _initCode = 0;
+
+  /// Fails loudly when the JNI bridge itself is broken instead of letting
+  /// every API degrade into empty scans and generic connect failures.
+  void _ensureBridge() {
+    if (_initCode == 0 || _initCode == 1) return;
+    _initCode = _lib.init();
+    if (_initCode == 0 || _initCode == 1) return;
+    throw BleException(
+      _initCode == 7
+          ? 'Android JNI bridge failed: the native library cannot reach the '
+                'Kotlin backend (is bluetooth_le_flutter in the app, and is '
+                'BluetoothLeAndroid kept by R8/ProGuard?)'
+          : 'Android backend initialization failed: no Application context',
+      code: _initCode,
+    );
   }
 
   static void _setCallablesKeepAlive(bool alive) {
@@ -64,7 +85,6 @@ class AndroidBleCentral extends BleCentralPlatform {
 
   final AndroidBindings _lib;
 
-  static AndroidBindings? _activeLib;
   static int _nextScanToken = 1;
   static StreamController<BleScanResult>? _scanController;
   static int _scanToken = 0;
@@ -75,6 +95,8 @@ class AndroidBleCentral extends BleCentralPlatform {
 
   static final ffi.NativeCallable<ScanCbNative> _scanCb =
       ffi.NativeCallable<ScanCbNative>.listener(_onScan);
+  static final ffi.NativeCallable<ScanFailedCbNative> _scanFailedCb =
+      ffi.NativeCallable<ScanFailedCbNative>.listener(_onScanFailed);
   static final ffi.NativeCallable<StateCbNative> _stateCb =
       ffi.NativeCallable<StateCbNative>.listener(_onState);
   static final ffi.NativeCallable<OpCbNative> _opCb =
@@ -84,13 +106,15 @@ class AndroidBleCentral extends BleCentralPlatform {
 
   @override
   Future<bool> isSupported() async {
-    _activeLib = _lib;
+    // Throws on a broken JNI bridge: "false" must mean "no BLE radio",
+    // never "the plumbing is broken".
+    _ensureBridge();
     return _lib.adapterState() != _AdapterCode.unavailable;
   }
 
   @override
   Future<BluetoothAdapterState> adapterState() async {
-    _activeLib = _lib;
+    _ensureBridge();
     return _AdapterCode.toEnum(_lib.adapterState());
   }
 
@@ -108,7 +132,7 @@ class AndroidBleCentral extends BleCentralPlatform {
 
   @override
   Stream<BleScanResult> startScan({List<Uuid>? withServices}) {
-    _activeLib = _lib;
+    _ensureBridge();
     final token = _nextScanToken++;
     late StreamController<BleScanResult> controller;
     controller = StreamController<BleScanResult>.broadcast(
@@ -132,8 +156,21 @@ class AndroidBleCentral extends BleCentralPlatform {
             : withServices.map((u) => u.value).join(',');
         final ptr = csv.toNativeUtf8();
         try {
-          if (_lib.startScan(token, ptr.cast()) != 0) {
-            controller.addError(const BleScanException('startScan failed'));
+          final rc = _lib.startScan(token, ptr.cast());
+          if (rc != 0) {
+            // Mirrors connect(): distinct codes so a retry loop can't spin
+            // forever on a permission/power problem it can never fix.
+            controller.addError(switch (rc) {
+              -2 => BleDisabledException(
+                'Bluetooth adapter is off or unavailable',
+                code: rc,
+              ),
+              -3 => BlePermissionException(
+                'Missing BLUETOOTH_SCAN permission',
+                code: rc,
+              ),
+              _ => BleScanException('startScan failed', code: rc),
+            });
             _scanController = null;
             unawaited(controller.close());
           } else {
@@ -169,7 +206,7 @@ class AndroidBleCentral extends BleCentralPlatform {
         'Android requires a MAC-address DeviceId to connect',
       );
     }
-    _activeLib = _lib;
+    _ensureBridge();
     final token = _nextConnToken++;
     final conn = AndroidGattConnection(token, _lib);
     _connections[token] = conn;
@@ -219,9 +256,13 @@ class AndroidBleCentral extends BleCentralPlatform {
       await _scanController!.close();
     }
     _scanController = null;
-    // Quiesce every remaining native event source, then release the isolate
-    // pin: nothing can dial the callables anymore, so the isolate may exit.
+    // Quiesce every remaining native event source, then null the process
+    // callback slots: reset() tears Kotlin sources down asynchronously, and
+    // any final callback must find empty slots (the C shim null-checks)
+    // rather than dialing this isolate's trampolines after the pin drops.
     _lib.reset();
+    _lib.register(ffi.nullptr, ffi.nullptr, ffi.nullptr, ffi.nullptr);
+    _lib.registerScanFailed(ffi.nullptr);
     _setCallablesKeepAlive(false);
     _instance = null;
     // Also vacate the platform-level singleton slot so a later default
@@ -246,8 +287,29 @@ class AndroidBleCentral extends BleCentralPlatform {
     } catch (e) {
       logNative.fine(() => 'skipped malformed scan result: $e');
     } finally {
-      if (json != ffi.nullptr) _activeLib?.free(json.cast());
+      if (json != ffi.nullptr) AndroidBindings.instance.free(json.cast());
     }
+  }
+
+  /// Android delivers startScan failures asynchronously via onScanFailed —
+  /// notably SCAN_FAILED_SCANNING_TOO_FREQUENTLY (5 starts / 30 s throttle).
+  /// Without this bridge the stream would just stay silently empty forever.
+  static void _onScanFailed(int token, int errorCode) {
+    final controller = _scanController;
+    if (controller == null || controller.isClosed || _scanToken != token) {
+      return;
+    }
+    controller.addError(
+      BleScanException(
+        errorCode == 6
+            ? 'scan rejected: too many scan starts (Android throttles >5 '
+                  'per 30s); wait ~30s before retrying'
+            : 'scan failed (Android ScanCallback error $errorCode)',
+        code: errorCode,
+      ),
+    );
+    _scanController = null;
+    unawaited(controller.close());
   }
 
   static void _onState(int connToken, int state) {
@@ -270,8 +332,8 @@ class AndroidBleCentral extends BleCentralPlatform {
       }
       _ops.remove(reqId)?.complete(_OpResult(status, jsonStr, bytes));
     } finally {
-      if (json != ffi.nullptr) _activeLib?.free(json.cast());
-      if (data != ffi.nullptr) _activeLib?.free(data.cast());
+      if (json != ffi.nullptr) AndroidBindings.instance.free(json.cast());
+      if (data != ffi.nullptr) AndroidBindings.instance.free(data.cast());
     }
   }
 
@@ -291,9 +353,9 @@ class AndroidBleCentral extends BleCentralPlatform {
       conn._onNotifyNative(key, bytes);
     } finally {
       if (characteristic != ffi.nullptr) {
-        _activeLib?.free(characteristic.cast());
+        AndroidBindings.instance.free(characteristic.cast());
       }
-      if (data != ffi.nullptr) _activeLib?.free(data.cast());
+      if (data != ffi.nullptr) AndroidBindings.instance.free(data.cast());
     }
   }
 
@@ -365,6 +427,11 @@ class AndroidGattConnection implements GattConnection {
   final Set<int> _pendingReqs = {};
   bool _torn = false;
 
+  /// Bounds every GATT op: some Android stacks are known to swallow a
+  /// callback with the link still up, and one lost callback must not wedge
+  /// the serialized op chain until disconnect.
+  static const Duration _opTimeout = Duration(seconds: 30);
+
   Future<_OpResult> _runOp(void Function(int reqId) issue) async {
     final reqId = AndroidBleCentral._nextReqId++;
     final completer = Completer<_OpResult>();
@@ -378,7 +445,22 @@ class AndroidGattConnection implements GattConnection {
       rethrow;
     }
     try {
-      return await completer.future;
+      final r = await completer.future.timeout(
+        _opTimeout,
+        onTimeout: () {
+          AndroidBleCentral._ops.remove(reqId);
+          throw const BleTimeoutException(
+            'GATT operation timed out',
+            timeout: _opTimeout,
+          );
+        },
+      );
+      if (r.status == -100) {
+        // The C shim could not even dispatch/marshal the op (version-skewed
+        // .so, OOM) — surface it as the infrastructure failure it is.
+        throw const BleException('native bridge failed dispatching GATT op');
+      }
+      return r;
     } finally {
       _pendingReqs.remove(reqId);
     }
@@ -408,7 +490,11 @@ class AndroidGattConnection implements GattConnection {
   }
 
   Future<void> waitConnected(Duration? timeout) {
-    if (timeout == null) return _connected.future;
+    // No caller timeout still gets a hard cap: if the adapter is toggled
+    // mid-connect Android can drop onConnectionStateChange entirely, and
+    // "waits forever" is never the right default. 35s clears the framework's
+    // own 30s connect supervision.
+    timeout ??= const Duration(seconds: 35);
     // _teardown() may completeError(_connected) after the timeout already fired;
     // a detached handler keeps that from surfacing as an unhandled async error.
     unawaited(_connected.future.catchError((_) {}));

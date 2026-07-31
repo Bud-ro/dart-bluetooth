@@ -36,12 +36,12 @@ object BluetoothLeAndroid {
     private var context: Context? = null
 
     private var scanCallback: ScanCallback? = null
-    private var scanToken: Long = 0
 
     private val connections = ConcurrentHashMap<Long, Conn>()
 
     // Implemented in the C shim (registered via RegisterNatives).
     @JvmStatic external fun nativeOnScan(token: Long, json: String)
+    @JvmStatic external fun nativeOnScanFailed(token: Long, errorCode: Int)
     @JvmStatic external fun nativeOnState(token: Long, state: Int)
     @JvmStatic external fun nativeOnOp(reqId: Long, status: Int, json: String?, data: ByteArray?)
     @JvmStatic external fun nativeOnNotify(token: Long, key: String, data: ByteArray)
@@ -56,16 +56,19 @@ object BluetoothLeAndroid {
         @Volatile var subscribeReq: Long = 0
     }
 
+    // 0 = ready, 1 = no Bluetooth adapter (genuinely unsupported hardware),
+    // 2 = no Application context (bridge ran before the app was up). Distinct
+    // so the Dart layer can tell "no radio" from "broken plumbing".
     @JvmStatic
     fun initialize(): Int {
         return try {
-            val ctx = currentApplication() ?: return 1
+            val ctx = currentApplication() ?: return 2
             context = ctx
             val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
             adapter = mgr?.adapter
             if (adapter == null) 1 else 0
         } catch (t: Throwable) {
-            1
+            2
         }
     }
 
@@ -89,14 +92,16 @@ object BluetoothLeAndroid {
 
     // --- Scanning ------------------------------------------------------------
 
+    // 0 started; -2 adapter unavailable/off; -3 missing BLUETOOTH_SCAN;
+    // -1 anything else — mirrors openGatt's convention so Dart can throw the
+    // right exception instead of a generic "startScan failed".
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun startScan(token: Long, csv: String): Int {
         return try {
-            val a = adapter ?: return -1
-            val scanner = a.bluetoothLeScanner ?: return -1
+            val a = adapter ?: return -2
+            val scanner = a.bluetoothLeScanner ?: return -2 // null while off
             stopScan()
-            scanToken = token
             val cb = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     try {
@@ -108,6 +113,17 @@ object BluetoothLeAndroid {
                 override fun onBatchScanResults(results: MutableList<ScanResult>) {
                     for (r in results) onScanResult(0, r)
                 }
+
+                override fun onScanFailed(errorCode: Int) {
+                    // Android reports startScan failures asynchronously —
+                    // notably SCAN_FAILED_SCANNING_TOO_FREQUENTLY (>5 starts
+                    // per 30s). Without this override the Dart stream just
+                    // stays silently empty forever.
+                    try {
+                        nativeOnScanFailed(token, errorCode)
+                    } catch (_: Throwable) {
+                    }
+                }
             }
             scanCallback = cb
             // No filters here — Dart applies the service filter when starting the
@@ -117,6 +133,8 @@ object BluetoothLeAndroid {
                 .build()
             scanner.startScan(buildFilters(csv), settings, cb)
             0
+        } catch (se: SecurityException) {
+            -3
         } catch (t: Throwable) {
             -1
         }
@@ -532,7 +550,11 @@ object BluetoothLeAndroid {
         val record = result.scanRecord
         return JSONObject().apply {
             put("id", device.address)
-            val name = record?.deviceName ?: device.name
+            // device.name needs BLUETOOTH_CONNECT; a scan-only app must still
+            // get the (unnamed) sighting, not lose the whole device to the
+            // catch in onScanResult.
+            val name = record?.deviceName
+                ?: runCatching { device.name }.getOrNull()
             if (name != null) put("name", name)
             put("rssi", result.rssi)
             put(

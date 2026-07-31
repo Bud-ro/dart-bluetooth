@@ -32,6 +32,7 @@ typedef void (*ble_op_cb)(int64_t req_id, int32_t status, const char *json,
                           const uint8_t *data, int32_t len);
 typedef void (*ble_notify_cb)(int64_t conn_token, const char *characteristic,
                               const uint8_t *data, int32_t len);
+typedef void (*ble_scan_failed_cb)(int64_t token, int32_t error_code);
 
 static JavaVM *g_vm = NULL;
 static jclass g_class = NULL; // global ref to BluetoothLeAndroid
@@ -41,6 +42,9 @@ static ble_scan_cb g_scan = NULL;
 static ble_state_cb g_state = NULL;
 static ble_op_cb g_op = NULL;
 static ble_notify_cb g_notify = NULL;
+static ble_scan_failed_cb g_scan_failed = NULL;
+// Guards g_class/g_natives_registered against concurrent-isolate init.
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static const char *kClassName = "lol/carson/bluetooth_le/BluetoothLeAndroid";
 // Dotted form for ClassLoader.loadClass (which takes binary names, not the
@@ -125,6 +129,13 @@ static void nOnScan(JNIEnv *env, jclass clazz, jlong token, jstring json) {
   if (copy) g_scan((int64_t)token, copy);
 }
 
+static void nOnScanFailed(JNIEnv *env, jclass clazz, jlong token,
+                          jint error_code) {
+  (void)env;
+  (void)clazz;
+  if (g_scan_failed) g_scan_failed((int64_t)token, (int32_t)error_code);
+}
+
 static void nOnState(JNIEnv *env, jclass clazz, jlong token, jint state) {
   (void)env;
   (void)clazz;
@@ -138,7 +149,14 @@ static void nOnOp(JNIEnv *env, jclass clazz, jlong reqId, jint status,
   char *jcopy = json ? jstring_to_utf8(env, json) : NULL;
   int32_t len = 0;
   uint8_t *dcopy = data ? jbytes_copy(env, data, &len) : NULL;
-  g_op((int64_t)reqId, (int32_t)status, jcopy, dcopy, len);
+  int32_t st = (int32_t)status;
+  // Marshalling failure (OOM/JNI exception) with a success status would look
+  // like a successful zero-byte read — force the internal-failure status.
+  if (st == 0 && ((json && !jcopy) ||
+                  (data && !dcopy && (*env)->GetArrayLength(env, data) > 0))) {
+    st = -100; // BLE_OP_BRIDGE_FAILED (defined below)
+  }
+  g_op((int64_t)reqId, st, jcopy, dcopy, len);
 }
 
 static void nOnNotify(JNIEnv *env, jclass clazz, jlong token, jstring key,
@@ -307,12 +325,27 @@ BLE_EXPORT void ble_and_register(ble_scan_cb scan, ble_state_cb state,
   g_notify = notify;
 }
 
+// Registered separately from ble_and_register so the long-standing 4-slot
+// ABI stays stable; the Dart side looks this symbol up optionally.
+BLE_EXPORT void ble_and_register_scan_failed(ble_scan_failed_cb cb) {
+  g_scan_failed = cb;
+}
+
+// Returns Kotlin initialize()'s code (0 ok, 1 no adapter, 2 no context) or
+// BLE_INIT_BRIDGE_FAILED when the JNI plumbing itself is broken (no JVM,
+// class not found — e.g. stripped by R8 — or RegisterNatives failed).
+#define BLE_INIT_BRIDGE_FAILED 7
+
 BLE_EXPORT int32_t ble_and_init(void) {
   JNIEnv *env = get_env();
-  if (!env) return 1; // unavailable
+  if (!env) return BLE_INIT_BRIDGE_FAILED;
+  pthread_mutex_lock(&g_init_lock);
   if (!g_class) {
     jclass local = find_app_class(env);
-    if (!local) return 1;
+    if (!local) {
+      pthread_mutex_unlock(&g_init_lock);
+      return BLE_INIT_BRIDGE_FAILED;
+    }
     g_class = (jclass)(*env)->NewGlobalRef(env, local);
     (*env)->DeleteLocalRef(env, local);
   }
@@ -321,18 +354,21 @@ BLE_EXPORT int32_t ble_and_init(void) {
   if (!g_natives_registered) {
     static const JNINativeMethod methods[] = {
         {"nativeOnScan", "(JLjava/lang/String;)V", (void *)nOnScan},
+        {"nativeOnScanFailed", "(JI)V", (void *)nOnScanFailed},
         {"nativeOnState", "(JI)V", (void *)nOnState},
         {"nativeOnOp", "(JILjava/lang/String;[B)V", (void *)nOnOp},
         {"nativeOnNotify", "(JLjava/lang/String;[B)V", (void *)nOnNotify},
     };
-    if ((*env)->RegisterNatives(env, g_class, methods, 4) != JNI_OK) {
+    if ((*env)->RegisterNatives(env, g_class, methods, 5) != JNI_OK) {
       (*env)->ExceptionClear(env);
-      return 1;
+      pthread_mutex_unlock(&g_init_lock);
+      return BLE_INIT_BRIDGE_FAILED;
     }
     g_natives_registered = 1;
   }
+  pthread_mutex_unlock(&g_init_lock);
   jmethodID m = static_method(env, "initialize", "()I");
-  if (!m) return 1;
+  if (!m) return BLE_INIT_BRIDGE_FAILED;
   int32_t r = (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
   clear_pending(env);
   return r;
@@ -340,12 +376,22 @@ BLE_EXPORT int32_t ble_and_init(void) {
 
 BLE_EXPORT int32_t ble_and_adapter_state(void) {
   JNIEnv *env = get_env();
-  if (!env) return 1;
+  if (!env) return BLE_INIT_BRIDGE_FAILED;
   jmethodID m = static_method(env, "adapterState", "()I");
-  if (!m) return 1;
+  if (!m) return BLE_INIT_BRIDGE_FAILED;
   int32_t r = (int32_t)(*env)->CallStaticIntMethod(env, g_class, m);
   clear_pending(env);
   return r;
+}
+
+// Delivered when the C shim itself cannot dispatch or marshal an op
+// (missing method after version skew, OOM). Keeps the op ABI void-returning
+// (stable across .so versions) while guaranteeing the Dart completer fails
+// instead of wedging the serialized op chain forever.
+#define BLE_OP_BRIDGE_FAILED (-100)
+
+static void fail_op(int64_t req_id) {
+  if (g_op) g_op(req_id, BLE_OP_BRIDGE_FAILED, NULL, NULL, 0);
 }
 
 BLE_EXPORT int32_t ble_and_start_scan(int64_t token, const char *csv) {
@@ -394,9 +440,9 @@ BLE_EXPORT void ble_and_disconnect(int64_t conn_token) {
 
 BLE_EXPORT void ble_and_discover_services(int64_t req_id, int64_t conn_token) {
   JNIEnv *env = get_env();
-  if (!env) return;
+  if (!env) return fail_op(req_id);
   jmethodID m = static_method(env, "discoverServices", "(JJ)V");
-  if (!m) return;
+  if (!m) return fail_op(req_id);
   (*env)->CallStaticVoidMethod(env, g_class, m, (jlong)req_id,
                                (jlong)conn_token);
   clear_pending(env);
@@ -405,11 +451,11 @@ BLE_EXPORT void ble_and_discover_services(int64_t req_id, int64_t conn_token) {
 BLE_EXPORT void ble_and_read(int64_t req_id, int64_t conn_token,
                              const char *service, const char *characteristic) {
   JNIEnv *env = get_env();
-  if (!env) return;
+  if (!env) return fail_op(req_id);
   jmethodID m = static_method(
       env, "readCharacteristic",
       "(JJLjava/lang/String;Ljava/lang/String;)V");
-  if (!m) return;
+  if (!m) return fail_op(req_id);
   jstring jsvc = (*env)->NewStringUTF(env, service);
   jstring jchr = (*env)->NewStringUTF(env, characteristic);
   (*env)->CallStaticVoidMethod(env, g_class, m, (jlong)req_id,
@@ -424,21 +470,20 @@ BLE_EXPORT void ble_and_write(int64_t req_id, int64_t conn_token,
                               const uint8_t *data, int32_t len,
                               int32_t without_response) {
   JNIEnv *env = get_env();
-  if (!env) return;
+  if (!env) return fail_op(req_id);
   jmethodID m = static_method(
       env, "writeCharacteristic",
       "(JJLjava/lang/String;Ljava/lang/String;[BZ)V");
-  if (!m) return;
+  if (!m) return fail_op(req_id);
   jstring jsvc = (*env)->NewStringUTF(env, service);
   jstring jchr = (*env)->NewStringUTF(env, characteristic);
   jbyteArray arr = (*env)->NewByteArray(env, len);
   if (!arr) {
-    // OOM: don't pass null to Kotlin's non-null ByteArray param (would NPE and
-    // leave the Dart op hung). Leave it to be torn down / time out.
+    // OOM: don't pass null to Kotlin's non-null ByteArray param (would NPE).
     clear_pending(env);
     (*env)->DeleteLocalRef(env, jsvc);
     (*env)->DeleteLocalRef(env, jchr);
-    return;
+    return fail_op(req_id);
   }
   if (len > 0) {
     (*env)->SetByteArrayRegion(env, arr, 0, len, (const jbyte *)data);
@@ -457,10 +502,10 @@ BLE_EXPORT void ble_and_subscribe(int64_t req_id, int64_t conn_token,
                                   const char *service,
                                   const char *characteristic, int32_t enable) {
   JNIEnv *env = get_env();
-  if (!env) return;
+  if (!env) return fail_op(req_id);
   jmethodID m = static_method(
       env, "subscribe", "(JJLjava/lang/String;Ljava/lang/String;Z)V");
-  if (!m) return;
+  if (!m) return fail_op(req_id);
   jstring jsvc = (*env)->NewStringUTF(env, service);
   jstring jchr = (*env)->NewStringUTF(env, characteristic);
   (*env)->CallStaticVoidMethod(env, g_class, m, (jlong)req_id,
@@ -474,9 +519,9 @@ BLE_EXPORT void ble_and_subscribe(int64_t req_id, int64_t conn_token,
 BLE_EXPORT void ble_and_request_mtu(int64_t req_id, int64_t conn_token,
                                     int32_t mtu) {
   JNIEnv *env = get_env();
-  if (!env) return;
+  if (!env) return fail_op(req_id);
   jmethodID m = static_method(env, "requestMtu", "(JJI)V");
-  if (!m) return;
+  if (!m) return fail_op(req_id);
   (*env)->CallStaticVoidMethod(env, g_class, m, (jlong)req_id,
                                (jlong)conn_token, (jint)mtu);
   clear_pending(env);

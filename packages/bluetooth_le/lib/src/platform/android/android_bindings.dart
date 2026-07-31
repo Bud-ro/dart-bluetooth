@@ -19,6 +19,7 @@ typedef OpCbNative =
       ffi.Pointer<ffi.Uint8>,
       ffi.Int32,
     );
+typedef ScanFailedCbNative = ffi.Void Function(ffi.Int64, ffi.Int32);
 typedef NotifyCbNative =
     ffi.Void Function(
       ffi.Int64,
@@ -49,6 +50,19 @@ class AndroidBindings {
             ffi.Pointer<ffi.NativeFunction<NotifyCbNative>>,
           )
         >('ble_and_register');
+    // Optional symbol (added in 0.2.0): tolerate an older .so — version skew
+    // must only cost the scan-failure bridge, not the whole backend.
+    try {
+      registerScanFailed = _lib
+          .lookupFunction<
+            ffi.Void Function(
+              ffi.Pointer<ffi.NativeFunction<ScanFailedCbNative>>,
+            ),
+            void Function(ffi.Pointer<ffi.NativeFunction<ScanFailedCbNative>>)
+          >('ble_and_register_scan_failed');
+    } on ArgumentError {
+      registerScanFailed = (_) {};
+    }
     init = _lib.lookupFunction<ffi.Int32 Function(), int Function()>(
       'ble_and_init',
     );
@@ -135,6 +149,11 @@ class AndroidBindings {
     );
   }
 
+  /// Per-isolate singleton: the .so and its symbols are process-wide, so one
+  /// lazily-opened instance serves every caller (and the static callbacks'
+  /// `free` routing never has a null to silently skip).
+  static final AndroidBindings instance = AndroidBindings.open();
+
   factory AndroidBindings.open() =>
       AndroidBindings._(ffi.DynamicLibrary.open(_libName));
 
@@ -150,6 +169,8 @@ class AndroidBindings {
     ffi.Pointer<ffi.NativeFunction<NotifyCbNative>>,
   )
   register;
+  late final void Function(ffi.Pointer<ffi.NativeFunction<ScanFailedCbNative>>)
+  registerScanFailed;
   late final int Function() init;
   late final int Function() adapterState;
   late final int Function(int, ffi.Pointer<ffi.Char>) startScan;
