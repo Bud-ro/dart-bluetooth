@@ -26,6 +26,12 @@ import 'ios_bindings.dart';
 )
 external int _btcEaPending(int handle);
 
+@ffi.Native<ffi.Int32 Function()>(
+  symbol: 'btc_ea_plist_declared',
+  assetId: 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart',
+)
+external int _btcEaPlistDeclared();
+
 /// iOS backend over ExternalAccessory (EASession).
 ///
 /// Only MFi accessories appear here — see the note in the C header. For a
@@ -142,6 +148,13 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
       );
       if (handle == 0) {
         _transports.remove(token);
+        if (_btcEaPlistDeclared() != 0) {
+          throw const BluetoothException(
+            'ExternalAccessory session failed: this app declares no '
+            'UISupportedExternalAccessoryProtocols in its Info.plist. Add '
+            'your accessory protocol string(s) to that key.',
+          );
+        }
         throw const BluetoothUnsupportedException(
           'No MFi ExternalAccessory session could be opened. iOS only supports '
           'Bluetooth Classic with MFi-certified accessories; for a non-MFi '
@@ -184,10 +197,23 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   Future<List<BluetoothDevice>> _accessories() async {
     final ptr = btcEaAccessoriesJson();
-    if (ptr == ffi.nullptr) return const [];
+    if (ptr == ffi.nullptr) {
+      // Genuine-empty is a non-NULL "[]"; NULL is an allocation/serialization
+      // failure in the native layer.
+      throw const BluetoothException('accessories native call failed');
+    }
     try {
       final list = (jsonDecode(ptr.cast<Utf8>().toDartString()) as List)
           .cast<Map<String, dynamic>>();
+      if (list.isEmpty && _btcEaPlistDeclared() != 0) {
+        // Without the plist key EA can never see ANY accessory — that's an
+        // app-configuration error, not "nothing is connected".
+        throw const BluetoothException(
+          'This app declares no UISupportedExternalAccessoryProtocols in its '
+          'Info.plist, so ExternalAccessory cannot surface any accessory. '
+          'Add your accessory protocol string(s) to that key.',
+        );
+      }
       return list
           .map(
             (j) => BluetoothDevice(
@@ -207,10 +233,22 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
   }
 
+  // Process-wide RX drop accounting, mirroring the macOS backend: a chunk
+  // discarded here must show up in [nativeStats], not silently vanish.
+  static int _rxUnroutedEvents = 0;
+  static int _rxUnroutedBytes = 0;
+  static int _rxOversizeEvents = 0;
+
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {
     final t = _transports[token];
     try {
-      if (t != null && len > 0 && len <= _maxInboundChunk) {
+      if (t == null) {
+        _rxUnroutedEvents++;
+        _rxUnroutedBytes += len;
+      } else if (len > _maxInboundChunk) {
+        _rxOversizeEvents++;
+        logNative.warning(() => 'dropped oversize inbound chunk (${len}B)');
+      } else if (len > 0) {
         t._deliver(Uint8List.fromList(data.asTypedList(len)));
       }
     } finally {
@@ -247,7 +285,12 @@ class _IosEaTransport implements RfcommTransport, TransportStats {
   int _droppedTxBytes = 0;
 
   @override
-  Map<String, int> nativeStats() => {'txDroppedBytes': _droppedTxBytes};
+  Map<String, int> nativeStats() => {
+    'txDroppedBytes': _droppedTxBytes,
+    'rxUnroutedEvents': IosBluetoothRfcomm._rxUnroutedEvents,
+    'rxUnroutedBytes': IosBluetoothRfcomm._rxUnroutedBytes,
+    'rxOversizeEvents': IosBluetoothRfcomm._rxOversizeEvents,
+  };
 
   void bindHandle(int handle) => _handle = handle;
 

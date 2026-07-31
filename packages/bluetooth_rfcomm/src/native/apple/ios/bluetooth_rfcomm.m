@@ -247,6 +247,17 @@ void btc_free(void *ptr) {
   if (ptr) free(ptr);
 }
 
+// 0 = the app's Info.plist declares at least one entry under
+// UISupportedExternalAccessoryProtocols; 1 = key missing/empty. Without the
+// key, connectedAccessories is ALWAYS empty and EASession init returns nil —
+// the single most common ExternalAccessory integration mistake, otherwise
+// indistinguishable from "no accessory connected / device is not MFi".
+int32_t btc_ea_plist_declared(void) {
+  NSArray *protos = [[NSBundle mainBundle]
+      objectForInfoDictionaryKey:@"UISupportedExternalAccessoryProtocols"];
+  return ([protos isKindOfClass:[NSArray class]] && protos.count > 0) ? 0 : 1;
+}
+
 char *btc_ea_accessories_json(void) {
   __block char *result = NULL;
   [[BTCWorker shared] runSync:^{

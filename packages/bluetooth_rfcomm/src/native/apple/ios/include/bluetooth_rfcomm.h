@@ -23,6 +23,9 @@ void btc_free(void *ptr);
 
 // Connected MFi accessories as a malloc'd UTF-8 JSON array, or NULL.
 // Each: {"id","name","protocols":[..],"manufacturer","modelNumber","serial"}.
+// 0 = Info.plist declares >=1 UISupportedExternalAccessoryProtocols entry;
+// 1 = missing/empty (EA can never see any accessory in that state).
+int32_t btc_ea_plist_declared(void);
 char *btc_ea_accessories_json(void);
 
 // Opens an EASession to the accessory whose connectionID matches `accessory_id`,

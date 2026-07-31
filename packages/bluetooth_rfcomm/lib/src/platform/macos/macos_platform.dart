@@ -127,7 +127,11 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
   @override
   Future<List<BluetoothDevice>> bondedDevices() async {
     final ptr = btcPairedDevicesJson();
-    if (ptr == ffi.nullptr) return const [];
+    if (ptr == ffi.nullptr) {
+      // Genuine-empty is a non-NULL "[]"; NULL is always an allocation or
+      // serialization failure in the native layer.
+      throw const BluetoothException('paired-devices native call failed');
+    }
     try {
       final json = ptr.cast<Utf8>().toDartString();
       final list = (jsonDecode(json) as List).cast<Map<String, dynamic>>();
@@ -207,7 +211,25 @@ class MacosBluetoothRfcomm extends BluetoothRfcommPlatform {
     if (!device.isAddress) return const [];
     final u = serviceUuid ?? Uuid.spp;
     final channel = _sdpChannel(device.address, u);
-    if (channel <= 0) return const [];
+    if (channel <= 0) {
+      // Distinguish environment failures from "device has no such service":
+      // with the radio off or Bluetooth permission denied every SDP query
+      // fails, and an empty list would misdirect the caller at the device.
+      switch (_AdapterStateCode.toEnum(btcAdapterState())) {
+        case BluetoothAdapterState.off:
+        case BluetoothAdapterState.unavailable:
+          throw const BluetoothDisabledException(
+            'Bluetooth adapter is off or unavailable; cannot query services',
+          );
+        case BluetoothAdapterState.unauthorized:
+          throw const BluetoothPermissionException(
+            'Bluetooth permission denied (System Settings > Privacy & '
+            'Security > Bluetooth); cannot query services',
+          );
+        default:
+          return const [];
+      }
+    }
     return [BluetoothService(uuid: u, rfcommChannelId: channel)];
   }
 
@@ -561,6 +583,19 @@ class _MacRfcommTransport implements RfcommTransport, TransportStats {
     // queue, so pending falls to 0 and the loop exits.
     while (!_closed && _handle != 0 && _btcRfcommPending(_handle) > 0) {
       await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    // The loop also exits when teardown PURGED the queue — those bytes were
+    // never transmitted, and per the lossless-send contract (matching iOS,
+    // Android, and Windows) a flush over them must fail, not report success.
+    // txDroppedBytes only ever counts teardown purges, so nonzero here means
+    // exactly that.
+    final dropped =
+        (_finalNativeStats ?? _readNativeStats())?['txDroppedBytes'] ?? 0;
+    if (dropped > 0) {
+      throw BluetoothWriteException(
+        '$dropped queued bytes were discarded by disconnect before delivery',
+        code: -3,
+      );
     }
   }
 

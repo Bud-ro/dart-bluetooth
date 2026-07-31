@@ -8,6 +8,7 @@
 // are NativeCallable.listener functions (thread-safe).
 
 #import <Foundation/Foundation.h>
+#import <CoreBluetooth/CoreBluetooth.h>
 #import <IOBluetooth/IOBluetooth.h>
 #import <stdio.h>
 #import <stdlib.h>
@@ -704,6 +705,20 @@ void btc_free(void *ptr) {
 }
 
 int32_t btc_adapter_state(void) {
+  // TCC (Bluetooth privacy) check first: a denied process still sees a
+  // powered-on controller, an empty paired list, and inquiries that complete
+  // cleanly with zero sightings — indistinguishable from "no devices nearby"
+  // unless we ask. CBCentralManager.authorization is a class property and
+  // does NOT trigger the permission prompt. notDetermined passes through:
+  // IOBluetooth never prompts, and flagging a never-asked state as denied
+  // would be just as misleading.
+  if (@available(macOS 10.15, *)) {
+    CBManagerAuthorization auth = CBCentralManager.authorization;
+    if (auth == CBManagerAuthorizationDenied ||
+        auth == CBManagerAuthorizationRestricted) {
+      return BTC_ADAPTER_UNAUTHORIZED;
+    }
+  }
   __block int32_t result = BTC_ADAPTER_UNKNOWN;
   [[BTCWorker shared] runSync:^{
     IOBluetoothHostController *hc = [IOBluetoothHostController defaultController];
@@ -795,6 +810,14 @@ int32_t btc_start_discovery(int64_t token, btc_found_cb found,
     inq.inquiry = [IOBluetoothDeviceInquiry inquiryWithDelegate:inq];
     g_inquiry = inq;
     result = ([inq.inquiry start] == kIOReturnSuccess) ? 0 : -1;
+    if (result != 0) {
+      // A dead inquiry left armed in g_inquiry retains the Dart callback
+      // pointers and fires a stale done on the next start/stop.
+      inq.inquiry.delegate = nil;
+      inq.found = NULL;
+      inq.done = NULL;
+      g_inquiry = nil;
+    }
   }];
   return result;
 }
