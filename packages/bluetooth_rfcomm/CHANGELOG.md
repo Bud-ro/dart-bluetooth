@@ -87,6 +87,16 @@ Fixed — two adversarial review passes over the whole stack; highlights:
 - Hot-restart safety: new native reset entry points quiesce every native
   event source at construction and dispose, so a restarted app can't crash on
   callbacks into the dead isolate — and CLIs now exit without `exit()`.
+- Android/Apple hardening pass — infrastructure failures now surface instead
+  of masquerading as empty results: the Kotlin backends survive R8/ProGuard
+  (consumer keep rules) and load correctly from Dart-attached threads (app
+  classloader); a broken JNI bridge, a denied macOS Bluetooth permission
+  (TCC), or a missing iOS `UISupportedExternalAccessoryProtocols` key each
+  throw a descriptive exception instead of returning "no devices"; missing
+  `BLUETOOTH_CONNECT` degrades to unnamed sightings rather than crashing the
+  discovery receiver; macOS `flush()` fails honestly when a disconnect
+  discarded queued bytes; and constructing a second Android backend can no
+  longer silently close the first one's sockets.
 
 Native changes build on CI for all platforms; runtime behavior still pending
 a hardware pass.

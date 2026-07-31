@@ -21,7 +21,7 @@ Reliability fixes from three deep review passes — no API changes beyond new
   serial flow works. `connect()` now throws `BleDisabledException` /
   `BlePermissionException` for adapter-off / missing-permission failures
   instead of a transient `DeviceNotFoundException` that invited endless
-  retries. Needs `bluetooth_le_flutter` >= 0.1.1.
+  retries. Needs `bluetooth_le_flutter` >= 0.2.0.
 - Linux: concurrent scans no longer stop each other; streams can be
   re-listened after cancelling; a link drop during subscribe setup no longer
   kills the process. Scans now survive suspend/resume (a Powered/Discovering
@@ -39,6 +39,18 @@ Reliability fixes from three deep review passes — no API changes beyond new
   (the process-shared backend survives the facade), and a backend's own
   `dispose()` vacates the shared platform slot so later use gets a fresh
   backend instead of a disposed, silent one.
+
+- Hardening pass (both platforms): scan failures now surface — Android's
+  async `onScanFailed` (incl. the 5-starts-per-30s throttle) errors the
+  stream instead of leaving it silently empty, and Apple scans/connects gate
+  on adapter state (a denied permission was a forever-empty scan). A radio
+  bounce on Apple no longer wedges connections and op chains (below-poweredOn
+  states now fire disconnects and re-arm the scan); reading a subscribed
+  characteristic no longer deadlocks the op chain; GATT ops are bounded by a
+  30 s timeout and fail fast on bridge errors instead of hanging. The Kotlin
+  backend survives R8/ProGuard (consumer keep rules) and app-classloader
+  loading; a broken JNI bridge throws descriptively instead of degrading
+  into empty results.
 
 ## 0.1.0
 
