@@ -35,6 +35,7 @@ typedef void (*ble_notify_cb)(int64_t conn_token, const char *characteristic,
 
 static JavaVM *g_vm = NULL;
 static jclass g_class = NULL; // global ref to BluetoothLeAndroid
+static int g_natives_registered = 0;
 
 static ble_scan_cb g_scan = NULL;
 static ble_state_cb g_state = NULL;
@@ -42,6 +43,9 @@ static ble_op_cb g_op = NULL;
 static ble_notify_cb g_notify = NULL;
 
 static const char *kClassName = "lol/carson/bluetooth_le/BluetoothLeAndroid";
+// Dotted form for ClassLoader.loadClass (which takes binary names, not the
+// slash-separated JNI descriptors FindClass takes).
+static const char *kClassNameDotted = "lol.carson.bluetooth_le.BluetoothLeAndroid";
 
 static char *jstring_to_utf8(JNIEnv *env, jstring s);
 static uint8_t *jbytes_copy(JNIEnv *env, jbyteArray arr, int32_t *out_len);
@@ -51,6 +55,21 @@ static uint8_t *jbytes_copy(JNIEnv *env, jbyteArray arr, int32_t *out_len);
 jint JNI_OnLoad(JavaVM *vm, void *reserved) {
   (void)reserved;
   g_vm = vm;
+  // If the library was loaded via System.loadLibrary (rather than Dart's
+  // dlopen), this thread has managed frames from the app classloader, so a
+  // plain FindClass resolves the Kotlin class. Cache it now — ble_and_init on
+  // a natively-attached Dart thread could otherwise only see the boot
+  // classloader (see find_app_class).
+  JNIEnv *env = NULL;
+  if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) == JNI_OK && env) {
+    jclass local = (*env)->FindClass(env, kClassName);
+    if (local) {
+      g_class = (jclass)(*env)->NewGlobalRef(env, local);
+      (*env)->DeleteLocalRef(env, local);
+    } else if ((*env)->ExceptionCheck(env)) {
+      (*env)->ExceptionClear(env);
+    }
+  }
   return JNI_VERSION_1_6;
 }
 
@@ -145,6 +164,77 @@ static void clear_pending(JNIEnv *env) {
   if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 }
 
+// Resolves the Kotlin class, returning a LOCAL ref (caller makes it global).
+//
+// FindClass on a natively-attached thread with no managed frames (the Dart
+// mutator that dlopen'd us) resolves against the system/boot classloader on
+// ART, which cannot see app-APK classes — so when it fails we go through the
+// application classloader instead: ActivityThread.currentApplication() (a
+// framework class, always findable) -> getClassLoader() -> loadClass(name).
+static jclass find_app_class(JNIEnv *env) {
+  jclass local = (*env)->FindClass(env, kClassName);
+  if (local) return local;
+  clear_pending(env);
+
+  jclass activityThread = (*env)->FindClass(env, "android/app/ActivityThread");
+  if (!activityThread) {
+    clear_pending(env);
+    return NULL;
+  }
+  jmethodID currentApplication = (*env)->GetStaticMethodID(
+      env, activityThread, "currentApplication", "()Landroid/app/Application;");
+  if (!currentApplication) {
+    clear_pending(env);
+    (*env)->DeleteLocalRef(env, activityThread);
+    return NULL;
+  }
+  jobject app =
+      (*env)->CallStaticObjectMethod(env, activityThread, currentApplication);
+  (*env)->DeleteLocalRef(env, activityThread);
+  clear_pending(env);
+  if (!app) return NULL;
+
+  jclass appCls = (*env)->GetObjectClass(env, app);
+  jmethodID getClassLoader = (*env)->GetMethodID(
+      env, appCls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+  (*env)->DeleteLocalRef(env, appCls);
+  if (!getClassLoader) {
+    clear_pending(env);
+    (*env)->DeleteLocalRef(env, app);
+    return NULL;
+  }
+  jobject loader = (*env)->CallObjectMethod(env, app, getClassLoader);
+  (*env)->DeleteLocalRef(env, app);
+  clear_pending(env);
+  if (!loader) return NULL;
+
+  jclass loaderCls = (*env)->GetObjectClass(env, loader);
+  jmethodID loadClass = (*env)->GetMethodID(
+      env, loaderCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+  (*env)->DeleteLocalRef(env, loaderCls);
+  if (!loadClass) {
+    clear_pending(env);
+    (*env)->DeleteLocalRef(env, loader);
+    return NULL;
+  }
+  jstring name = (*env)->NewStringUTF(env, kClassNameDotted);
+  if (!name) {
+    clear_pending(env);
+    (*env)->DeleteLocalRef(env, loader);
+    return NULL;
+  }
+  jclass result =
+      (jclass)(*env)->CallObjectMethod(env, loader, loadClass, name);
+  (*env)->DeleteLocalRef(env, name);
+  (*env)->DeleteLocalRef(env, loader);
+  if ((*env)->ExceptionCheck(env)) {
+    (*env)->ExceptionClear(env);
+    if (result) (*env)->DeleteLocalRef(env, result);
+    return NULL;
+  }
+  return result;
+}
+
 static uint8_t *jbytes_copy(JNIEnv *env, jbyteArray arr, int32_t *out_len) {
   *out_len = 0;
   if (!arr) return NULL;
@@ -221,14 +311,14 @@ BLE_EXPORT int32_t ble_and_init(void) {
   JNIEnv *env = get_env();
   if (!env) return 1; // unavailable
   if (!g_class) {
-    jclass local = (*env)->FindClass(env, kClassName);
-    if (!local) {
-      (*env)->ExceptionClear(env);
-      return 1;
-    }
+    jclass local = find_app_class(env);
+    if (!local) return 1;
     g_class = (jclass)(*env)->NewGlobalRef(env, local);
     (*env)->DeleteLocalRef(env, local);
-
+  }
+  // Registered separately from class caching: g_class may already have been
+  // cached by JNI_OnLoad (System.loadLibrary path) with no natives bound yet.
+  if (!g_natives_registered) {
     static const JNINativeMethod methods[] = {
         {"nativeOnScan", "(JLjava/lang/String;)V", (void *)nOnScan},
         {"nativeOnState", "(JI)V", (void *)nOnState},
@@ -239,6 +329,7 @@ BLE_EXPORT int32_t ble_and_init(void) {
       (*env)->ExceptionClear(env);
       return 1;
     }
+    g_natives_registered = 1;
   }
   jmethodID m = static_method(env, "initialize", "()I");
   if (!m) return 1;
