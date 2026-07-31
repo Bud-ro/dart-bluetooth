@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1
+## 0.2.0
 
 Reliability fixes from three deep review passes — no API changes beyond new
 `BleLoggers.root` / `.loggers` / `.setLevel(...)` logging conveniences.

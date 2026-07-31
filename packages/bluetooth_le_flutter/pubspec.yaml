@@ -2,7 +2,7 @@ name: bluetooth_le_flutter
 description: >-
   Flutter plugin that adds the Android native build for bluetooth_le (Bluetooth
   Low Energy / GATT). Add it to a Flutter app and use the bluetooth_le API.
-version: 0.1.1
+version: 0.2.0
 repository: https://github.com/Bud-ro/dart-bluetooth
 homepage: https://github.com/Bud-ro/dart-bluetooth/tree/master/packages/bluetooth_le_flutter
 issue_tracker: https://github.com/Bud-ro/dart-bluetooth/issues
@@ -19,7 +19,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  bluetooth_le: ^0.1.1
+  bluetooth_le: ^0.2.0
 
 # Develop against the in-repo package; stripped on publish.
 dependency_overrides:

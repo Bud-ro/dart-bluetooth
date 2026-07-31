@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1
+## 0.2.0
 
 - Android native fixes for `bluetooth_le` 0.1.1 (tracked CCCD writes, scan
   cleanup, hot-restart quiesce hook). `connect()` now returns distinct codes

@@ -70,15 +70,15 @@ Command-line or Flutter desktop:
 
 ```yaml
 dependencies:
-  bluetooth_le: ^0.1.0
+  bluetooth_le: ^0.2.0
 ```
 
 Flutter app targeting Android/iOS — add the companion plugin too:
 
 ```yaml
 dependencies:
-  bluetooth_le: ^0.1.0
-  bluetooth_le_flutter: ^0.1.0
+  bluetooth_le: ^0.2.0
+  bluetooth_le_flutter: ^0.2.0
 ```
 
 ## API
