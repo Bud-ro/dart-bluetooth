@@ -39,7 +39,7 @@ await conn.disconnect();                          // flush, then close
 | Linux | ✅ | ✅ | ✅ | ❌ |
 | macOS | ✅ | ✅ | ⚠️ | ⚠️ |
 | Windows | ✅ | ✅ | ⚠️ | ⚠️ |
-| Android | ✅ | ✅ | ⚠️ | ❌ |
+| Android | ✅ | ✅ | ⚠️ | ⚠️ |
 | iOS | ⚠️ | ⚠️ | ⚠️ | ❌ |
 
 In the capability columns (Discover / Connect / Pairing): ✅ supported · ⚠️ partial

@@ -21,7 +21,7 @@ Flutter plugin — see [Why the split](#why-the-split)):
 | Linux | ✅ | ✅ | ❌ |
 | macOS | ✅ | ✅ | ⚠️ |
 | Windows | ✅ | ⚠️ | ⚠️ |
-| Android | ✅ | ✅ | ❌ |
+| Android | ✅ | ✅ | ⚠️ |
 | iOS | ⚠️ | ✅ | ❌ |
 
 In the capability columns (Classic / Low Energy): ✅ supported · ⚠️ partial · ❌
