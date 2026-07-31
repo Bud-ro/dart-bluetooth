@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased (0.2.1 candidate) — macOS send-path rework
+
+- macOS writes move to a completion-driven async queue: writes no longer
+  block the shared event thread (which stalled inbound data and every API
+  call during peer stalls / sniff-mode wakes), transient write errors
+  (buffer-full, credit stalls) retry with bounded backoff instead of tearing
+  the connection down, flow-control callbacks resume stalled writes
+  immediately, and completions are sequence-matched via refcon so a
+  duplicate completion can never advance the queue past an untransmitted
+  chunk. Short successful writes resubmit their unsent tail.
+- `btc bench` in the example CLI: a CRC-framed, sequence-numbered
+  loss-measurement harness (lost / late / corrupted / never-sent).
+
 ## 0.2.0
 
 The device-listing release: scanning is now a first-class, always-available
