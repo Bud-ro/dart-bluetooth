@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'release-*', 'prep-*']
   pull_request:
   workflow_dispatch:
 
@@ -25,6 +25,55 @@ jobs:
   # build hook (compiling the IOBluetooth wrapper on macOS); running the built
   # binary then loads that library and resolves its FFI symbols — so a dylib/DLL
   # load or code-signing error fails CI even with no Bluetooth hardware.
+  # Static analysis of the NATIVE sources — the layer unit tests can't reach.
+  # clang's analyzer catches use-after-free / nil-misuse / leak classes in the
+  # ObjC without any hardware; the JNI C gets a strict syntax+warning pass.
+  native-analyze:
+    timeout-minutes: 15
+    name: native analyze
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: analyze Apple ObjC (clang --analyze)
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -e
+          xcrun clang --analyze -Xanalyzer -analyzer-output=text \
+            -Xanalyzer -analyzer-werror \
+            -Wall -Wextra -Werror -fobjc-arc -x objective-c \
+            packages/bluetooth_rfcomm/src/native/apple/macos/bluetooth_rfcomm.m \
+            -Ipackages/bluetooth_rfcomm/src/native/apple/macos/include
+          xcrun --sdk iphoneos clang --analyze -Xanalyzer -analyzer-output=text \
+            -Xanalyzer -analyzer-werror \
+            -Wall -Wextra -Werror -fobjc-arc -x objective-c \
+            -target arm64-apple-ios13.0 \
+            packages/bluetooth_rfcomm/src/native/apple/ios/bluetooth_rfcomm.m \
+            -Ipackages/bluetooth_rfcomm/src/native/apple/ios/include
+          xcrun clang --analyze -Xanalyzer -analyzer-output=text \
+            -Xanalyzer -analyzer-werror \
+            -Wall -Wextra -Werror -fobjc-arc -x objective-c \
+            packages/bluetooth_le/src/native/apple/bluetooth_le.m \
+            -Ipackages/bluetooth_le/src/native/apple/include
+      - uses: actions/setup-java@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: analyze Android JNI C (strict warnings)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -e
+          for f in packages/bluetooth_rfcomm_flutter/native/android/bluetooth_rfcomm_jni.c \
+                   packages/bluetooth_le_flutter/native/android/bluetooth_le_jni.c; do
+            clang -fsyntax-only -Wall -Wextra -Werror \
+              -Wno-unused-parameter \
+              -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" "$f"
+          done
+
   analyze-test:
     timeout-minutes: 20
     name: dart (${{ matrix.os }})

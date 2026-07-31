@@ -27,8 +27,74 @@ void main() {
       // SOCKADDR_BTH is byte-packed in ws2bth.h (pshpack1): 2 + 8 + 16 + 4 = 30.
       // (Natural alignment would give 40 — that mismatch made connect() fail.)
       expect(ffi.sizeOf<SockaddrBth>(), 30);
+      // WSAQUERYSETW / CSADDR_INFO / SOCKET_ADDRESS use NATURAL alignment
+      // (winsock2.h / ws2def.h are not packed). x64 MSVC sizes:
+      expect(ffi.sizeOf<SocketAddress>(), 16);
+      expect(ffi.sizeOf<CsAddrInfo>(), 40);
+      expect(ffi.sizeOf<WsaQuerySetW>(), 120);
     },
     skip: ffi.sizeOf<ffi.IntPtr>() != 8 ? '64-bit host only' : false,
+  );
+
+  test(
+    'WSAQUERYSETW key field offsets match the Win32 x64 ABI',
+    () {
+      // WSALookupServiceNextW writes into a caller buffer that we reinterpret
+      // as WsaQuerySetW, so the offsets of the fields we READ must match the
+      // SDK exactly: lpszServiceInstanceName @8, dwNameSpace @40,
+      // dwNumberOfCsAddrs @88, lpcsaBuffer @96.
+      final p = calloc<ffi.Uint8>(ffi.sizeOf<WsaQuerySetW>());
+      try {
+        final qs = p.cast<WsaQuerySetW>();
+        qs.ref.dwSize = 0x11223344;
+        qs.ref.lpszServiceInstanceName = ffi.Pointer.fromAddress(0x1);
+        qs.ref.dwNameSpace = 0x55667788;
+        qs.ref.dwNumberOfCsAddrs = 0x0A0B0C0D;
+        qs.ref.lpcsaBuffer = ffi.Pointer.fromAddress(0x2);
+        final b = p.asTypedList(ffi.sizeOf<WsaQuerySetW>());
+        expect(b.sublist(0, 4), [0x44, 0x33, 0x22, 0x11], reason: 'dwSize @0');
+        expect(b[8], 1, reason: 'lpszServiceInstanceName @8');
+        expect(b.sublist(40, 44), [
+          0x88,
+          0x77,
+          0x66,
+          0x55,
+        ], reason: 'dwNameSpace @40');
+        expect(b.sublist(88, 92), [
+          0x0D,
+          0x0C,
+          0x0B,
+          0x0A,
+        ], reason: 'dwNumberOfCsAddrs @88');
+        expect(b[96], 2, reason: 'lpcsaBuffer @96');
+      } finally {
+        calloc.free(p);
+      }
+    },
+    skip: ffi.sizeOf<ffi.IntPtr>() != 8 || !_le
+        ? '64-bit little-endian host only'
+        : false,
+  );
+
+  test(
+    'CSADDR_INFO remoteAddr offset matches the Win32 x64 ABI',
+    () {
+      // We read remoteAddr.lpSockaddr (@16) and cast it to SOCKADDR_BTH.
+      final p = calloc<ffi.Uint8>(ffi.sizeOf<CsAddrInfo>());
+      try {
+        final info = p.cast<CsAddrInfo>();
+        info.ref.remoteAddr.lpSockaddr = ffi.Pointer.fromAddress(0x7);
+        info.ref.remoteAddr.iSockaddrLength = 30;
+        final b = p.asTypedList(ffi.sizeOf<CsAddrInfo>());
+        expect(b[16], 7, reason: 'remoteAddr.lpSockaddr @16');
+        expect(b[24], 30, reason: 'remoteAddr.iSockaddrLength @24');
+      } finally {
+        calloc.free(p);
+      }
+    },
+    skip: ffi.sizeOf<ffi.IntPtr>() != 8 || !_le
+        ? '64-bit little-endian host only'
+        : false,
   );
 
   test(

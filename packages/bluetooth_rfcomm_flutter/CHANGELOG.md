@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0
+
+- Tracks `bluetooth_rfcomm` 0.2.0 (background scan, list APIs, `disconnect()`,
+  reliability fixes). Android native picks up the core's new flush/reset hooks
+  and discovery-receiver fixes; no API changes here.
+- Android hardening: survives R8/ProGuard (consumer keep rules) and loading
+  from Dart-attached threads (app classloader); permission failures surface
+  as distinct codes instead of empty lists or receiver crashes.
+
 ## 0.1.0
 
 Initial release.

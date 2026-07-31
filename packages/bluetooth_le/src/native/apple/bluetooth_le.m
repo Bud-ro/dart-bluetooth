@@ -100,11 +100,23 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
 @property(nonatomic, strong) CBPeripheral *peripheral;
 @property(nonatomic) int64_t discoverReqId;
 @property(nonatomic) NSUInteger pendingChars;
+// Set when any per-service characteristic discovery errored; the discover op
+// then fails as a whole instead of silently emitting a partial service map.
+@property(nonatomic) BOOL discoverFailed;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingReads;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingWrites;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pendingSubscribes;
 @property(nonatomic, strong) NSMutableSet<NSString *> *subscribed;
+// Write-without-response payloads waiting for CoreBluetooth's outgoing queue
+// to have room. Confined to the central's serial queue. Unbounded on purpose:
+// mirroring the rfcomm macOS write queue's contract, nothing is ever silently
+// dropped or silently bounded — pending entries either get submitted (op
+// completes 0) or failed on teardown (op completes -1).
+@property(nonatomic, strong) NSMutableArray<NSDictionary *> *pendingWwr;
 - (CBCharacteristic *)charForService:(NSString *)svc characteristic:(NSString *)chr;
 - (void)emitServices;
+- (void)drainWwr;
+- (void)failPendingWwr;
 @end
 
 @implementation BLEPeripheral
@@ -113,7 +125,9 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   if ((self = [super init])) {
     _pendingReads = [NSMutableDictionary dictionary];
     _pendingWrites = [NSMutableDictionary dictionary];
+    _pendingSubscribes = [NSMutableDictionary dictionary];
     _subscribed = [NSMutableSet set];
+    _pendingWwr = [NSMutableArray array];
   }
   return self;
 }
@@ -149,9 +163,16 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
     didDiscoverCharacteristicsForService:(CBService *)service
                                    error:(NSError *)error {
   (void)service;
-  (void)error;
+  if (error) self.discoverFailed = YES;
   if (self.pendingChars > 0) self.pendingChars--;
-  if (self.pendingChars == 0) [self emitServices];
+  if (self.pendingChars == 0) {
+    if (self.discoverFailed) {
+      self.discoverFailed = NO;
+      if (g_op) g_op(self.discoverReqId, -1, NULL, NULL, 0);
+    } else {
+      [self emitServices];
+    }
+  }
 }
 
 - (void)emitServices {
@@ -172,9 +193,14 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   NSData *jd = [NSJSONSerialization dataWithJSONObject:services
                                               options:0
                                                 error:nil];
-  if (jd && g_op) {
-    char *out = copy_data(jd);
-    if (out) g_op(self.discoverReqId, 0, out, NULL, 0);
+  if (!g_op) return;
+  char *out = jd ? copy_data(jd) : NULL;
+  if (out) {
+    g_op(self.discoverReqId, 0, out, NULL, 0);
+  } else {
+    // Serialization/OOM failure: fail the op rather than leaving its Dart
+    // completer (and everything queued behind it) hung forever.
+    g_op(self.discoverReqId, -1, NULL, NULL, 0);
   }
 }
 
@@ -184,14 +210,10 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   (void)peripheral;
   NSString *key = char_key(characteristic);
   NSData *value = characteristic.value;
-  if ([self.subscribed containsObject:key]) {
-    if (g_notify && !error) {
-      char *k = copy_cstr(key);
-      uint8_t *d = (uint8_t *)copy_data(value);
-      g_notify(self.token, k, d, value ? (int32_t)value.length : 0);
-    }
-    return;
-  }
+  // CoreBluetooth funnels read responses AND notifications through this one
+  // callback. A pending read wins: routing its response to the notify stream
+  // (the old behavior for subscribed characteristics) left the read op — and
+  // the serialized chain behind it — hung forever.
   NSNumber *reqId = self.pendingReads[key];
   if (reqId) {
     [self.pendingReads removeObjectForKey:key];
@@ -202,6 +224,14 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
         uint8_t *d = (uint8_t *)copy_data(value);
         g_op(reqId.longLongValue, 0, NULL, d, value ? (int32_t)value.length : 0);
       }
+    }
+    return;
+  }
+  if ([self.subscribed containsObject:key]) {
+    if (g_notify && !error) {
+      char *k = copy_cstr(key);
+      uint8_t *d = (uint8_t *)copy_data(value);
+      g_notify(self.token, k, d, value ? (int32_t)value.length : 0);
     }
   }
 }
@@ -216,6 +246,58 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
     [self.pendingWrites removeObjectForKey:key];
     if (g_op) g_op(reqId.longLongValue, error ? -1 : 0, NULL, NULL, 0);
   }
+}
+
+// Submits queued write-without-response payloads while CoreBluetooth reports
+// room in its outgoing queue, completing each op only once its write was
+// actually handed over. CoreBluetooth silently DISCARDS writeValue: calls of
+// type WithoutResponse issued while that queue is full, so every WWR is gated
+// on canSendWriteWithoutResponse (macOS 10.13+/iOS 11+; on older systems the
+// gate is unavailable and writes go straight through, matching the previous
+// behavior). Runs on the central's serial queue.
+- (void)drainWwr {
+  while (self.pendingWwr.count) {
+    if (@available(macOS 10.13, iOS 11.0, *)) {
+      if (!self.peripheral.canSendWriteWithoutResponse) return;
+    }
+    NSDictionary *item = self.pendingWwr.firstObject;
+    [self.pendingWwr removeObjectAtIndex:0];
+    [self.peripheral writeValue:item[@"payload"]
+              forCharacteristic:item[@"char"]
+                           type:CBCharacteristicWriteWithoutResponse];
+    if (g_op) g_op([item[@"req"] longLongValue], 0, NULL, NULL, 0);
+  }
+}
+
+// CoreBluetooth's "queue has room again" signal — the other half of the
+// canSendWriteWithoutResponse gate in drainWwr.
+- (void)peripheralIsReadyToSendWriteWithoutResponse:(CBPeripheral *)peripheral {
+  (void)peripheral;
+  [self drainWwr];
+}
+
+// Fails every not-yet-submitted write-without-response op (teardown path):
+// their bytes never reached CoreBluetooth, and per the no-silent-drop contract
+// that must be reported, not swallowed.
+- (void)failPendingWwr {
+  for (NSDictionary *item in self.pendingWwr) {
+    if (g_op) g_op([item[@"req"] longLongValue], -1, NULL, NULL, 0);
+  }
+  [self.pendingWwr removeAllObjects];
+}
+
+- (void)peripheral:(CBPeripheral *)peripheral
+    didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)characteristic
+                                          error:(NSError *)error {
+  (void)peripheral;
+  NSString *key = char_key(characteristic);
+  // A failed enable must not leave the key routing notifications that will
+  // never come (and the Dart stream is about to error out anyway).
+  if (error) [self.subscribed removeObject:key];
+  NSNumber *reqId = self.pendingSubscribes[key];
+  if (!reqId) return;
+  [self.pendingSubscribes removeObjectForKey:key];
+  if (g_op) g_op(reqId.longLongValue, error ? -1 : 0, NULL, NULL, 0);
 }
 
 @end
@@ -260,11 +342,31 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
 }
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
-  if (central.state == CBManagerStatePoweredOn && self.wantScan &&
-      !self.scanning) {
-    self.scanning = YES;
-    [central scanForPeripheralsWithServices:self.scanFilter options:nil];
+  if (central.state == CBManagerStatePoweredOn) {
+    if (self.wantScan && !self.scanning) {
+      self.scanning = YES;
+      [central scanForPeripheralsWithServices:self.scanFilter options:nil];
+    }
+    return;
   }
+  // Below poweredOn (off, resetting, unauthorized, unsupported) CoreBluetooth
+  // has already stopped any scan and invalidated every peripheral — WITHOUT
+  // didDisconnectPeripheral callbacks. Reflect that or the stack wedges: a
+  // stale scanning=YES blocks the wantScan relaunch after power-on forever,
+  // and Dart connections stay "connected" with their op chains hung.
+  self.scanning = NO;
+  for (BLEPeripheral *w in self.connections.allValues) {
+    [w failPendingWwr];
+    w.peripheral.delegate = nil;
+    if (g_state) g_state(w.token, 0);
+  }
+  [self.connections removeAllObjects];
+  // Below poweredOn, EVERY CBPeripheral from this manager is invalidated
+  // (Apple's documented contract). A stale cache entry would short-circuit
+  // ble_connect's retrievePeripheralsWithIdentifiers: fallback on the
+  // canonical bounce-recovery reconnect and issue connectPeripheral: on a
+  // dead object — a timeout-less connect then hangs.
+  [self.peripherals removeAllObjects];
 }
 
 - (void)centralManager:(CBCentralManager *)central
@@ -332,6 +434,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   (void)error;
   BLEPeripheral *w = [self wrapperForPeripheral:peripheral];
   if (w) {
+    [w failPendingWwr];
     if (g_state) g_state(w.token, 0);
     [self.connections removeObjectForKey:@(w.token)];
   }
@@ -344,6 +447,7 @@ static NSArray<NSString *> *property_names(CBCharacteristicProperties p) {
   (void)error;
   BLEPeripheral *w = [self wrapperForPeripheral:peripheral];
   if (w) {
+    [w failPendingWwr];
     if (g_state) g_state(w.token, 0);
     [self.connections removeObjectForKey:@(w.token)];
   }
@@ -359,11 +463,16 @@ void ble_free(void *ptr) {
 
 void ble_register(ble_scan_cb scan, ble_state_cb state, ble_op_cb op,
                   ble_notify_cb notify) {
-  g_scan = scan;
-  g_state = state;
-  g_op = op;
-  g_notify = notify;
-  (void)[BLECentral shared];
+  // Set on the delegate queue, where the callbacks read them — an off-queue
+  // write raced every in-flight delegate event (ble_reset already nulls them
+  // on-queue for the same reason).
+  BLECentral *c = [BLECentral shared];
+  dispatch_sync(c.queue, ^{
+    g_scan = scan;
+    g_state = state;
+    g_op = op;
+    g_notify = notify;
+  });
 }
 
 int32_t ble_adapter_state(void) {
@@ -419,6 +528,17 @@ void ble_stop_scan(void) {
     c.wantScan = NO;
     c.scanning = NO;
     [c.manager stopScan];
+    // A long scan accumulates one strongly-retained CBPeripheral per unique
+    // advertiser identity (privacy address rotation mints new identities all
+    // day); drop them now rather than only on the NEXT start, keeping just the
+    // peripherals a live connection still references. Connect-after-stop still
+    // works: ble_connect falls back to retrievePeripheralsWithIdentifiers.
+    NSMutableDictionary<NSString *, CBPeripheral *> *keep =
+        [NSMutableDictionary dictionary];
+    for (BLEPeripheral *w in c.connections.allValues) {
+      keep[w.peripheral.identifier.UUIDString] = w.peripheral;
+    }
+    [c.peripherals setDictionary:keep];
   });
 }
 
@@ -426,49 +546,67 @@ int32_t ble_connect(int64_t conn_token, const char *peripheral_id) {
   if (!peripheral_id) return -1;
   BLECentral *c = [BLECentral shared];
   NSString *pid = @(peripheral_id);
-  CBPeripheral *p = c.peripherals[pid];
-  if (!p) {
-    NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:pid];
-    if (uuid) {
-      NSArray<CBPeripheral *> *known =
-          [c.manager retrievePeripheralsWithIdentifiers:@[ uuid ]];
-      if (known.count) {
-        p = known.firstObject;
-        c.peripherals[pid] = p;
+  // peripherals/connections are confined to c.queue (the delegate callbacks
+  // mutate them there); dispatch_sync is deadlock-free because Dart caller
+  // threads are never on c.queue.
+  __block int32_t result = -1;
+  dispatch_sync(c.queue, ^{
+    CBPeripheral *p = c.peripherals[pid];
+    if (!p) {
+      NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:pid];
+      if (uuid) {
+        NSArray<CBPeripheral *> *known =
+            [c.manager retrievePeripheralsWithIdentifiers:@[ uuid ]];
+        if (known.count) {
+          p = known.firstObject;
+          c.peripherals[pid] = p;
+        }
       }
     }
-  }
-  if (!p) return -1;
+    if (!p) return;
+    if ([c wrapperForPeripheral:p]) {
+      result = -4; // already connected/connecting under another token
+      return;
+    }
 
-  BLEPeripheral *w = [BLEPeripheral new];
-  w.token = conn_token;
-  w.peripheral = p;
-  p.delegate = w;
-  c.connections[@(conn_token)] = w;
-  dispatch_async(c.queue, ^{
+    BLEPeripheral *w = [BLEPeripheral new];
+    w.token = conn_token;
+    w.peripheral = p;
+    p.delegate = w;
+    c.connections[@(conn_token)] = w;
     [c.manager connectPeripheral:p options:nil];
+    result = 0;
   });
-  return 0;
+  return result;
 }
 
 void ble_disconnect(int64_t conn_token) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) return;
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) return;
+    // Remove the wrapper HERE, not (only) in the delegate: cancelling a
+    // still-PENDING connect yields NO didDisconnect/didFailToConnect callback,
+    // so waiting for one leaks the wrapper — and a leaked wrapper can shadow a
+    // live one in wrapperForPeripheral:. The Dart side tears its connection
+    // state down alongside every ble_disconnect, and a later delegate event
+    // for this peripheral finds no wrapper and is a no-op.
+    [w failPendingWwr];
+    w.peripheral.delegate = nil;
+    [c.connections removeObjectForKey:@(conn_token)];
     [c.manager cancelPeripheralConnection:w.peripheral];
   });
 }
 
 void ble_discover_services(int64_t req_id, int64_t conn_token) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) {
-    if (g_op) g_op(req_id, -1, NULL, NULL, 0);
-    return;
-  }
-  w.discoverReqId = req_id;
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
+    w.discoverReqId = req_id;
     [w.peripheral discoverServices:nil];
   });
 }
@@ -476,13 +614,13 @@ void ble_discover_services(int64_t req_id, int64_t conn_token) {
 void ble_read(int64_t req_id, int64_t conn_token, const char *service,
               const char *characteristic) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) {
-    if (g_op) g_op(req_id, -1, NULL, NULL, 0);
-    return;
-  }
   NSString *svc = @(service), *chr = @(characteristic);
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
     CBCharacteristic *ch = [w charForService:svc characteristic:chr];
     if (!ch) {
       if (g_op) g_op(req_id, -1, NULL, NULL, 0);
@@ -497,26 +635,31 @@ void ble_write(int64_t req_id, int64_t conn_token, const char *service,
                const char *characteristic, const uint8_t *data, int32_t len,
                int32_t without_response) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) {
-    if (g_op) g_op(req_id, -1, NULL, NULL, 0);
-    return;
-  }
   NSString *svc = @(service), *chr = @(characteristic);
   NSData *payload = (data && len > 0)
                         ? [NSData dataWithBytes:data length:(NSUInteger)len]
                         : [NSData data];
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
     CBCharacteristic *ch = [w charForService:svc characteristic:chr];
     if (!ch) {
       if (g_op) g_op(req_id, -1, NULL, NULL, 0);
       return;
     }
     if (without_response) {
-      [w.peripheral writeValue:payload
-             forCharacteristic:ch
-                          type:CBCharacteristicWriteWithoutResponse];
-      if (g_op) g_op(req_id, 0, NULL, NULL, 0);
+      // Queue-and-drain (see drainWwr): the op completes only once the write
+      // was actually submitted to CoreBluetooth — issuing writeValue: while
+      // the WWR queue is full would silently discard the payload.
+      [w.pendingWwr addObject:@{
+        @"req" : @(req_id),
+        @"payload" : payload,
+        @"char" : ch,
+      }];
+      [w drainWwr];
     } else {
       w.pendingWrites[char_key(ch)] = @(req_id);
       [w.peripheral writeValue:payload
@@ -526,32 +669,72 @@ void ble_write(int64_t req_id, int64_t conn_token, const char *service,
   });
 }
 
-void ble_subscribe(int64_t conn_token, const char *service,
-                   const char *characteristic, int32_t enable) {
+void ble_set_notify(int64_t req_id, int64_t conn_token, const char *service,
+                    const char *characteristic, int32_t enable) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) return;
   NSString *svc = @(service), *chr = @(characteristic);
   dispatch_async(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
     CBCharacteristic *ch = [w charForService:svc characteristic:chr];
-    if (!ch) return;
+    if (!ch) {
+      if (g_op) g_op(req_id, -1, NULL, NULL, 0);
+      return;
+    }
     NSString *key = char_key(ch);
     if (enable) {
       [w.subscribed addObject:key];
     } else {
       [w.subscribed removeObject:key];
     }
+    // A pending toggle for the same characteristic being superseded must not
+    // leave its op hanging forever — fail it before tracking the new one.
+    NSNumber *old = w.pendingSubscribes[key];
+    if (old && g_op) g_op(old.longLongValue, -1, NULL, NULL, 0);
+    w.pendingSubscribes[key] = @(req_id);
     [w.peripheral setNotifyValue:(enable ? YES : NO) forCharacteristic:ch];
   });
 }
 
 int32_t ble_max_write_len(int64_t conn_token, int32_t without_response) {
   BLECentral *c = [BLECentral shared];
-  BLEPeripheral *w = c.connections[@(conn_token)];
-  if (!w) return 20;
-  CBCharacteristicWriteType type = without_response
-                                       ? CBCharacteristicWriteWithoutResponse
-                                       : CBCharacteristicWriteWithResponse;
-  NSUInteger n = [w.peripheral maximumWriteValueLengthForType:type];
-  return (int32_t)(n + 3); // report as an ATT MTU (payload + 3-byte header)
+  __block int32_t result = -1; // unknown/closed connection: no fabricated MTU
+  dispatch_sync(c.queue, ^{
+    BLEPeripheral *w = c.connections[@(conn_token)];
+    if (!w) return;
+    CBCharacteristicWriteType type = without_response
+                                         ? CBCharacteristicWriteWithoutResponse
+                                         : CBCharacteristicWriteWithResponse;
+    NSUInteger n = [w.peripheral maximumWriteValueLengthForType:type];
+    result = (int32_t)(n + 3); // report as an ATT MTU (payload + 3-byte header)
+  });
+  return result;
+}
+
+void ble_reset(void) {
+  BLECentral *c = [BLECentral shared];
+  dispatch_sync(c.queue, ^{
+    // Silence the C callback pointers first (on the queue, where they are
+    // read) so an already-queued delegate event delivered after this block
+    // cannot dial out into Dart; ble_register re-arms them.
+    g_scan = NULL;
+    g_state = NULL;
+    g_op = NULL;
+    g_notify = NULL;
+    c.wantScan = NO;
+    c.scanning = NO;
+    [c.manager stopScan];
+    for (BLEPeripheral *w in c.connections.allValues) {
+      w.peripheral.delegate = nil;
+      [c.manager cancelPeripheralConnection:w.peripheral];
+    }
+    // Dropping the wrappers also drops their op-tracking state (pendingReads/
+    // pendingWrites/pendingSubscribes/pendingWwr/subscribed); g_op is already
+    // NULL, so there is no one left to notify.
+    [c.connections removeAllObjects];
+    [c.peripherals removeAllObjects];
+  });
 }

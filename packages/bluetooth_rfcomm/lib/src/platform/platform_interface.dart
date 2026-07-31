@@ -35,10 +35,22 @@ abstract interface class RfcommTransport {
 
   /// Queues [data] for transmission. Must return immediately without blocking;
   /// the platform drains the queue off the calling isolate.
+  ///
+  /// The queue is unbounded and lossless: every byte accepted here is either
+  /// eventually handed to the OS or reported lost via [flush] / the terminal
+  /// disconnect — a transport must never silently drop accepted bytes.
   void send(Uint8List data);
 
   /// Completes when all queued bytes have been handed to the OS.
   Future<void> flush();
+
+  /// OS-advertised largest single write payload (RFCOMM MTU on macOS, max
+  /// transmit packet size on Android); null where the OS exposes none
+  /// (Windows/Linux stream sockets, iOS EA).
+  int? get maxPayloadSize;
+
+  /// Bytes accepted by [send] but not yet handed to the OS.
+  int get pendingWriteBytes;
 
   /// Closes the channel. Idempotent.
   Future<void> close();
@@ -65,6 +77,14 @@ abstract class BluetoothRfcommPlatform {
   @visibleForTesting
   static void resetInstance() => _instance = null;
 
+  /// Detaches [platform] from the shared [instance] slot if it currently
+  /// occupies it, so the next [instance] read builds a fresh backend instead
+  /// of handing out a disposed one. Platform implementations call this from
+  /// their `dispose()`; a no-op when [platform] is not the shared instance.
+  static void detachInstance(BluetoothRfcommPlatform platform) {
+    if (identical(_instance, platform)) _instance = null;
+  }
+
   static BluetoothRfcommPlatform _defaultInstance() {
     // Lazily constructed by the dispatcher so that pulling in, say, the dbus
     // backend never happens on Windows. Kept in a separate file to avoid a
@@ -88,10 +108,9 @@ abstract class BluetoothRfcommPlatform {
   /// Paired (bonded) devices known to the OS.
   Future<List<BluetoothDevice>> bondedDevices();
 
-  /// Starts an inquiry and streams sightings. Cancelling the subscription (or
-  /// calling [stopDiscovery]) stops the inquiry on every backend except Windows,
-  /// where the inquiry runs to completion (~10s) on a worker isolate and its
-  /// results are delivered in one batch; cancelling there only discards them.
+  /// Starts a real radio inquiry and streams sightings of nearby devices,
+  /// paired or not. Cancelling the subscription (or calling [stopDiscovery])
+  /// aborts the inquiry on every backend.
   Stream<BluetoothDiscoveryResult> startDiscovery();
 
   /// Stops any in-progress inquiry.
@@ -121,5 +140,10 @@ abstract class BluetoothRfcommPlatform {
   Future<void> unpair(DeviceId id);
 
   /// Releases any global resources held by the backend.
-  Future<void> dispose() async {}
+  ///
+  /// Overrides MUST also call [detachInstance] (or super) so the shared
+  /// [instance] slot never hands a disposed backend to the next facade.
+  Future<void> dispose() async {
+    detachInstance(this);
+  }
 }

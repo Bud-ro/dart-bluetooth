@@ -36,12 +36,12 @@ object BluetoothLeAndroid {
     private var context: Context? = null
 
     private var scanCallback: ScanCallback? = null
-    private var scanToken: Long = 0
 
     private val connections = ConcurrentHashMap<Long, Conn>()
 
     // Implemented in the C shim (registered via RegisterNatives).
     @JvmStatic external fun nativeOnScan(token: Long, json: String)
+    @JvmStatic external fun nativeOnScanFailed(token: Long, errorCode: Int)
     @JvmStatic external fun nativeOnState(token: Long, state: Int)
     @JvmStatic external fun nativeOnOp(reqId: Long, status: Int, json: String?, data: ByteArray?)
     @JvmStatic external fun nativeOnNotify(token: Long, key: String, data: ByteArray)
@@ -53,18 +53,22 @@ object BluetoothLeAndroid {
         @Volatile var readReq: Long = 0
         @Volatile var writeReq: Long = 0
         @Volatile var mtuReq: Long = 0
+        @Volatile var subscribeReq: Long = 0
     }
 
+    // 0 = ready, 1 = no Bluetooth adapter (genuinely unsupported hardware),
+    // 2 = no Application context (bridge ran before the app was up). Distinct
+    // so the Dart layer can tell "no radio" from "broken plumbing".
     @JvmStatic
     fun initialize(): Int {
         return try {
-            val ctx = currentApplication() ?: return 1
+            val ctx = currentApplication() ?: return 2
             context = ctx
             val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
             adapter = mgr?.adapter
             if (adapter == null) 1 else 0
         } catch (t: Throwable) {
-            1
+            2
         }
     }
 
@@ -88,14 +92,16 @@ object BluetoothLeAndroid {
 
     // --- Scanning ------------------------------------------------------------
 
+    // 0 started; -2 adapter unavailable/off; -3 missing BLUETOOTH_SCAN;
+    // -1 anything else — mirrors openGatt's convention so Dart can throw the
+    // right exception instead of a generic "startScan failed".
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun startScan(token: Long, csv: String): Int {
         return try {
-            val a = adapter ?: return -1
-            val scanner = a.bluetoothLeScanner ?: return -1
+            val a = adapter ?: return -2
+            val scanner = a.bluetoothLeScanner ?: return -2 // null while off
             stopScan()
-            scanToken = token
             val cb = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     try {
@@ -107,6 +113,17 @@ object BluetoothLeAndroid {
                 override fun onBatchScanResults(results: MutableList<ScanResult>) {
                     for (r in results) onScanResult(0, r)
                 }
+
+                override fun onScanFailed(errorCode: Int) {
+                    // Android reports startScan failures asynchronously —
+                    // notably SCAN_FAILED_SCANNING_TOO_FREQUENTLY (>5 starts
+                    // per 30s). Without this override the Dart stream just
+                    // stays silently empty forever.
+                    try {
+                        nativeOnScanFailed(token, errorCode)
+                    } catch (_: Throwable) {
+                    }
+                }
             }
             scanCallback = cb
             // No filters here — Dart applies the service filter when starting the
@@ -116,6 +133,8 @@ object BluetoothLeAndroid {
                 .build()
             scanner.startScan(buildFilters(csv), settings, cb)
             0
+        } catch (se: SecurityException) {
+            -3
         } catch (t: Throwable) {
             -1
         }
@@ -153,11 +172,18 @@ object BluetoothLeAndroid {
 
     // --- Connect -------------------------------------------------------------
 
+    /**
+     * Return codes (additive; Dart maps them to domain exceptions):
+     *  0 initiated, -1 generic failure (unknown device / connectGatt null),
+     *  -2 adapter missing or powered off, -3 SecurityException (missing
+     *  BLUETOOTH_CONNECT runtime grant).
+     */
     @SuppressLint("MissingPermission")
     @JvmStatic
     fun connect(connToken: Long, address: String): Int {
         return try {
-            val a = adapter ?: return -1
+            val a = adapter ?: return -2
+            if (!a.isEnabled) return -2
             val device = a.getRemoteDevice(address) ?: return -1
             val conn = Conn(connToken)
             connections[connToken] = conn
@@ -170,10 +196,32 @@ object BluetoothLeAndroid {
                 return -1
             }
             0
+        } catch (se: SecurityException) {
+            connections.remove(connToken)
+            -3
         } catch (t: Throwable) {
             connections.remove(connToken)
             -1
         }
+    }
+
+    /**
+     * Quiesces every event source owned by this object: stops any active scan
+     * and disconnects/closes every tracked GATT connection, clearing the
+     * connection map without completing any in-flight request. Called by the
+     * Dart layer at construction — BEFORE it registers new callback pointers —
+     * so nothing left over from a dead isolate (Flutter hot restart) can invoke
+     * a destroyed NativeCallable trampoline; also called at dispose.
+     *
+     * Deliberately does NOT touch the C callback pointers themselves: the Dart
+     * side owns (re-)registration, reset only kills the event sources.
+     */
+    @JvmStatic
+    fun reset(): Int {
+        stopScan()
+        for (connToken in connections.keys.toList()) disconnect(connToken)
+        connections.clear()
+        return 0
     }
 
     @SuppressLint("MissingPermission")
@@ -199,7 +247,13 @@ object BluetoothLeAndroid {
             return
         }
         conn.discoverReq = reqId
-        if (!gatt.discoverServices()) nativeOnOp(reqId, GATT_FAILURE, null, null)
+        if (!gatt.discoverServices()) {
+            // Clear the slot before reporting, like every other op's failure
+            // branch — a stale slot lets a later spontaneous
+            // onServicesDiscovered fire a duplicate completion.
+            conn.discoverReq = 0
+            nativeOnOp(reqId, GATT_FAILURE, null, null)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -259,27 +313,52 @@ object BluetoothLeAndroid {
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
     @JvmStatic
-    fun subscribe(connToken: Long, service: String, characteristic: String, enable: Boolean) {
+    fun subscribe(
+        reqId: Long,
+        connToken: Long,
+        service: String,
+        characteristic: String,
+        enable: Boolean,
+    ) {
         val conn = connections[connToken]
         val ch = findChar(conn, service, characteristic)
-        val gatt = conn?.gatt ?: return
-        if (ch == null) return
+        val gatt = conn?.gatt
+        if (conn == null || ch == null || gatt == null) {
+            nativeOnOp(reqId, GATT_FAILURE, null, null)
+            return
+        }
         try {
             gatt.setCharacteristicNotification(ch, enable)
-            val cccd: BluetoothGattDescriptor = ch.getDescriptor(CCCD) ?: return
+            val cccd: BluetoothGattDescriptor? = ch.getDescriptor(CCCD)
+            if (cccd == null) {
+                // No CCCD to write — local routing is set and nothing stays in
+                // flight, so the op is complete.
+                nativeOnOp(reqId, 0, null, null)
+                return
+            }
             val value = when {
                 !enable -> BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
                 (ch.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 ->
                     BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 else -> BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeDescriptor(cccd, value)
+            // Completed by onDescriptorWrite; Android allows only one
+            // outstanding GATT op, so Dart must not issue the next op until
+            // this CCCD write finishes.
+            conn.subscribeReq = reqId
+            val ok: Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(cccd, value) == BluetoothGatt.GATT_SUCCESS
             } else {
                 cccd.value = value
                 gatt.writeDescriptor(cccd)
             }
-        } catch (_: Throwable) {
+            if (!ok) {
+                conn.subscribeReq = 0
+                nativeOnOp(reqId, GATT_FAILURE, null, null)
+            }
+        } catch (t: Throwable) {
+            conn.subscribeReq = 0
+            nativeOnOp(reqId, GATT_FAILURE, null, null)
         }
     }
 
@@ -371,6 +450,17 @@ object BluetoothLeAndroid {
                         characteristic.value ?: ByteArray(0),
                     )
                 }
+            }
+
+            override fun onDescriptorWrite(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int,
+            ) {
+                val conn = connections[connToken] ?: return
+                val reqId = conn.subscribeReq
+                conn.subscribeReq = 0
+                if (reqId != 0L) nativeOnOp(reqId, status, null, null)
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
@@ -466,7 +556,11 @@ object BluetoothLeAndroid {
         val record = result.scanRecord
         return JSONObject().apply {
             put("id", device.address)
-            val name = record?.deviceName ?: device.name
+            // device.name needs BLUETOOTH_CONNECT; a scan-only app must still
+            // get the (unnamed) sighting, not lose the whole device to the
+            // catch in onScanResult.
+            val name = record?.deviceName
+                ?: runCatching { device.name }.getOrNull()
             if (name != null) put("name", name)
             put("rssi", result.rssi)
             put(

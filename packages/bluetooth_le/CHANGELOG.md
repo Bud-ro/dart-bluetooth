@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.2.0
+
+Reliability fixes from three deep review passes — no API changes beyond new
+`BleLoggers.root` / `.loggers` / `.setLevel(...)` logging conveniences.
+
+- Apple: write-without-response no longer reports success while CoreBluetooth
+  silently drops chunks — writes are gated on `canSendWriteWithoutResponse`
+  and queued until the peripheral is ready, so bulk `BleSerial` sends arrive
+  intact. A failed notify enable now errors the subscribe stream instead of
+  going silently dead; connecting with the adapter off throws
+  `BleDisabledException` instead of hanging; cancelled pending connects no
+  longer leak native wrappers; stopping a scan releases the peripherals a
+  long scan accumulated.
+- Apple: fixed a thread-safety race in the native connection bookkeeping that
+  could crash on disconnect; hot restarts can no longer crash on stale native
+  callbacks (new quiesce-on-construction/dispose).
+- Android: enabling notifications no longer collides with the next GATT op
+  (the CCCD write is now a tracked op) — the everyday "listen then write"
+  serial flow works. `connect()` now throws `BleDisabledException` /
+  `BlePermissionException` for adapter-off / missing-permission failures
+  instead of a transient `DeviceNotFoundException` that invited endless
+  retries. Needs `bluetooth_le_flutter` >= 0.2.0.
+- Linux: concurrent scans no longer stop each other; streams can be
+  re-listened after cancelling; a link drop during subscribe setup no longer
+  kills the process. Scans now survive suspend/resume (a Powered/Discovering
+  watch restarts discovery on power-on); BlueZ `NotReady` / `DoesNotExist`
+  errors map to `BleDisabledException` / `DeviceNotFoundException`; one
+  malformed manufacturer-data entry no longer hides a whole sighting; and
+  `dispose()` no longer closes a caller-supplied `DBusClient`.
+- Windows: `connect()` now runs its blocking Win32 calls on a worker isolate
+  and honours the `timeout` parameter.
+- `BleSerial.input`: bytes arriving while nobody listens are buffered (1 MiB
+  bound, replayed in order to the next listener); notifications stay enabled
+  until `close()` releases them; a backend whose subscribe throws (Windows)
+  errors the stream instead of crashing the process.
+- Lifecycle: `BleCentral.dispose()` disposes only a caller-injected platform
+  (the process-shared backend survives the facade), and a backend's own
+  `dispose()` vacates the shared platform slot so later use gets a fresh
+  backend instead of a disposed, silent one.
+
+- Hardening pass (both platforms): scan failures now surface — Android's
+  async `onScanFailed` (incl. the 5-starts-per-30s throttle) errors the
+  stream instead of leaving it silently empty, and Apple scans/connects gate
+  on adapter state (a denied permission was a forever-empty scan). A radio
+  bounce on Apple no longer wedges connections and op chains (below-poweredOn
+  states now fire disconnects and re-arm the scan); reading a subscribed
+  characteristic no longer deadlocks the op chain; on Android GATT ops are
+  bounded by a 30 s timeout and fail fast on bridge errors instead of
+  hanging. Connecting to a peripheral that is already connected/connecting
+  now throws `BleConnectionException` instead of silently stealing the first
+  connection's callbacks. The Kotlin
+  backend survives R8/ProGuard (consumer keep rules) and app-classloader
+  loading; a broken JNI bridge throws descriptively instead of degrading
+  into empty results.
+
 ## 0.1.0
 
 Initial release.

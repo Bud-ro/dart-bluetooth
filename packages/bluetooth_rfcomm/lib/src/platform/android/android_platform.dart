@@ -29,17 +29,61 @@ import 'android_bindings.dart';
 /// Requires the app to hold the runtime Bluetooth permissions
 /// (`BLUETOOTH_CONNECT`/`BLUETOOTH_SCAN` on API 31+, location on older).
 class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
-  AndroidBluetoothRfcomm() : _lib = AndroidBindings.open() {
-    // Set before any native callback can fire so the static free-routing in
-    // _onData/_onFound never sees a null binding.
-    _activeLib = _lib;
+  /// Singleton (per isolate): the constructor resets process-global native
+  /// state (closing every open socket) as hot-restart recovery, so a second
+  /// live instance would silently kill the first one's connections. Mirrors
+  /// the BLE backend's guard.
+  factory AndroidBluetoothRfcomm() => _instance ??= AndroidBluetoothRfcomm._();
+
+  AndroidBluetoothRfcomm._() : _lib = AndroidBindings.instance {
+    // The callables must pin this isolate while native sources can dial them.
+    _setCallablesKeepAlive(true);
+    // Order is load-bearing: register FIRST so the process-global callback
+    // slots point at THIS isolate's live trampolines, THEN reset to quiesce
+    // any event sources a previous (hot-restarted) isolate left running —
+    // their dying events land here and are token-dropped, instead of dialing
+    // the dead isolate's destroyed trampolines (a native crash).
     _lib.register(
       _foundCb.nativeFunction,
       _doneCb.nativeFunction,
       _dataCb.nativeFunction,
       _stateCb.nativeFunction,
     );
-    _lib.init();
+    _initCode = _lib.init();
+    _lib.reset();
+  }
+
+  static AndroidBluetoothRfcomm? _instance;
+
+  /// Last `btc_and_init` result: 0 ready, 1 no adapter (genuinely unsupported
+  /// hardware), 2 no Application context yet, 7 JNI bridge failure (no JVM /
+  /// Kotlin class missing — e.g. stripped by R8). Only 0 and 1 are settled
+  /// states; anything else is retried by [_ensureBridge].
+  int _initCode = 0;
+
+  /// Fails loudly when the JNI bridge itself is broken instead of letting
+  /// every API degrade into empty lists and generic connect failures. Retries
+  /// init first: an early construction can legitimately precede the
+  /// Application context.
+  void _ensureBridge() {
+    if (_initCode == 0 || _initCode == 1) return;
+    _initCode = _lib.init();
+    if (_initCode == 0 || _initCode == 1) return;
+    throw BluetoothException(
+      _initCode == 7
+          ? 'Android JNI bridge failed: the native library cannot reach the '
+                'Kotlin backend (is bluetooth_rfcomm_flutter in the app, and '
+                'is BluetoothRfcommAndroid kept by R8/ProGuard?)'
+          : 'Android backend initialization failed: no Application context',
+      code: _initCode,
+    );
+  }
+
+  static void _setCallablesKeepAlive(bool alive) {
+    _foundCb.keepIsolateAlive = alive;
+    _doneCb.keepIsolateAlive = alive;
+    _dataCb.keepIsolateAlive = alive;
+    _stateCb.keepIsolateAlive = alive;
   }
 
   final AndroidBindings _lib;
@@ -49,8 +93,6 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
   static final Map<int, _AndroidTransport> _transports = {};
   static final Map<int, StreamController<BluetoothDiscoveryResult>>
   _discoveries = {};
-  // Late-bound so the static callbacks can reach the active backend's bindings.
-  static AndroidBindings? _activeLib;
 
   static final ffi.NativeCallable<FoundCbNative> _foundCb =
       ffi.NativeCallable<FoundCbNative>.listener(_onFound);
@@ -63,13 +105,19 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<bool> isSupported() async {
-    _activeLib = _lib;
+    // Code 2 (no Application context YET) is transient — a capability probe
+    // during early startup must answer false like 0.1.x, not throw. Only a
+    // genuinely broken bridge (7: no JVM / class stripped) throws, because
+    // nothing will ever work and "false" would misdiagnose it as no-radio.
+    if (_initCode == 2) _initCode = _lib.init();
+    if (_initCode == 2) return false;
+    _ensureBridge();
     return _lib.adapterState() != _AdapterCode.unavailable;
   }
 
   @override
   Future<BluetoothAdapterState> adapterState() async {
-    _activeLib = _lib;
+    _ensureBridge();
     return _AdapterCode.toEnum(_lib.adapterState());
   }
 
@@ -88,13 +136,31 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<List<BluetoothDevice>> bondedDevices() async {
-    _activeLib = _lib;
+    _ensureBridge();
     final ptr = _lib.bondedJson();
-    if (ptr == ffi.nullptr) return const [];
+    if (ptr == ffi.nullptr) {
+      // The Kotlin side never returns null (worst case an {"error":..}
+      // envelope), so NULL is always a JNI plumbing failure — reporting it as
+      // "no bonded devices" is how bridge bugs stay invisible.
+      throw const BluetoothException('bonded-devices JNI bridge call failed');
+    }
     try {
-      final list = (jsonDecode(ptr.cast<Utf8>().toDartString()) as List)
-          .cast<Map<String, dynamic>>();
+      final decoded = jsonDecode(ptr.cast<Utf8>().toDartString());
+      if (decoded is Map) {
+        throw switch ((decoded['error'] as num?)?.toInt()) {
+          -2 => const BluetoothDisabledException(
+            'Bluetooth adapter unavailable',
+          ),
+          -3 => const BluetoothPermissionException(
+            'BLUETOOTH_CONNECT permission not granted',
+          ),
+          _ => const BluetoothException('enumerating bonded devices failed'),
+        };
+      }
+      final list = (decoded as List).cast<Map<String, dynamic>>();
       return list.map(_deviceFromJson).toList();
+    } on BluetoothException {
+      rethrow;
     } catch (e) {
       logNative.warning(() => 'malformed bonded-devices payload: $e');
       throw BluetoothException('malformed bonded-devices payload', cause: e);
@@ -103,24 +169,43 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
   }
 
+  /// Token of the native inquiry running on our behalf (null = none). The
+  /// Kotlin side has a SINGLE receiver slot, so concurrent discovery streams
+  /// SHARE one inquiry: only the first stream starts it, later streams
+  /// piggyback on its sightings, and only the last stream cancelling stops it
+  /// — a second startDiscovery no longer clobbers (and orphans) the first.
+  /// The token also lets [_onInquiryDone] ignore a STALE done (a late
+  /// DISCOVERY_FINISHED from an inquiry already stopped) so it can't tear
+  /// down a freshly started one.
+  static int? _nativeInquiryToken;
+
   @override
   Stream<BluetoothDiscoveryResult> startDiscovery() {
-    _activeLib = _lib;
+    _ensureBridge();
     final token = _nextToken++;
     late StreamController<BluetoothDiscoveryResult> controller;
     controller = StreamController<BluetoothDiscoveryResult>.broadcast(
       onListen: () {
         _discoveries[token] = controller;
+        if (_nativeInquiryToken != null) return; // share the running inquiry
         if (_lib.startDiscovery(token) != 0) {
           controller.addError(
             const BluetoothDiscoveryException('startDiscovery failed'),
           );
           _discoveries.remove(token);
+          // A discovery that failed to start never produces results or a done
+          // callback — close so listeners see a terminal event, not a hang.
+          unawaited(controller.close());
+          return;
         }
+        _nativeInquiryToken = token;
       },
       onCancel: () async {
         _discoveries.remove(token);
-        _lib.stopDiscovery();
+        if (_discoveries.isEmpty && _nativeInquiryToken != null) {
+          _nativeInquiryToken = null;
+          _lib.stopDiscovery();
+        }
       },
     );
     return controller.stream;
@@ -128,7 +213,10 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> stopDiscovery() async {
-    _lib.stopDiscovery();
+    if (_nativeInquiryToken != null) {
+      _nativeInquiryToken = null;
+      _lib.stopDiscovery();
+    }
     // Close any discovery streams whose subscribers used stopDiscovery() rather
     // than cancelling, so the controllers don't leak. (The ACTION_DISCOVERY_-
     // FINISHED callback also closes them, but only if it actually fires.)
@@ -162,7 +250,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
         'Android requires a MAC-address DeviceId for RFCOMM connect',
       );
     }
-    _activeLib = _lib;
+    _ensureBridge();
     final token = _nextToken++;
     final transport = _AndroidTransport(token, _lib);
     _transports[token] = transport;
@@ -175,12 +263,15 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
     final address = device.address;
     final uuidValue = serviceUuid.value;
     final ch = channel ?? 0;
-    // Run the blocking open via a top-level function (NOT an inline closure):
-    // the computation sent to Isolate.run must be sendable, and an inline closure
-    // in this method can capture non-sendable context. Mirrors the Windows path.
-    final openFuture = Isolate.run(
-      () => _androidOpen(token, address, ch, uuidValue),
-    );
+    // Spawned via the dedicated top-level helper, NOT an inline lambda in
+    // this method: the VM gives all closures in one scope a
+    // single shared context, and the timeout-cleanup closure below captures
+    // `this` (for `_lib`) — inlining the lambda in this method could drag the
+    // whole platform object (DynamicLibrary included) into the isolate
+    // message and fail the send, which the generic catch would then disguise
+    // as an instant "connect failed". Matches the Windows _spawnConnect
+    // pattern.
+    final openFuture = spawnAndroidOpen(token, address, ch, uuidValue);
 
     final int handle;
     try {
@@ -241,6 +332,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
 
   @override
   Future<void> dispose() async {
+    await stopDiscovery();
     for (final t in _transports.values.toList()) {
       await t.close();
     }
@@ -248,39 +340,58 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
       if (!c.isClosed) await c.close();
     }
     _discoveries.clear();
+    // Quiesce every remaining native event source, then null the process
+    // callback slots: reset() wakes dying Kotlin read loops asynchronously,
+    // and their final nativeOnState must find empty slots (the C shim
+    // null-checks) rather than dialing this isolate's trampolines after the
+    // pin below is released. Only then is letting the isolate exit safe.
+    _lib.reset();
+    _lib.register(ffi.nullptr, ffi.nullptr, ffi.nullptr, ffi.nullptr);
+    _setCallablesKeepAlive(false);
+    _instance = null;
+    // Also vacate the interface-level slot: with the callback slots nulled
+    // above, handing this disposed backend to the next default-constructed
+    // facade would silently black-hole every sighting, byte, and disconnect.
+    BluetoothRfcommPlatform.detachInstance(this);
   }
 
   // --- static callback dispatch --------------------------------------------
 
   static void _onFound(int token, ffi.Pointer<ffi.Char> json) {
-    final controller = _discoveries[token];
     try {
-      if (controller != null && !controller.isClosed) {
+      if (_discoveries.isNotEmpty) {
         final map =
             jsonDecode(json.cast<Utf8>().toDartString())
                 as Map<String, dynamic>;
         final device = _deviceFromJson(map);
-        controller.add(
-          BluetoothDiscoveryResult(
-            device: device,
-            rssi: device.rssi,
-            timestamp: DateTime.now(),
-          ),
+        final result = BluetoothDiscoveryResult(
+          device: device,
+          rssi: device.rssi,
+          timestamp: DateTime.now(),
         );
+        // The single native inquiry is shared: deliver to EVERY live stream.
+        for (final controller in _discoveries.values.toList()) {
+          if (!controller.isClosed) controller.add(result);
+        }
       }
     } catch (e) {
       // Skip a malformed sighting rather than tearing down discovery.
       logNative.fine(() => 'skipped malformed sighting: $e');
     } finally {
-      _activeLib?.free(json.cast());
+      AndroidBindings.instance.free(json.cast());
     }
   }
 
   static void _onInquiryDone(int token, int aborted) {
-    final controller = _discoveries.remove(token);
-    if (controller != null && !controller.isClosed) {
-      unawaited(controller.close());
+    // A done queued from an inquiry that was already stopped/replaced must not
+    // tear down a freshly started one — only the CURRENT inquiry's done acts.
+    if (token != _nativeInquiryToken) return;
+    _nativeInquiryToken = null;
+    // The shared inquiry is over: every piggybacked stream completes with it.
+    for (final controller in _discoveries.values.toList()) {
+      if (!controller.isClosed) unawaited(controller.close());
     }
+    _discoveries.clear();
   }
 
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {
@@ -290,7 +401,7 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
         t._deliver(Uint8List.fromList(data.asTypedList(len)));
       }
     } finally {
-      _activeLib?.free(data.cast());
+      AndroidBindings.instance.free(data.cast());
     }
   }
 
@@ -318,12 +429,28 @@ class AndroidBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 }
 
+/// Spawns [_androidOpen] on a helper isolate from a dedicated top-level
+/// scope. The Isolate.run lambda MUST live in a function containing no other
+/// closures: the VM shares one context object among all closures of a scope,
+/// so a sibling closure capturing `this` (as openRfcomm's timeout cleanup
+/// does for `_lib`) would make the entire platform — DynamicLibrary and all —
+/// part of the sent closure and fail the send with "Illegal argument in
+/// isolate message". Top-level, so `this` cannot even be in scope. Visible
+/// (non-private) so the sendability regression test can exercise it.
+Future<int> spawnAndroidOpen(int token, String address, int ch, String uuid) =>
+    Isolate.run(() => _androidOpen(token, address, ch, uuid));
+
+/// See [spawnAndroidOpen] — same dedicated-scope rule.
+Future<int> spawnAndroidFlush(int handle) =>
+    Isolate.run(() => _androidFlush(handle));
+
 /// Runs the blocking native `open` on a helper isolate. Top-level (not a method
 /// closure) so the computation sent to [Isolate.run] captures only its sendable
-/// args. Opens its own bindings (lookups only — the global JNI callbacks were
-/// registered once on the main isolate and still deliver there).
+/// args. Uses the helper isolate's own lazily-created [AndroidBindings.instance]
+/// (lookups only — the global JNI callbacks were registered once on the main
+/// isolate and still deliver there).
 int _androidOpen(int token, String address, int channel, String uuid) {
-  final lib = AndroidBindings.open();
+  final lib = AndroidBindings.instance;
   final addrPtr = address.toNativeUtf8();
   final uuidPtr = uuid.toNativeUtf8();
   try {
@@ -333,6 +460,10 @@ int _androidOpen(int token, String address, int channel, String uuid) {
     calloc.free(uuidPtr);
   }
 }
+
+/// Blocks (up to ~10s in the Kotlin layer) until the per-socket write executor
+/// has drained. Top-level so [Isolate.run] captures only the sendable handle.
+int _androidFlush(int handle) => AndroidBindings.instance.flush(handle);
 
 abstract final class _AdapterCode {
   static const int unavailable = 1;
@@ -372,6 +503,10 @@ class _AndroidTransport implements RfcommTransport {
       return false;
     }
     _handle = handle;
+    // Fetched ONCE at bind (a sync JNI hop) — it is fixed for the socket's
+    // lifetime, so the getter never pays the native call again.
+    final mtu = _lib.maxTx(handle);
+    _maxPayload = mtu > 0 ? mtu : null;
     _current = ConnectionState.connected;
     if (!_state.isClosed) _state.add(ConnectionState.connected);
     return true;
@@ -396,6 +531,25 @@ class _AndroidTransport implements RfcommTransport {
   @override
   ConnectionState get state => _current;
 
+  int? _maxPayload;
+
+  /// OS-advertised max single-write payload
+  /// (`BluetoothSocket.getMaxTransmitPacketSize`), fetched once after connect;
+  /// null when the OS doesn't report one (pre-API-23, or an older native lib).
+  @override
+  int? get maxPayloadSize => _maxPayload;
+
+  /// Bytes accepted by [send] but not yet handed to the socket: read straight
+  /// from the Kotlin per-socket AtomicLong (incremented at enqueue, decremented
+  /// when the executor write task finishes), so it is exact — the cost is one
+  /// sync JNI call per read. Returns 0 once closed.
+  @override
+  int get pendingWriteBytes {
+    if (_closed || _handle == 0) return 0;
+    final n = _lib.pendingBytes(_handle);
+    return n > 0 ? n : 0;
+  }
+
   @override
   void send(Uint8List data) {
     if (_closed || _handle == 0) {
@@ -412,7 +566,20 @@ class _AndroidTransport implements RfcommTransport {
   }
 
   @override
-  Future<void> flush() async {}
+  Future<void> flush() async {
+    if (_closed || _handle == 0) return;
+    // Drains the Kotlin per-socket write executor (a blocking marker-task
+    // wait), run on a helper isolate so the caller never blocks. -1 on a
+    // still-open handle means the executor died with writes queued.
+    final rc = await spawnAndroidFlush(_handle);
+    if (rc != 0 && !_closed) {
+      throw BluetoothWriteException(
+        'flush failed (link lost, an earlier write failed, or >10s of '
+        'backlog did not drain)',
+        code: rc,
+      );
+    }
+  }
 
   @override
   Future<void> close() async {

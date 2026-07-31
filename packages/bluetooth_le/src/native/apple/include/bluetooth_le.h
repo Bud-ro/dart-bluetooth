@@ -77,19 +77,36 @@ void ble_read(int64_t req_id, int64_t conn_token, const char *service,
               const char *characteristic);
 
 // Writes `len` bytes to a characteristic. With `without_response`, fires `op_cb`
-// (status 0) immediately; otherwise after the acknowledged write completes.
+// (status 0) once the write has actually been submitted to CoreBluetooth —
+// payloads are queued (unbounded) while its outgoing WWR queue is full and
+// drained on peripheralIsReadyToSendWriteWithoutResponse; queued-but-unsent
+// payloads fail (status != 0) on disconnect/teardown, never silently dropped.
+// Without `without_response`, fires after the acknowledged write completes.
 void ble_write(int64_t req_id, int64_t conn_token, const char *service,
                const char *characteristic, const uint8_t *data, int32_t len,
                int32_t without_response);
 
-// Enables/disables notifications on a characteristic. While enabled, pushed
-// values arrive via `notify_cb` with characteristic = "service|char" (canonical
-// lowercase 128-bit UUIDs).
-void ble_subscribe(int64_t conn_token, const char *service,
-                   const char *characteristic, int32_t enable);
+// Enables/disables notifications on a characteristic (tracked): completes
+// `op_cb` with `req_id` once the peripheral acknowledges the
+// notification-state change (status 0), or with status != 0 when the
+// connection/characteristic is unknown or CoreBluetooth reports an error —
+// so a failed enable surfaces instead of silently never notifying. While
+// enabled, pushed values arrive via `notify_cb` with characteristic =
+// "service|char" (canonical lowercase 128-bit UUIDs).
+void ble_set_notify(int64_t req_id, int64_t conn_token, const char *service,
+                    const char *characteristic, int32_t enable);
 
 // Returns the usable ATT MTU (max write payload + 3) for the connection.
 int32_t ble_max_write_len(int64_t conn_token, int32_t without_response);
+
+// Quiesces the backend: silences the registered callbacks, stops any scan,
+// cancels every tracked connection, and clears all connection/peripheral and
+// op-tracking state so no CoreBluetooth callback can reach Dart afterwards.
+// The Dart layer calls this at construction (hot-restart recovery: stop every
+// native event source left behind by a dead isolate BEFORE ble_register wires
+// up new callbacks) and at dispose (so nothing native ever invokes a torn-down
+// callback trampoline afterwards).
+void ble_reset(void);
 
 #if defined(__cplusplus)
 }

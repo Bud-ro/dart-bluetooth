@@ -23,9 +23,15 @@ import '../platform_interface.dart';
 class LinuxBleCentral extends BleCentralPlatform {
   LinuxBleCentral({DBusClient? bus, String adapter = 'hci0'})
     : _bus = bus ?? DBusClient.system(),
+      _ownsBus = bus == null,
       _adapterName = adapter;
 
   final DBusClient _bus;
+
+  /// Whether [dispose] may close [_bus]: only when this backend created it. A
+  /// caller-injected client is theirs to manage (mirrors the rfcomm backend).
+  final bool _ownsBus;
+
   final String _adapterName;
 
   static const String _service = 'org.bluez';
@@ -79,29 +85,44 @@ class LinuxBleCentral extends BleCentralPlatform {
   Stream<BluetoothAdapterState> adapterStateChanges() {
     late StreamController<BluetoothAdapterState> controller;
     StreamSubscription<DBusPropertiesChangedSignal>? sub;
-    var cancelled = false;
+    // Bumped on every listen AND cancel, so an in-flight onListen can detect it
+    // was superseded mid-await (and not wire up a dead subscription) without a
+    // one-way `cancelled` latch that would leave a re-listened stream (broadcast
+    // onListen re-fires on 0 -> 1) permanently silent.
+    var epoch = 0;
     controller = StreamController<BluetoothAdapterState>.broadcast(
       onListen: () async {
+        final myEpoch = ++epoch;
         final initial = await adapterState();
-        if (cancelled) return;
+        if (epoch != myEpoch) return;
         controller.add(initial);
-        final created = _obj(_adapterPath).propertiesChanged.listen((
-          sig,
-        ) async {
-          if (sig.propertiesInterface == _adapterIface &&
-              sig.changedProperties.containsKey('Powered')) {
-            controller.add(await adapterState());
-          }
-        });
-        if (cancelled) {
+        final created = _obj(_adapterPath).propertiesChanged.listen(
+          (sig) async {
+            if (sig.propertiesInterface == _adapterIface &&
+                sig.changedProperties.containsKey('Powered')) {
+              controller.add(await adapterState());
+            }
+          },
+          // A malformed signal must not become an unhandled zone error (the
+          // dbus dispatcher addErrors signature mismatches into this stream).
+          onError: (Object e) =>
+              logAdapter.warning(() => 'adapter signal error: $e'),
+        );
+        if (epoch != myEpoch) {
           await created.cancel();
         } else {
           sub = created;
         }
       },
       onCancel: () async {
-        cancelled = true;
-        await sub?.cancel();
+        epoch++;
+        // Snapshot-then-null BEFORE the await: a re-listen completing during
+        // cancel() would otherwise have its fresh subscription nulled-over
+        // and left running with no owner (a D-Bus match-rule leak). Same fix
+        // the rfcomm backend carries.
+        final s = sub;
+        sub = null;
+        await s?.cancel();
       },
     );
     return controller.stream;
@@ -120,6 +141,127 @@ class LinuxBleCentral extends BleCentralPlatform {
 
   // --- Scanning ------------------------------------------------------------
 
+  /// Live scan streams, so [stopScan] can close them (matching the
+  /// Apple/Android backends) and so BlueZ StartDiscovery/StopDiscovery can be
+  /// reference-counted: discovery is scoped to the D-Bus client, and this
+  /// backend shares ONE client, so a stream tearing down must only ask BlueZ to
+  /// stop when it is the last local scan — otherwise cancelling one scan stream
+  /// would kill a concurrent one's inquiry.
+  final Set<StreamController<BleScanResult>> _scanControllers = {};
+  int _scanRefs = 0;
+
+  /// Serializes StartDiscovery/StopDiscovery calls so a stop issued by a
+  /// just-cancelled stream can't land after — and silently kill — the
+  /// StartDiscovery of a stream that began a moment later.
+  Future<void> _scanOps = Future<void>.value();
+
+  Future<void> _enqueueScanOp(Future<void> Function() op) {
+    final result = _scanOps.then((_) => op());
+    // Keep the chain alive past failures; the caller sees the error.
+    _scanOps = result.then((_) {}, onError: (_) {});
+    return result;
+  }
+
+  /// Filter of the scan currently driving the BlueZ inquiry (one shared client
+  /// has one filter), kept so a suspend/resume recovery can re-issue the same
+  /// StartDiscovery.
+  List<Uuid>? _activeFilter;
+
+  /// Whether this client's BlueZ discovery session is believed to be running.
+  /// Cleared when the adapter powers off (BlueZ silently tears the session
+  /// down on suspend/rfkill) so the recovery path knows to restart it.
+  bool _discovering = false;
+
+  /// Adapter Powered/Discovering watch, armed while local scans are live.
+  /// Signal-driven (no polling): on Powered=false the internal discovering
+  /// flag is cleared; on Powered=true — or on an externally-dropped
+  /// Discovering while scans are live — a serialized restart op re-fires
+  /// SetDiscoveryFilter + StartDiscovery, so a scan stream survives a
+  /// laptop lid-close/open instead of going silently dead.
+  StreamSubscription<DBusPropertiesChangedSignal>? _adapterScanWatch;
+
+  void _armAdapterScanWatch() {
+    _adapterScanWatch ??= _obj(_adapterPath).propertiesChanged.listen(
+      (sig) {
+        if (sig.propertiesInterface != _adapterIface) return;
+        final powered = sig.changedProperties['Powered'];
+        final discovering = sig.changedProperties['Discovering'];
+        if (powered is DBusBoolean && !powered.value) {
+          // Adapter went down: the discovery session is gone with it. Mark it
+          // so the power-on path below restarts, and don't try now (BlueZ
+          // would answer NotReady).
+          _discovering = false;
+          logScan.warning(
+            'adapter powered off during scan; discovery will restart on '
+            'power-on',
+          );
+          return;
+        }
+        final poweredBackOn = powered is DBusBoolean && powered.value;
+        final discoveryDropped =
+            discovering is DBusBoolean && !discovering.value;
+        if (discoveryDropped) _discovering = false;
+        if ((poweredBackOn || discoveryDropped) &&
+            _scanRefs > 0 &&
+            !_discovering) {
+          unawaited(
+            _enqueueScanOp(() async {
+              // Re-checked at execution: the last scan may have cancelled (or
+              // an earlier restart already succeeded) while this op queued.
+              if (_scanRefs <= 0 || _discovering) return;
+              try {
+                await _startBluezDiscovery(_activeFilter);
+                logScan.fine('discovery restarted after adapter power-cycle');
+              } catch (e) {
+                // Powered may still be off mid-transition; the next
+                // Powered=true signal retries.
+                logScan.warning(() => 'discovery restart failed: $e');
+              }
+            }),
+          );
+        }
+      },
+      onError: (Object e) =>
+          logScan.warning(() => 'adapter scan-watch signal error: $e'),
+    );
+  }
+
+  Future<void> _disarmAdapterScanWatch() async {
+    final watch = _adapterScanWatch;
+    _adapterScanWatch = null;
+    await watch?.cancel();
+  }
+
+  /// Configures the discovery filter and starts the BlueZ inquiry. Must run
+  /// inside the serialized scan-op chain.
+  Future<void> _startBluezDiscovery(List<Uuid>? withServices) async {
+    // Restrict to LE and (optionally) the requested services so we don't
+    // surface Classic-only devices on a dual-mode adapter.
+    final filter = <String, DBusValue>{'Transport': const DBusString('le')};
+    if (withServices != null && withServices.isNotEmpty) {
+      filter['UUIDs'] = DBusArray.string(
+        withServices.map((u) => u.value).toList(),
+      );
+    }
+    await _obj(_adapterPath)
+        .callMethod(_adapterIface, 'SetDiscoveryFilter', [
+          DBusDict.stringVariant(filter),
+        ], replySignature: DBusSignature(''))
+        .timeout(_busTimeout);
+    if (_scanRefs <= 0) return;
+    try {
+      await _obj(
+        _adapterPath,
+      ).callMethod(_adapterIface, 'StartDiscovery', []).timeout(_busTimeout);
+    } on DBusMethodResponseException catch (e) {
+      // A discovery already running on this client (a race with a stop
+      // still in flight) reports InProgress — the radio is already doing
+      // what we want, so that's success, not an error.
+      if (e.errorName != 'org.bluez.Error.InProgress') rethrow;
+    }
+    _discovering = true;
+  }
+
   @override
   Stream<BleScanResult> startScan({List<Uuid>? withServices}) {
     late StreamController<BleScanResult> controller;
@@ -137,16 +279,21 @@ class LinuxBleCentral extends BleCentralPlatform {
             object: om,
             interface: _omIface,
             name: 'InterfacesAdded',
-          ).listen((signal) {
-            try {
-              if (signal.values.length < 2) return;
-              final ifaces = _ifacesFromDict(signal.values[1] as DBusDict);
-              final props = ifaces[_deviceIface];
-              if (props != null) controller.add(_scanResultFromProps(props));
-            } catch (_) {
-              // Skip a malformed signal rather than erroring the scan stream.
-            }
-          });
+          ).listen(
+            (signal) {
+              try {
+                if (signal.values.length < 2) return;
+                final ifaces = _ifacesFromDict(signal.values[1] as DBusDict);
+                final props = ifaces[_deviceIface];
+                if (props != null) controller.add(_scanResultFromProps(props));
+              } catch (_) {
+                // Skip a malformed signal rather than erroring the scan stream.
+              }
+            },
+            onError: (Object e) {
+              logScan.warning(() => 'InterfacesAdded signal error: $e');
+            },
+          );
       // RSSI/name updates on already-known devices arrive as PropertiesChanged
       // from each device's own path, so match the adapter path namespace.
       changedSub =
@@ -156,50 +303,80 @@ class LinuxBleCentral extends BleCentralPlatform {
             interface: _propsIface,
             name: 'PropertiesChanged',
             pathNamespace: _adapterPath,
-          ).listen((signal) async {
-            try {
-              if (signal.values.isEmpty) return;
-              if ((signal.values[0] as DBusString).value != _deviceIface) {
-                return;
+          ).listen(
+            (signal) async {
+              try {
+                if (signal.values.isEmpty) return;
+                if ((signal.values[0] as DBusString).value != _deviceIface) {
+                  return;
+                }
+                final props = await _allProps(signal.path, _deviceIface);
+                // The controller can close (stopScan) while we awaited the
+                // props — guard explicitly rather than relying on the catch.
+                if (!controller.isClosed) {
+                  controller.add(_scanResultFromProps(props));
+                }
+              } catch (_) {
+                // Device vanished mid-update / malformed signal.
               }
-              final props = await _allProps(signal.path, _deviceIface);
-              controller.add(_scanResultFromProps(props));
-            } catch (_) {
-              // Device vanished mid-update / malformed signal.
-            }
-          });
+            },
+            onError: (Object e) {
+              logScan.warning(() => 'PropertiesChanged signal error: $e');
+            },
+          );
 
-      // Restrict to LE and (optionally) the requested services so we don't
-      // surface Classic-only devices on a dual-mode adapter.
-      final filter = <String, DBusValue>{'Transport': const DBusString('le')};
-      if (withServices != null && withServices.isNotEmpty) {
-        filter['UUIDs'] = DBusArray.string(
-          withServices.map((u) => u.value).toList(),
-        );
-      }
-      await _obj(_adapterPath)
-          .callMethod(_adapterIface, 'SetDiscoveryFilter', [
-            DBusDict.stringVariant(filter),
-          ], replySignature: DBusSignature(''))
-          .timeout(_busTimeout);
-      await _obj(
-        _adapterPath,
-      ).callMethod(_adapterIface, 'StartDiscovery', []).timeout(_busTimeout);
-      logScan.fine('scan started');
+      // Only the FIRST local scan configures and starts the BlueZ inquiry; a
+      // concurrent scan rides the one already running (with its filter — one
+      // shared client has one filter).
+      if (_scanRefs != 1) return;
+      _activeFilter = withServices;
+      // Watch Powered/Discovering while scans are live, so a suspend/resume
+      // (which silently kills the BlueZ session) restarts discovery instead of
+      // leaving the stream dead.
+      _armAdapterScanWatch();
+      await _enqueueScanOp(() async {
+        // Cancels that landed while this op was queued — or during the filter
+        // call below — must not let StartDiscovery run after StopDiscovery, or
+        // nothing would ever stop the adapter again. Checked against the live
+        // refcount (not a per-stream flag) so cancelling this stream doesn't
+        // starve a concurrent scan that is riding this StartDiscovery.
+        if (_scanRefs <= 0) return;
+        await _startBluezDiscovery(withServices);
+        logScan.fine('scan started');
+      });
     }
 
     controller = StreamController<BleScanResult>.broadcast(
       onListen: () {
+        // Broadcast onListen re-fires on 0 -> 1, so a re-listen after a full
+        // cancel re-runs begin() and re-arms the stream.
+        _scanControllers.add(controller);
+        _scanRefs++;
         begin().catchError((Object e) {
           controller.addError(
             BleScanException('StartDiscovery failed', cause: e),
           );
+          // A scan that failed to start will never produce results or complete
+          // on its own — close it so listeners see a terminal event, not a
+          // hung stream.
+          if (!controller.isClosed) unawaited(controller.close());
         });
       },
       onCancel: () async {
+        _scanControllers.remove(controller);
+        _scanRefs--;
         await addedSub?.cancel();
         await changedSub?.cancel();
-        await stopScan();
+        addedSub = null;
+        changedSub = null;
+        // Only the LAST local scan stops the radio inquiry (and drops the
+        // adapter watch — disarmed FIRST, so our own StopDiscovery's
+        // Discovering=false signal can't be mistaken for a dropped session).
+        if (_scanRefs <= 0) {
+          _scanRefs = 0;
+          await _disarmAdapterScanWatch();
+          await _enqueueScanOp(_stopBluezDiscovery);
+        }
       },
     );
     return controller.stream;
@@ -207,6 +384,25 @@ class LinuxBleCentral extends BleCentralPlatform {
 
   @override
   Future<void> stopScan() async {
+    // Close live scan streams (mirrors Apple/Android, whose stopScan closes
+    // the active scan controller) so their listeners get a terminal done
+    // instead of a silently-dead stream; each close drains the refcount via
+    // its onCancel, and the last one stops the BlueZ inquiry.
+    for (final c in _scanControllers.toList()) {
+      if (!c.isClosed) unawaited(c.close());
+    }
+    // Backstop for an inquiry with no live stream to drain (e.g. one left
+    // running by an external orchestration quirk). Checked at execution time —
+    // after the queued closes above — so a scan started right after stopScan()
+    // (whose refcount is live again) is never starved of its inquiry.
+    await _enqueueScanOp(() async {
+      if (_scanRefs > 0) return;
+      await _stopBluezDiscovery();
+    });
+  }
+
+  Future<void> _stopBluezDiscovery() async {
+    _discovering = false;
     try {
       await _obj(
         _adapterPath,
@@ -238,7 +434,12 @@ class LinuxBleCentral extends BleCentralPlatform {
 
   @override
   Future<void> dispose() async {
-    await _bus.close();
+    await _disarmAdapterScanWatch();
+    // Vacate the platform-level singleton slot so a later default construction
+    // gets a fresh backend, not this disposed one.
+    BleCentralPlatform.detachInstance(this);
+    // A caller-injected bus is theirs to manage; only close one we created.
+    if (_ownsBus) await _bus.close();
   }
 
   // --- Helpers -------------------------------------------------------------
@@ -259,6 +460,26 @@ class LinuxBleCentral extends BleCentralPlatform {
     }
     if (e is DBusUnknownObjectException) {
       throw DeviceNotFoundException('Unknown object during $op', cause: e);
+    }
+    if (e is DBusMethodResponseException) {
+      throw switch (e.errorName) {
+        // Adapter powered off — the retry story is "wait for the adapter",
+        // exactly what BleDisabledException documents.
+        'org.bluez.Error.NotReady' => BleDisabledException(
+          'Bluetooth adapter is powered off',
+          cause: e,
+        ),
+        'org.bluez.Error.NotAuthorized' ||
+        'org.bluez.Error.AuthenticationRejected' => BlePermissionException(
+          'Not authorized during $op',
+          cause: e,
+        ),
+        'org.bluez.Error.DoesNotExist' => DeviceNotFoundException(
+          'Unknown device during $op',
+          cause: e,
+        ),
+        _ => BleException('BlueZ error during $op', cause: e),
+      };
     }
     throw BleException('D-Bus error during $op', cause: e);
   }
@@ -314,8 +535,14 @@ class LinuxBleCentral extends BleCentralPlatform {
     final mfg = props['ManufacturerData'];
     if (mfg is DBusDict) {
       mfg.children.forEach((k, v) {
-        final company = (k as DBusUint16).value;
-        manufacturerData[company] = _bytesOf((v as DBusVariant).value);
+        // Guard per entry (like serviceUuids/serviceData): one malformed
+        // peer-supplied entry must not discard the whole sighting.
+        if (k is! DBusUint16) return;
+        try {
+          manufacturerData[k.value] = _bytesOf((v as DBusVariant).value);
+        } catch (_) {
+          // Skip a malformed manufacturer-data entry.
+        }
       });
     }
 
@@ -407,14 +634,22 @@ class LinuxGattConnection implements GattConnection {
   Future<void> open(Duration? timeout) async {
     // Watch the device for disconnects before we connect, so we never miss the
     // transition.
-    _deviceSub = _obj(_devicePath).propertiesChanged.listen((sig) {
-      if (sig.propertiesInterface != _deviceIface) return;
-      final connected = sig.changedProperties['Connected'];
-      if (connected is DBusBoolean && !connected.value) {
-        _setState(BleConnectionState.disconnected);
-        _teardown();
-      }
-    });
+    _deviceSub = _obj(_devicePath).propertiesChanged.listen(
+      (sig) {
+        if (sig.propertiesInterface != _deviceIface) return;
+        final connected = sig.changedProperties['Connected'];
+        if (connected is DBusBoolean && !connected.value) {
+          _setState(BleConnectionState.disconnected);
+          _teardown();
+        }
+      },
+      // A malformed signal must not become an unhandled zone error.
+      onError: (Object e) => logConnection.warning(
+        () =>
+            'device signal error: '
+            '$e',
+      ),
+    );
     final device = _obj(_devicePath);
     final connect = device.callMethod(
       _deviceIface,
@@ -422,16 +657,24 @@ class LinuxGattConnection implements GattConnection {
       [],
       replySignature: DBusSignature(''),
     );
+    // ONE deadline covers Connect AND the ServicesResolved wait (a caller's
+    // 10s timeout must not quietly become 20s), and a caller with no timeout
+    // still gets a safety cap — BlueZ Connect against a wedged bluetoothd is
+    // otherwise unbounded. Mirrors the rfcomm backend.
+    final deadline = timeout ?? _connectSafetyTimeout;
+    final started = Stopwatch()..start();
     try {
-      if (timeout != null) {
-        await connect.timeout(timeout);
-      } else {
-        await connect;
-      }
+      await connect.timeout(deadline);
       // BlueZ's Connect usually returns once services are resolved, but for
       // cached/re-connected devices ServicesResolved can briefly lag — making
-      // the first discoverServices() see an empty tree. Wait for it (bounded).
-      await _awaitServicesResolved(timeout);
+      // the first discoverServices() see an empty tree. Wait for it (bounded
+      // by the REMAINDER of the same deadline).
+      final remaining = deadline - started.elapsed;
+      await _awaitServicesResolved(
+        remaining > const Duration(seconds: 1)
+            ? remaining
+            : const Duration(seconds: 1),
+      );
     } on TimeoutException {
       unawaited(close());
       throw BleTimeoutException('connect timed out', timeout: timeout);
@@ -448,6 +691,11 @@ class LinuxGattConnection implements GattConnection {
     _setState(BleConnectionState.connected);
   }
 
+  /// No-caller-timeout safety cap for the whole connect sequence (Connect +
+  /// ServicesResolved): "waits forever on a wedged bluetoothd" is never the
+  /// right default.
+  static const Duration _connectSafetyTimeout = Duration(minutes: 1);
+
   Future<void> _awaitServicesResolved(Duration? timeout) async {
     final device = _obj(_devicePath);
     try {
@@ -459,15 +707,22 @@ class LinuxGattConnection implements GattConnection {
       return; // property absent / bus issue — discoverServices lazy-resolves
     }
     final done = Completer<void>();
-    final sub = device.propertiesChanged.listen((sig) {
-      if (sig.propertiesInterface != _deviceIface) return;
-      final r = sig.changedProperties['ServicesResolved'];
-      if (r is DBusBoolean && r.value && !done.isCompleted) done.complete();
-      final c = sig.changedProperties['Connected'];
-      if (c is DBusBoolean && !c.value && !done.isCompleted) {
-        done.complete(); // disconnect; the device watch handles teardown
-      }
-    });
+    final sub = device.propertiesChanged.listen(
+      (sig) {
+        if (sig.propertiesInterface != _deviceIface) return;
+        final r = sig.changedProperties['ServicesResolved'];
+        if (r is DBusBoolean && r.value && !done.isCompleted) done.complete();
+        final c = sig.changedProperties['Connected'];
+        if (c is DBusBoolean && !c.value && !done.isCompleted) {
+          done.complete(); // disconnect; the device watch handles teardown
+        }
+      },
+      onError: (Object e) => logConnection.warning(
+        () =>
+            'device signal error: '
+            '$e',
+      ),
+    );
     try {
       await done.future.timeout(timeout ?? LinuxBleCentral._busTimeout);
     } on TimeoutException {
@@ -590,20 +845,29 @@ class LinuxGattConnection implements GattConnection {
   Stream<Uint8List> subscribe(Uuid service, Uuid characteristic) {
     late StreamController<Uint8List> controller;
     StreamSubscription<DBusPropertiesChangedSignal>? sub;
-    var cancelled = false;
+    // Bumped on every listen AND cancel (see adapterStateChanges): guards the
+    // in-flight onListen against a cancel mid-await without latching a
+    // re-listened stream (broadcast onListen re-fires on 0 -> 1) dead.
+    var epoch = 0;
     controller = StreamController<Uint8List>.broadcast(
       onListen: () async {
+        final myEpoch = ++epoch;
         _notifyCtrls.add(controller);
         try {
           final path = await _charPath(service, characteristic);
-          if (cancelled) return;
-          sub = _obj(path).propertiesChanged.listen((sig) {
-            if (sig.propertiesInterface != _charIface) return;
-            final value = sig.changedProperties['Value'];
-            if (value != null) {
-              controller.add(LinuxBleCentral._bytesOf(value));
-            }
-          });
+          if (epoch != myEpoch) return;
+          sub = _obj(path).propertiesChanged.listen(
+            (sig) {
+              if (sig.propertiesInterface != _charIface) return;
+              final value = sig.changedProperties['Value'];
+              if (value != null && !controller.isClosed) {
+                controller.add(LinuxBleCentral._bytesOf(value));
+              }
+            },
+            // A malformed signal must not become an unhandled zone error.
+            onError: (Object e) =>
+                logGatt.warning(() => 'notify signal error: $e'),
+          );
           _notifySubs.add(sub!);
           await _obj(path).callMethod(
             _charIface,
@@ -619,16 +883,33 @@ class LinuxGattConnection implements GattConnection {
             await sub!.cancel();
             sub = null;
           }
-          controller.addError(_gattError(e, 'subscribe'));
+          // The link can drop while we were parked at an await above, and
+          // _teardown() then closes this controller before we get here —
+          // addError on a closed controller is a StateError that would land as
+          // an UNHANDLED zone error (process death in a CLI). Guard it.
+          if (!controller.isClosed) {
+            controller.addError(_gattError(e, 'subscribe'));
+          } else {
+            logGatt.fine(() => 'subscribe failed after teardown: $e');
+          }
         }
       },
       onCancel: () async {
-        cancelled = true;
-        if (sub != null) {
-          _notifySubs.remove(sub);
-          await sub!.cancel();
+        epoch++;
+        // Snapshot-then-null BEFORE the await (see adapterStateChanges).
+        final s = sub;
+        sub = null;
+        if (s != null) {
+          _notifySubs.remove(s);
+          await s.cancel();
         }
         _notifyCtrls.remove(controller);
+        if (sub != null) {
+          // A re-listen re-armed while we were cancelling: leave BlueZ
+          // notifying — StopNotify here would silently kill the live
+          // stream's notifications on the bus side.
+          return;
+        }
         try {
           final path = await _charPath(service, characteristic);
           await _obj(path).callMethod(
@@ -755,6 +1036,28 @@ class LinuxGattConnection implements GattConnection {
     }
     if (e is FormatException) {
       throw BleGattException('malformed data during $op', cause: e);
+    }
+    if (e is DBusMethodResponseException) {
+      // BlueZ's typed errors carry the real story (mirrors the rfcomm Linux
+      // mapper): NotReady is the adapter being off (isTransient=false — park
+      // on adapterStateChanges, don't hammer BlueZ in a retry loop), and
+      // DoesNotExist is an unknown device.
+      throw switch (e.errorName) {
+        'org.bluez.Error.NotReady' => BleDisabledException(
+          'Bluetooth adapter is powered off',
+          cause: e,
+        ),
+        'org.bluez.Error.NotAuthorized' ||
+        'org.bluez.Error.AuthenticationRejected' => BlePermissionException(
+          'Not authorized during $op',
+          cause: e,
+        ),
+        'org.bluez.Error.DoesNotExist' => DeviceNotFoundException(
+          'Unknown device during $op',
+          cause: e,
+        ),
+        _ => BleConnectionException('BlueZ error during $op', cause: e),
+      };
     }
     throw BleConnectionException('D-Bus error during $op', cause: e);
   }

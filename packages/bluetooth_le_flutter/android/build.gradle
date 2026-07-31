@@ -42,6 +42,8 @@ android {
     defaultConfig {
         // 21 is the NDK floor for the CMake/JNI build (CXX1110).
         minSdk = 21
+        // Keep the reflection-only Kotlin backend alive in minified consumers.
+        consumerProguardFiles "consumer-rules.pro"
     }
 
     // Builds the JNI shim into libbluetooth_le_android.so.

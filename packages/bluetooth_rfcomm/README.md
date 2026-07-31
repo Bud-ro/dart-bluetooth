@@ -20,11 +20,16 @@ import 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart';
 
 final bt = BluetoothRfcomm.instance;
 
-final paired = await bt.bondedDevices();
-final conn = await bt.connect(paired.first);     // SDP-resolves the SPP channel
+await bt.startScan(); // background scan: sightings accumulate while you work
+
+// Paired AND actually nearby — the connectable set. (Or pass scanDuration
+// instead of running startScan yourself.)
+final connectable = await bt.listPairedAndScannedDevices();
+
+final conn = await bt.connect(connectable.first); // SDP-resolves the SPP channel
 conn.input.listen((bytes) => print('rx ${bytes.length} bytes'));
 conn.add(Uint8List.fromList('AT\r\n'.codeUnits)); // non-blocking send
-await conn.finish();                              // flush, then close
+await conn.disconnect();                          // flush, then close
 ```
 
 ## Support
@@ -33,7 +38,7 @@ await conn.finish();                              // flush, then close
 | --- | --- | --- | --- | --- |
 | Linux | ✅ | ✅ | ✅ | ❌ |
 | macOS | ✅ | ✅ | ⚠️ | ⚠️ |
-| Windows | ⚠️ | ✅ | ⚠️ | ⚠️ |
+| Windows | ✅ | ✅ | ⚠️ | ⚠️ |
 | Android | ✅ | ✅ | ⚠️ | ❌ |
 | iOS | ⚠️ | ⚠️ | ⚠️ | ❌ |
 
@@ -47,8 +52,8 @@ hardware-verified** (the capability shown in the other columns is implemented, b
 its effectiveness has not been confirmed by the author).
 
 > Note: ⚠️ means **"partial"** in the capability columns but **"author-verified"**
-> in the Manually verified column — they are unrelated. (E.g. Windows is ⚠️ partial
-> for Discover *and* ⚠️ author-verified.)
+> in the Manually verified column — they are unrelated. (E.g. iOS is ⚠️ partial
+> for Discover, while Windows is ⚠️ author-verified.)
 
 > ⚠️ Only **macOS** and **Windows** have been manually verified against real
 > devices so far. Every other backend is implemented but unverified — treat it as
@@ -58,17 +63,26 @@ its effectiveness has not been confirmed by the author).
 
 Notes:
 
-- **Windows discovery** does **not** run a live radio inquiry. A Bluetooth
-  Classic inquiry monopolizes the radio for seconds and can't be aborted, which
-  starves connections — so on Windows `startDiscovery` is a fast, radio-silent
-  shim that returns the **paired** devices only (it does not find nearby unpaired
-  devices). For a paired-device picker this is what you want; for discovering
-  *new* devices, pair them in Windows settings first.
+- **Windows discovery is a real inquiry** (as of 0.2.0): `startDiscovery`,
+  the background scan and `bondedAndDiscovered` all run a genuine
+  `WSALookupService` inquiry on a worker isolate — nearby *unpaired* devices
+  are found, and `bondedAndDiscovered` really means "paired AND in range".
+  The inquiry occupies the radio for up to ~10s while it runs, but it is
+  abortable (`WSALookupServiceEnd`) and is paused automatically while a
+  connect is in flight. Note the new inquiry path has not yet been verified
+  against real hardware.
 - **Pairing** is programmatic on Linux; elsewhere pair through the OS settings
   (the API throws `BluetoothUnsupportedException` for `pair`/`unpair`).
 - **iOS** reaches only MFi accessories (devices with Apple's authentication
   coprocessor); a non-MFi device throws `BluetoothUnsupportedException` — use BLE
-  ([`bluetooth_le`](https://pub.dev/packages/bluetooth_le)) instead.
+  ([`bluetooth_le`](https://pub.dev/packages/bluetooth_le)) instead. iOS also
+  cannot report the real radio state: `adapterState` is a fixed optimistic `on`
+  (ExternalAccessory has no status API and CoreBluetooth would trigger the
+  permission prompt).
+- **`discoverServices` is only authoritative on macOS.** Windows/Linux/Android
+  return the requested service with a sentinel channel 0 ("resolved at connect
+  time by the OS") without consulting the device — a non-empty result there
+  does not confirm the device advertises the service.
 
 How each platform is reached: Linux via BlueZ over D-Bus (`package:dbus`); macOS
 via an IOBluetooth wrapper; Windows via Winsock `AF_BTH`/`BTHPROTO_RFCOMM`;
@@ -83,15 +97,15 @@ Command-line or Flutter desktop:
 
 ```yaml
 dependencies:
-  bluetooth_rfcomm: ^0.1.1
+  bluetooth_rfcomm: ^0.2.0
 ```
 
 Flutter app targeting Android/iOS — add the companion plugin too:
 
 ```yaml
 dependencies:
-  bluetooth_rfcomm: ^0.1.1
-  bluetooth_rfcomm_flutter: ^0.1.0
+  bluetooth_rfcomm: ^0.2.0
+  bluetooth_rfcomm_flutter: ^0.2.0
 ```
 
 ## API
@@ -101,11 +115,31 @@ dependencies:
 - `isSupported()`, `adapterState()`, `adapterStateChanges` (stream),
   `requestEnable()`/`requestDisable()` (where the OS permits)
 - `bondedDevices()` — paired devices
-- `startDiscovery()` → `Stream<BluetoothDiscoveryResult>`, `stopDiscovery()`
+- `startScan()`/`stopScan()` — opt-in **background scan** that accumulates every
+  sighted device (paired or not) into `scannedDevices` /
+  `scannedDevicesStream`; `forgetScannedDevices()` clears the cache. Start it
+  early (e.g. in `main`) and device listings are instant and complete — no
+  waiting out a ~10s inquiry at listing time. The scan pauses automatically
+  while a `connect` or one-shot discovery is in flight and resumes after.
+- The three dedicated listings (deliberately never a union — a mixed list
+  makes paired-but-out-of-range devices look connectable):
+  - `listScannedDevices({scanDuration})` — everything the scan has sighted,
+    paired or not
+  - `listPairedDevices()` — what the OS remembers, nearby or not (courtesy;
+    don't build a connect picker from this alone)
+  - `listPairedAndScannedDevices({scanDuration})` — **paired AND actually
+    sighted: the connectable set a picker wants**
+  All are instant and radio-silent by default; pass `scanDuration` to scan for
+  that window first (starts and stops the scan for you if it wasn't already
+  running)
+- `startDiscovery()` → `Stream<BluetoothDiscoveryResult>`, `stopDiscovery()` —
+  one-shot inquiry, real on every platform (see the Windows note above)
 - `bondedAndDiscovered()` — one-shot: paired **and** in range during a single
-  inquiry
-- `bondedAndDiscoveredStream()` → `Stream<List<BluetoothDevice>>` — keeps scanning
-  and emits the cumulative set of paired devices seen nearby; cancel to stop
+  fresh inquiry, on every platform
+- `bondedAndDiscoveredStream()` → `Stream<List<BluetoothDevice>>` — the live
+  version of `listPairedAndScannedDevices`: emits **only** devices that are
+  paired AND have actually been sighted (never the bare paired list).
+  Listening holds the shared background scan running; cancel to stop
 - `discoverServices(device)` — SDP lookup (RFCOMM channels)
 - `connect(device, {channel, serviceUuid, timeout})` → `BluetoothConnection`
 - `pair()`/`unpair()` — programmatic on Linux; elsewhere throws
@@ -119,11 +153,23 @@ so reconnect by calling `connect` again.
 `BluetoothConnection`:
 
 - `input` — `Stream<Uint8List>`; closes on disconnect (clean EOF)
-- `add(bytes)` — synchronous, never blocks (drained off the calling isolate)
+- `add(bytes)` — synchronous, never blocks (drained off the calling isolate);
+  the outbound queue is unbounded and **never silently drops accepted bytes**
 - `write(bytes)` (= `add` + `flush`); `flush()` awaits the OS accepting queued
-  bytes on Windows/Linux and is best-effort on macOS/iOS/Android
+  bytes on Windows/Linux/Android and is best-effort on macOS/iOS
+- `pendingWriteBytes` — bytes accepted but not yet handed to the OS;
+  `drain({belowBytes})` — awaits the queue dipping to that depth;
+  `maxPayloadSize` — the OS-advertised max single-write payload, or null (see
+  [Backpressure and throughput](#backpressure-and-throughput))
 - `stateChanges`, `state`, `isConnected`
-- `close()` (immediate) / `finish()` (flush then close)
+- `disconnect()` (= `finish()`: flush then close) / `close()` (immediate,
+  discards unflushed bytes)
+
+Disconnects always bubble up: when the peer drops (e.g. the device is powered
+off), `input` closes, `stateChanges` emits a final `disconnected` and closes,
+and `isConnected` flips to false. Every method stays safe afterwards — writes
+throw `BluetoothWriteException`, and `disconnect`/`close`/`finish`/`flush` are
+idempotent no-ops.
 
 ### Channel selection
 
@@ -136,6 +182,67 @@ works at all (it rejects channel 0):
 final services = await bt.discoverServices(device);   // inspect SDP
 final conn = await bt.connect(device, channel: 1);     // or force a channel
 ```
+
+### Backpressure and throughput
+
+**The contract: bytes you hand to `add` are never silently dropped.** The queue
+between `add` and the OS is unbounded and lossless — every accepted byte is
+either delivered to the OS or *loudly* reported lost (a
+`BluetoothWriteException` from `flush`/`drain`, or the terminal disconnect).
+The flip side of an unbounded queue is that nothing stops you from queueing
+faster than the link drains; the fix is not a bigger buffer somewhere, it's
+pacing with the async primitives:
+
+- **Small, occasional frames** (commands, telemetry): `conn.add(frame)`,
+  fire-and-forget.
+- **Request/response**: `await conn.write(request)` per message — each frame
+  reaches the OS before the next is sent.
+- **Bulk transfer**: window it against `pendingWriteBytes` with `drain`:
+
+```dart
+// Send a large payload without ever holding more than ~64 KiB in the queue.
+const window = 64 * 1024;
+const chunkSize = 4 * 1024;
+for (var off = 0; off < payload.length; off += chunkSize) {
+  final end = (off + chunkSize < payload.length) ? off + chunkSize : payload.length;
+  conn.add(Uint8List.sublistView(payload, off, end));
+  if (conn.pendingWriteBytes >= window) {
+    await conn.drain(belowBytes: window ~/ 2); // let the link catch up
+  }
+}
+await conn.drain(); // fully handed to the OS (throws if the link died first)
+```
+
+`drain(belowBytes: 0)` rides `flush` (exact on Windows/Linux/Android, drains
+the native queue on macOS); for `belowBytes > 0` the queue is polled every
+~5 ms with an automatic `flush` fallback when the gauge shows no progress
+(Linux reports an upper bound that only `flush` refreshes) — pacing converges
+on every platform. `drain` throws if queued bytes were discarded (link death
+or `close()`) rather than reporting a lie of success.
+
+**Why is there no `bitsPerSecond`?** Unlike a UART, Bluetooth Classic
+advertises **no throughput number anywhere** — no OS API reports a data rate
+for an RFCOMM link. The radio renegotiates packet types with link quality, the
+link may sit in sniff (power-save) mode, RFCOMM's own credit-based flow
+control lets the *peer* throttle you, and the bandwidth is shared with every
+other connection on the adapter. Any number this package invented would be a
+measurement, not a capability — so it doesn't invent one. What the OS *does*
+advertise is at most a maximum size for a single outgoing packet, exposed
+verbatim as `maxPayloadSize`:
+
+| Platform | `maxPayloadSize` | OS source |
+| --- | --- | --- |
+| macOS | RFCOMM frame payload size (typically ≤ 1011 B) | `IOBluetoothRFCOMMChannel getMTU` |
+| Android | max outgoing packet size | `BluetoothSocket.getMaxTransmitPacketSize()` |
+| Windows | `null` — stream socket, nothing advertised per link | (`SO_SNDBUF` is buffer capacity, not a rate) |
+| Linux | `null` — BlueZ profile fd, nothing advertised | — |
+| iOS | `null` — ExternalAccessory streams | — |
+
+That's a frame *size*, not a rate — useful for sizing protocol frames so each
+fits one RFCOMM packet, nothing more. You never have to chunk to it: `add`
+accepts any size and transports split as needed. To observe actual throughput,
+measure it yourself: watch `pendingWriteBytes` fall over time. Design details
+in [doc/backpressure.md](doc/backpressure.md).
 
 ### Errors
 
@@ -199,16 +306,21 @@ recoverable problems at `WARNING`, and a failed `connect()` at `SEVERE`.
 ```dart
 import 'package:logging/logging.dart';
 
-Logger.root.level = Level.FINE;
+// One call: this package's loggers at FINE, everything else untouched.
+BluetoothRfcommLoggers.setLevel(Level.FINE);
 Logger.root.onRecord.listen((r) {
   print('${r.level.name} ${r.loggerName}: ${r.message}');
 });
 ```
 
-For per-subsystem levels, set `hierarchicalLoggingEnabled = true` and configure
-individual loggers (e.g. silence `BluetoothRfcommLoggers.data` to drop raw
-bytes). Raw-byte messages are built lazily, so leaving that logger off costs
-nothing.
+For per-subsystem levels, configure individual loggers (all reachable via
+`BluetoothRfcommLoggers.loggers` / `.root`, or by name) — e.g. silence
+`BluetoothRfcommLoggers.data` to drop raw bytes. Raw-byte messages are built
+lazily, so leaving that logger off costs nothing.
+
+The package itself never prints. The one exception outside `package:logging`'s
+reach: the Android native layer logs RFCOMM connect failures to logcat under
+the tag `BluetoothRfcomm` (the JNI ABI can't carry the throwable across).
 
 ## Testing without hardware
 

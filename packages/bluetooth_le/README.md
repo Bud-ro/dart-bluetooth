@@ -70,15 +70,15 @@ Command-line or Flutter desktop:
 
 ```yaml
 dependencies:
-  bluetooth_le: ^0.1.0
+  bluetooth_le: ^0.2.0
 ```
 
 Flutter app targeting Android/iOS — add the companion plugin too:
 
 ```yaml
 dependencies:
-  bluetooth_le: ^0.1.0
-  bluetooth_le_flutter: ^0.1.0
+  bluetooth_le: ^0.2.0
+  bluetooth_le_flutter: ^0.2.0
 ```
 
 ## API
@@ -155,14 +155,16 @@ Raw bytes log at `FINEST`, lifecycle at `FINE`, and recoverable problems at
 ```dart
 import 'package:logging/logging.dart';
 
-Logger.root.level = Level.FINE;
+// One call: this package's loggers at FINE, everything else untouched.
+BleLoggers.setLevel(Level.FINE);
 Logger.root.onRecord.listen((r) {
   print('${r.level.name} ${r.loggerName}: ${r.message}');
 });
 ```
 
-For per-subsystem levels, set `hierarchicalLoggingEnabled = true` and configure
-individual loggers (e.g. silence `BleLoggers.data` to drop raw bytes). Raw-byte
+For per-subsystem levels, configure individual loggers (all reachable via
+`BleLoggers.loggers` / `.root`, or by name — e.g. silence `BleLoggers.data`
+to drop raw bytes). Raw-byte
 messages are built lazily, so leaving that logger off costs nothing.
 
 ## Example

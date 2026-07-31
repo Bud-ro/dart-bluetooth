@@ -48,11 +48,12 @@ void btc_free(void *ptr);
 int32_t btc_adapter_state(void);
 
 // Returns a malloc'd UTF-8 JSON array of paired devices, or NULL on error.
-// Each element: {"address","name","classOfDevice","connected"}.
+// Each element: {"address","name","classOfDevice","connected","paired"}.
 char *btc_paired_devices_json(void);
 
 // Resolves the RFCOMM channel for `uuid` on `address` via the device's SDP
-// records. Returns the channel (1..30) or -1 if not found.
+// records, issuing a fresh SDP query (bounded, ~12s) when none are cached.
+// Returns the channel (1..30) or -1 if not found.
 int32_t btc_sdp_channel(const char *address, const char *uuid);
 
 // Starts a device inquiry. `found` fires per sighting (device_json malloc'd);
@@ -70,12 +71,55 @@ int32_t btc_stop_discovery(void);
 int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
                         const char *uuid, btc_data_cb data, btc_state_cb state);
 
-// Queues `len` bytes for transmission on `handle`. Returns 0 on success.
-// Non-blocking: the write is dispatched to the worker thread.
+// Accepts `len` bytes for transmission on `handle`. Returns 0 on acceptance,
+// -2 if the buffered backlog cap (4 MiB) would be exceeded. Never blocks the
+// caller: bytes are written on the worker thread via blocking writeSync (the
+// field-proven engine; the completion-driven async queue with transient-error
+// retry ships separately). A write that finds the channel already torn down
+// counts its bytes into txDroppedBytes — never a silent drop; the Dart layer
+// fail-fasts on its own closed flag before calling. A mid-stream write error
+// surfaces as a disconnect (state callback) with the untransmitted remainder
+// counted.
 int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len);
+
+// The RFCOMM channel MTU (largest single write payload) negotiated for
+// `handle`, cached when the channel finished opening. Returns 0 if unknown or
+// the handle is closed.
+int32_t btc_rfcomm_mtu(int64_t handle);
+
+// Bytes accepted by btc_rfcomm_write for `handle` but not yet handed to the
+// OS. Decremented per MTU-sized chunk as writeSync completes, so during a
+// large stalled write it reflects the true unsent remainder. 0 for an
+// unknown/closed handle. Never blocks (lock-guarded gauge; no worker hop).
+int64_t btc_rfcomm_pending(int64_t handle);
+
+// Returns a malloc'd UTF-8 JSON object of monotonic per-channel transfer
+// counters for `handle` (caller frees via btc_free), with exactly the fields:
+//   {"txEnqueuedBytes","txSubmittedBytes","txCompletedBytes",
+//    "txRetriedChunks","txFailedChunks","txDroppedBytes",
+//    "rxEvents","rxBytes","rxDroppedEvents"}
+// all int64, counted at the hop each name implies: enqueued = accepted by
+// btc_rfcomm_write; submitted = offered to writeSync; completed = writeSync
+// returned success; retried = always 0 in this engine (the async-queue
+// rework's counter, kept for a stable JSON shape); dropped = discarded for any
+// reason, including a teardown purging the queue; rxEvents/rxBytes = what the
+// stack delivered natively; rxDroppedEvents = deliveries whose payload was
+// discarded before reaching Dart (e.g. allocation failure). Counters survive
+// disconnect — they remain readable after the channel is torn down (until
+// btc_reset) so post-mortem loss stays attributable. For an unknown handle
+// returns {"error":"unknown handle"}.
+char *btc_rfcomm_stats_json(int64_t handle);
 
 // Closes `handle`. Returns 0 on success.
 int32_t btc_rfcomm_close(int64_t handle);
+
+// Quiesces the backend: finishes any in-progress inquiry (firing its done
+// callback) and tears down every open RFCOMM channel delegate-safely, clearing
+// the handle map. The Dart layer calls this at construction (hot-restart
+// recovery: stop every native event source left behind by a dead isolate
+// BEFORE new callbacks are registered) and at dispose (so nothing native ever
+// invokes a torn-down callback trampoline afterwards).
+void btc_reset(void);
 
 #if defined(__cplusplus)
 }

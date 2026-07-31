@@ -33,12 +33,26 @@ class AppleBleCentral extends BleCentralPlatform {
   static AppleBleCentral? _instance;
 
   AppleBleCentral._() {
+    // The callables must pin this isolate while native sources can dial them.
+    _setCallablesKeepAlive(true);
+    // Order is load-bearing and the OPPOSITE of the Android backend:
+    // ble_reset NULLs the process-global callback slots (so a hot-restarted
+    // predecessor's sources are silenced before they can dial its destroyed
+    // trampolines), and ble_register then re-arms them with THIS isolate's.
+    bleReset();
     bleRegister(
       _scanCb.nativeFunction,
       _stateCb.nativeFunction,
       _opCb.nativeFunction,
       _notifyCb.nativeFunction,
     );
+  }
+
+  static void _setCallablesKeepAlive(bool alive) {
+    _scanCb.keepIsolateAlive = alive;
+    _stateCb.keepIsolateAlive = alive;
+    _opCb.keepIsolateAlive = alive;
+    _notifyCb.keepIsolateAlive = alive;
   }
 
   static int _nextScanToken = 1;
@@ -90,23 +104,57 @@ class AppleBleCentral extends BleCentralPlatform {
           controller.addError(
             const BleScanException('a scan is already in progress'),
           );
+          // A scan that never started produces no results and no done on its
+          // own — close so error-tolerant listeners see a terminal event, not
+          // a hang.
+          unawaited(controller.close());
           return;
         }
         _scanController = controller;
         _scanToken = token;
-        final csv = (withServices == null || withServices.isEmpty)
-            ? ''
-            : withServices.map((u) => u.value).join(',');
-        final ptr = csv.toNativeUtf8();
-        try {
-          bleStartScan(token, ptr.cast());
-          logScan.fine('scan started');
-        } finally {
-          calloc.free(ptr);
-        }
+        unawaited(() async {
+          // Same gate as connect(): ble_start_scan itself always returns 0
+          // and latches wantScan, so a denied authorization or powered-off
+          // radio would otherwise be a silent, forever-empty stream.
+          final state = await _settledAdapterState();
+          if (controller.isClosed || _scanToken != token) return;
+          final Object? error = switch (state) {
+            BluetoothAdapterState.off ||
+            BluetoothAdapterState.unavailable => const BleDisabledException(
+              'Bluetooth adapter is off or unavailable; cannot scan',
+            ),
+            BluetoothAdapterState.unauthorized => const BlePermissionException(
+              'Bluetooth permission denied; cannot scan',
+            ),
+            _ => null,
+          };
+          if (error != null) {
+            controller.addError(error);
+            _scanController = null;
+            unawaited(controller.close());
+            return;
+          }
+          final csv = (withServices == null || withServices.isEmpty)
+              ? ''
+              : withServices.map((u) => u.value).join(',');
+          final ptr = csv.toNativeUtf8();
+          try {
+            bleStartScan(token, ptr.cast());
+            logScan.fine('scan started');
+          } finally {
+            calloc.free(ptr);
+          }
+        }());
       },
       onCancel: () {
         if (_scanToken == token) {
+          // Invalidate the token BEFORE anything else: the onListen gate may
+          // still be awaiting the adapter settle, and its post-await check
+          // must see the cancellation — otherwise it would go on to call
+          // bleStartScan with no consumer, re-arming the native wantScan
+          // latch into a phantom scan that drains the battery and
+          // re-accumulates retained peripherals until the next scan.
+          _scanToken = 0;
           bleStopScan();
           _scanController = null;
         }
@@ -124,8 +172,42 @@ class AppleBleCentral extends BleCentralPlatform {
     _scanController = null;
   }
 
+  /// Waits (bounded) for the manager to leave its startup `unknown` state.
+  /// CoreBluetooth discards retrievePeripherals/connectPeripheral calls issued
+  /// before the first centralManagerDidUpdateState ("API MISUSE" log only), so
+  /// the canonical connect-to-stored-id-at-launch flow — where construction to
+  /// connect is milliseconds, especially in a CLI — would misreport as
+  /// "unknown peripheral; scan for it first".
+  static Future<BluetoothAdapterState> _settledAdapterState() async {
+    var state = _AdapterCode.toEnum(bleAdapterState());
+    final deadline = DateTime.now().add(const Duration(seconds: 3));
+    while (state == BluetoothAdapterState.unknown &&
+        DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      state = _AdapterCode.toEnum(bleAdapterState());
+    }
+    return state;
+  }
+
   @override
   Future<GattConnection> connect(DeviceId id, {Duration? timeout}) async {
+    // CoreBluetooth quietly drops connectPeripheral: on a non-poweredOn
+    // manager ("API MISUSE" log only), which would hang a timeout-less connect
+    // forever and mislabel a timed one as BleTimeoutException. Fail fast with
+    // the accurate domain error instead.
+    switch (await _settledAdapterState()) {
+      case BluetoothAdapterState.off:
+      case BluetoothAdapterState.unavailable:
+        throw const BleDisabledException(
+          'Bluetooth adapter is off or unavailable; cannot connect',
+        );
+      case BluetoothAdapterState.unauthorized:
+        throw const BlePermissionException(
+          'Bluetooth permission denied; cannot connect',
+        );
+      default:
+        break;
+    }
     final token = _nextConnToken++;
     final conn = AppleGattConnection(token);
     _connections[token] = conn;
@@ -139,10 +221,15 @@ class AppleBleCentral extends BleCentralPlatform {
     }
     if (rc != 0) {
       _connections.remove(token);
-      throw DeviceNotFoundException(
-        'Unknown peripheral ${id.value}; scan for it first',
-        code: rc,
-      );
+      throw rc == -4
+          ? BleConnectionException(
+              'Peripheral ${id.value} is already connected or connecting',
+              code: rc,
+            )
+          : DeviceNotFoundException(
+              'Unknown peripheral ${id.value}; scan for it first',
+              code: rc,
+            );
     }
     try {
       await conn.waitConnected(timeout);
@@ -163,6 +250,16 @@ class AppleBleCentral extends BleCentralPlatform {
       await _scanController!.close();
     }
     _scanController = null;
+    // Quiesce natively (this also NULLs the callback slots), then release the
+    // isolate pin: nothing can dial the callables anymore, so the isolate may
+    // exit. A later construction re-arms via the factory (fresh _instance).
+    bleReset();
+    _setCallablesKeepAlive(false);
+    _instance = null;
+    // Also vacate the platform-level singleton slot: without this,
+    // BleCentralPlatform.instance (and every default-constructed BleCentral)
+    // would keep handing out THIS disposed backend — silent scans forever.
+    BleCentralPlatform.detachInstance(this);
   }
 
   // --- native callback dispatch --------------------------------------------
@@ -454,14 +551,31 @@ class AppleGattConnection implements GattConnection {
       late StreamController<Uint8List> c;
       c = StreamController<Uint8List>.broadcast(
         onListen: () {
-          _setNotify(service, characteristic, enable: true);
+          // Surface a failed enable on the stream (mirrors the Android CCCD
+          // fix) — subscribers otherwise wait forever on notifications that
+          // were never switched on (wrong UUID, undiscovered services, a
+          // characteristic without notify, or a CoreBluetooth error).
+          unawaited(
+            _setNotify(service, characteristic, enable: true).catchError((
+              Object e,
+            ) {
+              if (!c.isClosed) c.addError(e);
+            }),
+          );
           logGatt.fine(() => 'subscribe ${characteristic.value} conn $_token');
         },
         onCancel: () {
-          _setNotify(service, characteristic, enable: false);
-          // Drop the (now listener-less) controller so a later subscribe starts
-          // a fresh one; teardown closes any that remain.
+          // Disable is best-effort — the link may already be gone.
+          unawaited(
+            _setNotify(service, characteristic, enable: false).catchError(
+              (Object e) => logGatt.fine(() => 'notify disable failed: $e'),
+            ),
+          );
+          // Drop AND close the (now listener-less) controller so a later
+          // subscribe starts a fresh one and a re-listen on the old stream gets
+          // a terminal done instead of silently-lost events.
           _notifyControllers.remove(key);
+          unawaited(c.close());
         },
       );
       return c;
@@ -469,15 +583,32 @@ class AppleGattConnection implements GattConnection {
     return controller.stream;
   }
 
-  void _setNotify(Uuid service, Uuid characteristic, {required bool enable}) {
-    final sPtr = service.value.toNativeUtf8();
-    final cPtr = characteristic.value.toNativeUtf8();
-    try {
-      bleSubscribe(_token, sPtr.cast(), cPtr.cast(), enable ? 1 : 0);
-    } finally {
-      calloc.free(sPtr);
-      calloc.free(cPtr);
-    }
+  Future<void> _setNotify(
+    Uuid service,
+    Uuid characteristic, {
+    required bool enable,
+  }) {
+    // A tracked op (ble_set_notify completes it from
+    // didUpdateNotificationStateForCharacteristic:), routed through the op
+    // chain like every other GATT op so ordering stays simple.
+    return _enqueue(() async {
+      final r = await _runOp((reqId) {
+        final sPtr = service.value.toNativeUtf8();
+        final cPtr = characteristic.value.toNativeUtf8();
+        try {
+          bleSetNotify(reqId, _token, sPtr.cast(), cPtr.cast(), enable ? 1 : 0);
+        } finally {
+          calloc.free(sPtr);
+          calloc.free(cPtr);
+        }
+      });
+      if (r.status != 0) {
+        throw BleGattException(
+          '${enable ? 'enable' : 'disable'} notify failed',
+          code: r.status,
+        );
+      }
+    });
   }
 
   @override

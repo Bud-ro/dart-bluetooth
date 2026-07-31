@@ -52,7 +52,7 @@ Future<void> main(List<String> argv) async {
 
     switch (argv.first) {
       case 'list':
-        await _list(bt);
+        await _list(bt, argv.skip(1).toList());
       case 'scan':
         await _scan(bt, argv.skip(1).toList());
       case 'connect':
@@ -68,16 +68,39 @@ Future<void> main(List<String> argv) async {
   exit(0);
 }
 
-Future<void> _list(BluetoothRfcomm bt) async {
-  final devices = await bt.bondedDevices();
-  if (devices.isEmpty) {
-    stdout.writeln('No paired devices.');
-    return;
+Future<void> _list(BluetoothRfcomm bt, List<String> args) async {
+  final parser = ArgParser()
+    ..addOption('scan', abbr: 's', help: 'scan this many seconds first');
+  final opts = parser.parse(args);
+  final scanSecs = opts['scan'] as String?;
+  final window = scanSecs != null
+      ? Duration(seconds: int.parse(scanSecs))
+      : null;
+  if (window != null) stdout.writeln('Scanning for ${scanSecs}s...');
+  // The three dedicated listings: connectable (paired ∩ scanned) first — the
+  // set a picker cares about — then everything scanned, then the paired list.
+  final connectable = await bt.listPairedAndScannedDevices(
+    scanDuration: window,
+  );
+  final scanned = await bt.listScannedDevices();
+  final paired = await bt.listPairedDevices();
+
+  void section(String title, Iterable<BluetoothDevice> devices) {
+    stdout.writeln('$title:');
+    if (devices.isEmpty) stdout.writeln('  (none)');
+    for (final d in devices) {
+      final rssi = d.rssi != null ? '  [${d.rssi} dBm]' : '';
+      stdout.writeln('  ${d.id}  ${d.name ?? '(unknown)'}$rssi');
+    }
   }
-  stdout.writeln('Paired devices:');
-  for (final d in devices) {
-    stdout.writeln('  ${d.id}  ${d.name ?? '(unknown)'}');
-  }
+
+  section('Paired & nearby (connectable)', connectable);
+  final connectableIds = {for (final d in connectable) d.id};
+  section(
+    'Other scanned',
+    scanned.where((d) => !connectableIds.contains(d.id)),
+  );
+  section('Paired (whether nearby or not)', paired);
 }
 
 Future<void> _scan(BluetoothRfcomm bt, List<String> args) async {
@@ -86,16 +109,22 @@ Future<void> _scan(BluetoothRfcomm bt, List<String> args) async {
   final timeout = Duration(seconds: int.parse(opts['timeout'] as String));
 
   stdout.writeln('Scanning for ${timeout.inSeconds}s...');
+  // The background scan accumulates every sighting (paired or not) into
+  // bt.scannedDevices; in an app you'd start it once in main() and read the
+  // cache whenever you need to show a picker.
   final seen = <DeviceId>{};
-  final sub = bt.startDiscovery().listen((r) {
-    if (seen.add(r.device.id)) {
-      final rssi = r.rssi != null ? ' (${r.rssi} dBm)' : '';
-      stdout.writeln('  ${r.device.id}  ${r.device.name ?? '(unknown)'}$rssi');
+  final sub = bt.scannedDevicesStream.listen((devices) {
+    for (final d in devices) {
+      if (seen.add(d.id)) {
+        final rssi = d.rssi != null ? ' (${d.rssi} dBm)' : '';
+        stdout.writeln('  ${d.id}  ${d.name ?? '(unknown)'}$rssi');
+      }
     }
-  });
+  }, onError: (Object e) => stderr.writeln('scan error: $e'));
+  await bt.startScan();
   await Future<void>.delayed(timeout);
+  await bt.stopScan();
   await sub.cancel();
-  await bt.stopDiscovery();
   stdout.writeln('Done. ${seen.length} device(s).');
 }
 
@@ -135,7 +164,7 @@ Future<void> _connect(BluetoothRfcomm bt, List<String> args) async {
     conn.add(Uint8List.fromList(utf8.encode('$line\r\n')));
   }
   await rx.cancel();
-  await conn.finish();
+  await conn.disconnect();
 }
 
 void _usage() {
@@ -144,7 +173,7 @@ bluetooth_rfcomm CLI
 
 Usage:
   btc doctor                        Load the native backend & print state
-  btc list                          List paired devices
+  btc list [--scan N]               List paired + scanned devices
   btc scan [--timeout 8]            Discover nearby devices
   btc connect <ADDR> [--channel N]  Open an RFCOMM serial link
 ''');

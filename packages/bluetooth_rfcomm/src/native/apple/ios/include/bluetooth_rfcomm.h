@@ -23,6 +23,9 @@ void btc_free(void *ptr);
 
 // Connected MFi accessories as a malloc'd UTF-8 JSON array, or NULL.
 // Each: {"id","name","protocols":[..],"manufacturer","modelNumber","serial"}.
+// 0 = Info.plist declares >=1 UISupportedExternalAccessoryProtocols entry;
+// 1 = missing/empty (EA can never see any accessory in that state).
+int32_t btc_ea_plist_declared(void);
 char *btc_ea_accessories_json(void);
 
 // Opens an EASession to the accessory whose connectionID matches `accessory_id`,
@@ -33,11 +36,24 @@ char *btc_ea_accessories_json(void);
 int64_t btc_ea_open(int64_t token, const char *accessory_id,
                     const char *protocol, btc_data_cb data, btc_state_cb state);
 
-// Queues bytes for transmission. Returns 0 on success.
+// Queues bytes for transmission. Returns 0 on success, -1 on failure (unknown
+// handle, or the buffered backlog cap — 1 MiB — would be exceeded).
 int32_t btc_ea_write(int64_t handle, const uint8_t *data, int32_t len);
+
+// Bytes accepted by btc_ea_write for `handle` but not yet written to the
+// output stream (the outBuffer backlog). 0 for an unknown/closed handle.
+int64_t btc_ea_pending(int64_t handle);
 
 // Closes the session. Returns 0 on success.
 int32_t btc_ea_close(int64_t handle);
+
+// Quiesces the backend: closes every open EASession (un-scheduling its streams
+// and nilling their delegates) and clears the handle map. The Dart layer calls
+// this at construction (hot-restart recovery: stop every native event source
+// left behind by a dead isolate BEFORE new callbacks are registered) and at
+// dispose (so nothing native ever invokes a torn-down callback trampoline
+// afterwards).
+void btc_ea_reset(void);
 
 #if defined(__cplusplus)
 }

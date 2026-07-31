@@ -24,3 +24,7 @@ doc/api/
 
 # Local Claude Code config / skills (not part of the published repo)
 .claude/
+
+# Flutter tool-generated plugin registries
+.flutter-plugins
+.flutter-plugins-dependencies

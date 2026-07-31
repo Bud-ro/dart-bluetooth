@@ -110,7 +110,14 @@ static char *btc_json(id obj) {
 @property(nonatomic) btc_state_cb state;
 @property(nonatomic, strong) EASession *session;
 @property(nonatomic, strong) NSMutableData *outBuffer;
+// Latches NSStreamEventHasSpaceAvailable so _pump only writes when the output
+// stream can take bytes without blocking the shared worker run loop.
+@property(nonatomic) BOOL hasSpace;
 @end
+
+// Backlog cap for outBuffer: past this btc_ea_write fails (-1) instead of
+// buffering without bound against a stalled accessory.
+static const NSUInteger kBTCWriteBacklogCap = 1 * 1024 * 1024; // 1 MiB
 
 @implementation BTCSession
 
@@ -142,19 +149,27 @@ static char *btc_json(id obj) {
 - (void)_pump {
   NSOutputStream *out = self.session.outputStream;
   if (out == nil) return;
-  // Do NOT gate on hasSpaceAvailable: it's edge-triggered and is consumed by the
-  // initial (empty-buffer) event, so a later enqueue would find it NO and stall
-  // forever. Always attempt a write when data is queued; a <=0 return means the
-  // stream is full/errored and re-arms the HasSpaceAvailable notification.
+  // Only write while space is known available: write: with no space blocks
+  // until the accessory drains, stalling the shared worker run loop for every
+  // session. self.hasSpace latches the edge-triggered HasSpaceAvailable event
+  // (which otherwise fires once against an empty buffer and is lost); after
+  // each write, polling out.hasSpaceAvailable (non-blocking) re-arms the flag
+  // while the stream can still take bytes. When it goes NO we stop and resume
+  // from the next NSStreamEventHasSpaceAvailable.
   // Track how much we've drained and compact the buffer ONCE at the end.
   // Removing the written prefix on every iteration memmoves the remaining bytes
   // down each time — O(n^2) when a large payload drains in many small writes.
   NSUInteger drained = 0;
-  while (drained < self.outBuffer.length) {
+  while (self.hasSpace && drained < self.outBuffer.length) {
     NSInteger written = [out write:(const uint8_t *)self.outBuffer.bytes + drained
                         maxLength:self.outBuffer.length - drained];
-    if (written <= 0) break;
+    if (written <= 0) {
+      // Full or errored despite the flag: wait for the next space event.
+      self.hasSpace = NO;
+      break;
+    }
     drained += (NSUInteger)written;
+    self.hasSpace = out.hasSpaceAvailable;
   }
   if (drained > 0) {
     [self.outBuffer replaceBytesInRange:NSMakeRange(0, drained)
@@ -164,7 +179,13 @@ static char *btc_json(id obj) {
 }
 
 - (void)closeSession {
-  for (NSStream *s in @[ self.session.inputStream, self.session.outputStream ]) {
+  // Either stream can be nil if the session never fully materialized, and an
+  // array literal with a nil element throws NSInvalidArgumentException — so
+  // collect only the streams that exist.
+  NSMutableArray<NSStream *> *streams = [NSMutableArray new];
+  if (self.session.inputStream) [streams addObject:self.session.inputStream];
+  if (self.session.outputStream) [streams addObject:self.session.outputStream];
+  for (NSStream *s in streams) {
     [s close];
     [s removeFromRunLoop:[NSRunLoop currentRunLoop]
                  forMode:NSDefaultRunLoopMode];
@@ -195,7 +216,10 @@ static char *btc_json(id obj) {
       break;
     }
     case NSStreamEventHasSpaceAvailable:
-      [self _pump];
+      if (stream == self.session.outputStream) {
+        self.hasSpace = YES;
+        [self _pump];
+      }
       break;
     case NSStreamEventEndEncountered:
     case NSStreamEventErrorOccurred:
@@ -221,6 +245,17 @@ static int64_t g_next_handle = 1;
 
 void btc_free(void *ptr) {
   if (ptr) free(ptr);
+}
+
+// 0 = the app's Info.plist declares at least one entry under
+// UISupportedExternalAccessoryProtocols; 1 = key missing/empty. Without the
+// key, connectedAccessories is ALWAYS empty and EASession init returns nil —
+// the single most common ExternalAccessory integration mistake, otherwise
+// indistinguishable from "no accessory connected / device is not MFi".
+int32_t btc_ea_plist_declared(void) {
+  NSArray *protos = [[NSBundle mainBundle]
+      objectForInfoDictionaryKey:@"UISupportedExternalAccessoryProtocols"];
+  return ([protos isKindOfClass:[NSArray class]] && protos.count > 0) ? 0 : 1;
 }
 
 char *btc_ea_accessories_json(void) {
@@ -281,11 +316,29 @@ int64_t btc_ea_open(int64_t token, const char *accessory_id,
 int32_t btc_ea_write(int64_t handle, const uint8_t *data, int32_t len) {
   if (len <= 0) return 0;
   NSData *bytes = [NSData dataWithBytes:data length:len];
-  [[BTCWorker shared] runAsync:^{
+  __block int32_t result = -1;
+  // runSync (not runAsync) so the backlog check is race-free against the
+  // worker's own draining; _pump never blocks, so this returns promptly.
+  [[BTCWorker shared] runSync:^{
     BTCSession *h = g_sessions()[@(handle)];
+    if (!h) return; // unknown/closed handle -> -1
+    if (h.outBuffer.length + bytes.length > kBTCWriteBacklogCap) {
+      result = -2; // backlog full — distinct from closed, matching macOS
+      return;
+    }
     [h enqueue:bytes];
+    result = 0;
   }];
-  return 0;
+  return result;
+}
+
+int64_t btc_ea_pending(int64_t handle) {
+  __block int64_t result = 0;
+  [[BTCWorker shared] runSync:^{
+    BTCSession *h = g_sessions()[@(handle)];
+    if (h) result = (int64_t)h.outBuffer.length;
+  }];
+  return result;
 }
 
 int32_t btc_ea_close(int64_t handle) {
@@ -297,4 +350,17 @@ int32_t btc_ea_close(int64_t handle) {
     }
   }];
   return 0;
+}
+
+void btc_ea_reset(void) {
+  [[BTCWorker shared] runSync:^{
+    // closeSession un-schedules the streams and nils their delegates, so no
+    // stream event can dial out into Dart after this returns.
+    for (BTCSession *h in [g_sessions() allValues]) {
+      [h closeSession];
+      h.data = NULL;
+      h.state = NULL;
+    }
+    [g_sessions() removeAllObjects];
+  }];
 }

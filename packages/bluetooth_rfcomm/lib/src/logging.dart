@@ -52,6 +52,28 @@ abstract final class BluetoothRfcommLoggers {
     adapter,
     native,
   ];
+
+  /// The package's parent [Logger] (`bluetooth_rfcomm`). With
+  /// `hierarchicalLoggingEnabled = true`, setting its level controls every
+  /// subsystem at once; [setLevel] does exactly that in one call.
+  static Logger get root => Logger(package);
+
+  /// The package's [Logger]s, parent first — for bulk configuration or
+  /// attaching listeners per subsystem.
+  static List<Logger> get loggers => [for (final name in all) Logger(name)];
+
+  /// One-call setup: enables `hierarchicalLoggingEnabled` and sets [level] on
+  /// the package's [root] logger, so every `bluetooth_rfcomm.*` subsystem
+  /// follows it (and the rest of the app's loggers are untouched).
+  ///
+  /// ```dart
+  /// BluetoothRfcommLoggers.setLevel(Level.FINE);
+  /// Logger.root.onRecord.listen((r) => debugPrint('${r.loggerName}: ${r.message}'));
+  /// ```
+  static void setLevel(Level level) {
+    hierarchicalLoggingEnabled = true;
+    root.level = level;
+  }
 }
 
 // --- Internal logger instances (not exported; clients use the names above with
