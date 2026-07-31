@@ -42,7 +42,8 @@ The contract is "never silently drop accepted bytes" — and it's enforced by
 accounting, not by review: every discard path (teardown purges, RX drops,
 rejected writes, buffer overflows) increments a counter surfaced via
 `BluetoothConnection.stats` (Dart + native hops on macOS). A loss report that
-all counters read zero against is a *localizable* loss. `btc bench` (example
+all counters read zero against is a *localizable* loss. `btc bench` (ships
+with the macOS send-path PR; example
 CLI) is the reference load harness: CRC-framed, sequence-numbered, separating
 lost / late / corrupted / never-sent.
 

@@ -38,12 +38,6 @@ Fixed — two adversarial review passes over the whole stack; highlights:
   writes fail with `BluetoothWriteException`, teardown is idempotent, and
   `flush()` reports lost bytes honestly (Windows previously acked success on
   a dead link; Android could report a clean flush after a failed write).
-- macOS: fixed two silent-loss bugs in the write queue — a duplicate write
-  completion could advance the queue past a chunk that was never transmitted
-  (one lost message per duplicate; the likely cause of steady percent-level
-  loss in request/response testing), and a short-but-successful write
-  discarded the unsent tail. Completions are now sequence-matched via refcon
-  and partial writes resubmit their remainder.
 - New test infrastructure that prevents bug classes rather than instances: a
   reusable transport contract-conformance checker (exported from
   `testing.dart`, runs against the fake in CI and against real backends on
@@ -51,24 +45,22 @@ Fixed — two adversarial review passes over the whole stack; highlights:
   machines, and clang static analysis of the native sources in CI. See
   `doc/testing.md`.
 - New diagnostics: `BluetoothConnection.stats` — hop-by-hop TX/RX counters
-  (Dart + native on macOS) that attribute any loss to an exact hop — and a
-  `btc bench` command in the example CLI: a CRC-framed, sequence-numbered
-  loss-measurement harness that distinguishes lost / late / corrupted /
-  never-sent.
+  (Dart + native on macOS) that attribute any loss to an exact hop, logged
+  automatically once per connection at teardown (FINE).
 - `input` no longer loses bytes that arrive while nothing is listening:
   a peer that responds before your first `listen()` attaches (or during a
   cancel/re-listen gap) is buffered and replayed in order. New `rxBytes` /
   `txBytes` counters make loss attributable to a side.
-- Sending is now lossless under load on every platform: transient write
-  errors (buffer-full, credit stalls, sniff-mode wakes) retry with backoff
-  instead of dropping bytes or tearing the connection down. The macOS write
-  path was rebuilt — writes no longer block the shared event thread (which
-  stalled inbound data and made 100ms-cadence traffic look like dropped
-  messages), flow-control callbacks resume stalled writes immediately, and a
-  transient error no longer wipes the queue.
+- Sending no longer loses bytes silently: Windows retries transient send
+  errors (WSAENOBUFS) for the message remainder — a hole mid-stream is now
+  impossible — and Android can no longer report a clean flush after a failed
+  write. The macOS send path is deliberately unchanged from 0.1.x in this
+  release (the only path with hardware mileage); its async-queue rework ships
+  separately, and every macOS discard is now counted in `stats` instead of
+  vanishing.
 - macOS: a stopped inquiry now completes its stream (the "list devices twice"
-  bug); sightings report real paired state; writes moved off the worker run
-  loop; SDP queries the device when nothing is cached.
+  bug); sightings report real paired state; SDP queries the device when
+  nothing is cached.
 - Windows: ordered socket teardown (no more stale isolate touching a recycled
   handle), connect timeouts honored, inquiry cancellation races closed.
 - Linux: connect timeouts bound BlueZ's own page timeout, BlueZ errors map to
