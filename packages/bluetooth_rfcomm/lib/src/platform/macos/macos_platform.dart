@@ -562,10 +562,9 @@ class _MacRfcommTransport implements RfcommTransport, TransportStats {
       ptr.asTypedList(data.length).setAll(0, data);
       final rc = btcRfcommWrite(_handle, ptr, data.length);
       if (rc != 0) {
-        // -2: the bounded native backlog is full (peer stalled). The bytes
-        // were NOT queued — surface it, never drop silently. (Closed-channel
-        // fail-fast is the guard above; the native accept path is
-        // deliberately non-blocking and counts its own teardown races.)
+        // -1: channel already closed natively (a disconnect event is on its
+        // way); -2: the bounded native backlog is full (peer stalled). Either
+        // way the bytes were NOT queued — surface it, never drop silently.
         throw BluetoothWriteException(
           rc == -2
               ? 'write rejected: native write backlog full (peer stalled)'

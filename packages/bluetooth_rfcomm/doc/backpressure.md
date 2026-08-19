@@ -128,8 +128,7 @@ int get pendingWriteBytes; // accepted by send() but not yet handed to the OS
 it synchronously): increment by `data.length` in `send`, decrement when the
 worker/native layer confirms bytes were handed to the OS. "Handed to the OS"
 means the platform write call accepted them (Winsock `send`, fd `write`,
-`OutputStream.write`, IOBluetooth write acceptance) — not delivered to the
-peer;
+`OutputStream.write`, `writeAsync` completion) — not delivered to the peer;
 RFCOMM has no end-to-end delivery signal.
 
 `FakeRfcommTransport` mirrors this: `send` accrues `pendingWriteBytes`,
