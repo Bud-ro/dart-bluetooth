@@ -279,13 +279,10 @@ static NSMutableDictionary<NSNumber *, NSValue *> *g_stats(void) {
 // cannot grow the registry without bound. Live channels are never evicted.
 static const NSUInteger kBTCStatsCap = 1024;
 
-// Accepted-but-not-yet-written byte gauges, keyed by handle. Lock-guarded
-// (NOT worker-confined) on purpose: with the blocking writeSync send path an
-// in-progress write can hold the worker for the length of a peer stall, and
-// both send()'s accept/backlog check and btc_rfcomm_pending reads must never
-// block the calling isolate behind that. Every accept (+) is balanced by
-// exactly one worker-side (-) — at writeBlocking entry, or in the
-// dead-channel path of the write block.
+// Accepted-but-not-yet-completed byte gauges, keyed by handle. Lock-guarded
+// (NOT worker-confined) so send()'s accept/backlog check and
+// btc_rfcomm_pending reads never need to enter the worker. Every accept (+) is
+// balanced by exactly one completion or teardown (-).
 static os_unfair_lock g_gauge_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_gauges_storage;
 
@@ -311,6 +308,8 @@ static int64_t btc_gauge_read(int64_t handle) {
 
 #pragma mark - RFCOMM channel delegate
 
+@class BTCWrite;
+
 @interface BTCChannel : NSObject <IOBluetoothRFCOMMChannelDelegate>
 @property(nonatomic) int64_t token;
 @property(nonatomic) int64_t handle;
@@ -328,8 +327,20 @@ static int64_t btc_gauge_read(int64_t handle) {
 // a struct the registry may since have freed. May be NULL if calloc failed at
 // open; every increment site checks.
 @property(nonatomic) btc_channel_stats *stats;
-- (void)writeBlocking:(NSData *)bytes;
+@property(nonatomic, strong) NSMutableArray<NSData *> *pendingWrites;
+@property(nonatomic, strong) BTCWrite *activeWrite;
+- (void)enqueueWrite:(NSData *)bytes;
+- (void)pumpWriteQueue;
+- (void)completeWrite:(BTCWrite *)write status:(IOReturn)status;
 - (void)teardown;
+@end
+
+@interface BTCWrite : NSObject
+@property(nonatomic, strong) NSData *bytes;
+@property(nonatomic) BOOL accounted;
+@end
+
+@implementation BTCWrite
 @end
 
 static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
@@ -341,7 +352,7 @@ static NSMutableDictionary<NSNumber *, BTCChannel *> *g_channels(void);
 // connection teardown — the moment getMTU misreported 0.)
 static const NSUInteger kBTCFallbackChunk = 127;
 
-// Cap on bytes accepted but not yet handed to writeSync. Past this
+// Cap on bytes accepted but not yet completed by writeAsync. Past this
 // btc_rfcomm_write fails (-2) instead of buffering without bound against a
 // stalled peer.
 static const int64_t kBTCWriteBacklogCap = 4 * 1024 * 1024; // 4 MiB
@@ -359,74 +370,75 @@ static btc_channel_stats *btc_stats_for(BTCChannel *ch) {
 
 @implementation BTCChannel
 
-// The field-proven 0.1.x send path: writeSync blocks THIS worker thread
-// (never the caller) until the controller accepts each MTU-sized chunk.
-// Deliberate trade-off for this release: a stalled peer or a sniff-mode wake
-// blocks the worker — including inbound delivery and every runSync C-ABI
-// call — for the duration of the stall. The completion-driven async queue
-// that removes this head-of-line blocking ships separately (send-path PR);
-// this release keeps the only macOS write path with hardware mileage.
-//
-// Latency note (sniff mode): with idle gaps of ~100 ms+ between messages the
-// controllers may place the ACL link in sniff/low-power mode; the first write
-// after an idle gap then stalls until the next sniff anchor point (commonly
-// up to ~1.28 s). That is pure LATENCY — baseband retransmission means no
-// bytes are lost on a live link.
-//
-// writeSync pumps the worker run loop while it waits, so delegate callbacks
-// (including rfcommChannelClosed → teardown) can fire mid-loop; the tornDown
-// re-check per chunk keeps a dead channel from being written to. Worker
-// thread only.
-- (void)writeBlocking:(NSData *)bytes {
-  const uint8_t *p = bytes.bytes;
+- (instancetype)init {
+  self = [super init];
+  if (self) self.pendingWrites = [NSMutableArray new];
+  return self;
+}
+
+- (void)enqueueWrite:(NSData *)bytes {
   NSUInteger mtu = self.mtu;
   if (mtu == 0 && self.channel) mtu = [self.channel getMTU];
   if (mtu == 0) mtu = kBTCFallbackChunk;
-  size_t offset = 0;
-  // Gauge discipline: the accept-side +len is paid back per chunk as each
-  // writeSync returns, and the remainder in one go on any early exit — so
-  // pendingWriteBytes/flush track what has NOT yet been handed to the OS,
-  // not "0 the moment the worker picked the payload up" (which would let
-  // flush() report success over megabytes still unsent behind a peer stall).
-  while (offset < bytes.length) {
-    if (self.tornDown || !self.channel) {
-      // Channel died between accept and (this part of) the write; the
-      // remainder was never transmitted. Count it — never silent. Stats via
-      // the registry, which outlives the channel for exactly this moment.
-      int64_t remainder = (int64_t)(bytes.length - offset);
-      btc_gauge_add(self.handle, -remainder);
-      btc_channel_stats *st = btc_stats_for(self);
-      if (st) st->txDroppedBytes += remainder;
-      return;
-    }
-    size_t chunk = bytes.length - offset;
-    if (chunk > mtu) chunk = mtu;
-    btc_channel_stats *st = btc_stats_for(self);
-    if (st) st->txSubmittedBytes += (int64_t)chunk;
-    IOReturn rc = [self.channel writeSync:(void *)(p + offset)
-                                   length:(UInt16)chunk];
-    // writeSync pumps the run loop, so teardown may have run meanwhile and
-    // NULLed self.stats — re-resolve through the registry before counting,
-    // or the common remote-disconnect-during-write loses its accounting.
-    st = btc_stats_for(self);
-    if (rc != kIOReturnSuccess) {
-      // A mid-stream failure means the link is gone. Surface it as a
-      // disconnect instead of silently truncating the byte stream, and count
-      // the untransmitted remainder (this chunk included).
-      int64_t remainder = (int64_t)(bytes.length - offset);
-      btc_gauge_add(self.handle, -remainder);
-      if (st) {
-        st->txFailedChunks++;
-        st->txDroppedBytes += remainder;
-      }
-      if (self.state) self.state(self.token, BTC_CONN_DISCONNECTED);
-      [self teardown];
-      return;
-    }
-    btc_gauge_add(self.handle, -(int64_t)chunk);
-    if (st) st->txCompletedBytes += (int64_t)chunk;
+
+  const uint8_t *p = bytes.bytes;
+  for (NSUInteger offset = 0; offset < bytes.length;) {
+    NSUInteger chunk = MIN(bytes.length - offset, mtu);
+    [self.pendingWrites addObject:[NSData dataWithBytes:p + offset length:chunk]];
     offset += chunk;
   }
+  [self pumpWriteQueue];
+}
+
+- (void)pumpWriteQueue {
+  if (self.tornDown || self.activeWrite || self.pendingWrites.count == 0) return;
+
+  BTCWrite *write = [BTCWrite new];
+  write.bytes = self.pendingWrites.firstObject;
+  [self.pendingWrites removeObjectAtIndex:0];
+  self.activeWrite = write;
+
+  btc_channel_stats *st = btc_stats_for(self);
+  if (st) st->txSubmittedBytes += (int64_t)write.bytes.length;
+
+  IOReturn rc = [self.channel writeAsync:(void *)write.bytes.bytes
+                                  length:(UInt16)write.bytes.length
+                                  refcon:(void *)write];
+  if (rc != kIOReturnSuccess) {
+    [self completeWrite:write status:rc];
+  }
+}
+
+- (void)completeWrite:(BTCWrite *)write status:(IOReturn)status {
+  if (self.activeWrite != write) return;
+  self.activeWrite = nil;
+
+  btc_channel_stats *st = btc_stats_for(self);
+  if (status == kIOReturnSuccess && !self.tornDown) {
+    btc_gauge_add(self.handle, -(int64_t)write.bytes.length);
+    if (st) st->txCompletedBytes += (int64_t)write.bytes.length;
+    [self pumpWriteQueue];
+    return;
+  }
+
+  int64_t dropped = write.accounted ? 0 : (int64_t)write.bytes.length;
+  for (NSData *pending in self.pendingWrites) {
+    dropped += (int64_t)pending.length;
+  }
+  [self.pendingWrites removeAllObjects];
+  if (dropped > 0) {
+    btc_gauge_add(self.handle, -dropped);
+    if (st) st->txDroppedBytes += dropped;
+  }
+  if (status != kIOReturnSuccess && st) st->txFailedChunks++;
+  if (status != kIOReturnSuccess && self.state) self.state(self.token, BTC_CONN_DISCONNECTED);
+  if (status != kIOReturnSuccess) [self teardown];
+}
+
+- (void)rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)rfcommChannel
+                             refcon:(void *)refcon
+                             status:(IOReturn)error {
+  [self completeWrite:(__bridge BTCWrite *)refcon status:error];
 }
 
 // Delegate-safe teardown shared by every close path (local close, remote
@@ -439,16 +451,29 @@ static btc_channel_stats *btc_stats_for(BTCChannel *ch) {
 // drop the last strong reference; the deferred block's capture of self keeps
 // the object alive until it has run. Worker thread only.
 //
-// Bytes still pending (accepted, block not yet run) are NOT purged here: each
-// pending writeBlocking block still runs, finds tornDown, and counts its own
-// remainder into txDroppedBytes via the registry — one counting site, no
-// double-count.
+// Pending writes are accounted as dropped here. An in-flight write remains
+// retained until its completion callback arrives, but is marked accounted so a
+// late callback cannot double-count it.
 - (void)teardown {
   // Idempotent: a second entry (e.g. rfcommChannelClosed arriving after a
   // failed write already tore down, before the deferred delegate-nil has run)
   // must not re-run the detach below.
   if (self.tornDown) return;
   self.tornDown = YES;
+  int64_t dropped = 0;
+  for (NSData *pending in self.pendingWrites) {
+    dropped += (int64_t)pending.length;
+  }
+  [self.pendingWrites removeAllObjects];
+  if (self.activeWrite && !self.activeWrite.accounted) {
+    dropped += (int64_t)self.activeWrite.bytes.length;
+    self.activeWrite.accounted = YES;
+  }
+  if (dropped > 0) {
+    btc_gauge_add(self.handle, -dropped);
+    btc_channel_stats *st = btc_stats_for(self);
+    if (st) st->txDroppedBytes += dropped;
+  }
   // Detach from the stats struct NOW (not in the deferred block): the registry
   // owns it and may free it (eviction/btc_reset) once this channel is torn
   // down, and delegate callbacks can still arrive until the deferred
@@ -712,10 +737,9 @@ int64_t btc_rfcomm_open(int64_t token, const char *address, int32_t channel,
 
 int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len) {
   if (len <= 0) return 0;
-  // No runSync anywhere on this path: with the blocking writeSync engine an
-  // in-progress write can hold the worker for the length of a peer stall,
-  // and send() must never block the calling isolate behind it (the 0.1.x
-  // contract). The handle map is worker-confined, so channel validation
+  // No runSync anywhere on this path: send() must never block the calling
+  // isolate (the 0.1.x contract). The handle map is worker-confined, so
+  // channel validation
   // happens inside the block: the Dart layer fail-fasts on its own closed
   // flag before calling here, and the narrow accepted-then-torn-down race is
   // counted into txDroppedBytes — never silent. The backlog check reads the
@@ -740,7 +764,7 @@ int32_t btc_rfcomm_write(int64_t handle, const uint8_t *data, int32_t len) {
       return;
     }
     if (ch.stats) ch.stats->txEnqueuedBytes += len;
-    [ch writeBlocking:bytes];
+    [ch enqueueWrite:bytes];
   }];
   return 0;
 }
@@ -759,7 +783,7 @@ int32_t btc_rfcomm_mtu(int64_t handle) {
 
 int64_t btc_rfcomm_pending(int64_t handle) {
   // Gauge read only — deliberately does NOT enter the worker, so flush/drain
-  // polling stays responsive while a writeSync rides out a peer stall.
+  // polling stays responsive while asynchronous writes wait for completion.
   return btc_gauge_read(handle);
 }
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- macOS: submit RFCOMM writes asynchronously and retain each MTU-sized buffer
+  until its completion callback, preventing a flow-controlled peer from
+  blocking the worker thread that delivers inbound RFCOMM data.
+
 ## 0.2.0
 
 The device-listing release: scanning is now a first-class, always-available
@@ -54,10 +60,7 @@ Fixed — two adversarial review passes over the whole stack; highlights:
 - Sending no longer loses bytes silently: Windows retries transient send
   errors (WSAENOBUFS) for the message remainder — a hole mid-stream is now
   impossible — and Android can no longer report a clean flush after a failed
-  write. The macOS send path is deliberately unchanged from 0.1.x in this
-  release (the only path with hardware mileage); its async-queue rework ships
-  separately, and every macOS discard is now counted in `stats` instead of
-  vanishing.
+  write. Every macOS discard is counted in `stats` instead of vanishing.
 - macOS: a stopped inquiry now completes its stream (the "list devices twice"
   bug); sightings report real paired state; SDP queries the device when
   nothing is cached.
