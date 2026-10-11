@@ -485,11 +485,16 @@ class _LinuxRfcommProfile implements RfcommTransport {
       options['Channel'] = DBusUint16(channel);
     }
     try {
-      await mgr.callMethod('org.bluez.ProfileManager1', 'RegisterProfile', [
-        profilePath,
-        DBusString(serviceUuid.value),
-        DBusDict.stringVariant(options),
-      ], replySignature: DBusSignature(''));
+      await mgr.callMethod(
+        'org.bluez.ProfileManager1',
+        'RegisterProfile',
+        [
+          profilePath,
+          DBusString(serviceUuid.value),
+          DBusDict.stringVariant(options),
+        ],
+        replySignature: DBusSignature(''),
+      );
     } catch (e) {
       settled = true;
       await bus.unregisterObject(profile);
@@ -535,9 +540,12 @@ class _LinuxRfcommProfile implements RfcommTransport {
         name: 'org.bluez',
         path: DBusObjectPath('/org/bluez'),
       );
-      await mgr.callMethod('org.bluez.ProfileManager1', 'UnregisterProfile', [
-        profile.path,
-      ], replySignature: DBusSignature(''));
+      await mgr.callMethod(
+        'org.bluez.ProfileManager1',
+        'UnregisterProfile',
+        [profile.path],
+        replySignature: DBusSignature(''),
+      );
     } catch (_) {
       /* already gone */
     }

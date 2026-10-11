@@ -21,11 +21,15 @@ import 'package:test/test.dart';
 final _le = Endian.host == Endian.little;
 
 void main() {
-  test('struct sizes match the Win32 SDK (x64)', () {
-    // SOCKADDR_BTH is byte-packed in ws2bth.h (pshpack1): 2 + 8 + 16 + 4 = 30.
-    // (Natural alignment would give 40 — that mismatch made connect() fail.)
-    expect(ffi.sizeOf<SockaddrBth>(), 30);
-  }, skip: ffi.sizeOf<ffi.IntPtr>() != 8 ? '64-bit host only' : false);
+  test(
+    'struct sizes match the Win32 SDK (x64)',
+    () {
+      // SOCKADDR_BTH is byte-packed in ws2bth.h (pshpack1): 2 + 8 + 16 + 4 = 30.
+      // (Natural alignment would give 40 — that mismatch made connect() fail.)
+      expect(ffi.sizeOf<SockaddrBth>(), 30);
+    },
+    skip: ffi.sizeOf<ffi.IntPtr>() != 8 ? '64-bit host only' : false,
+  );
 
   test(
     'SOCKADDR_BTH byte layout matches packed Win32 (offsets + endianness)',
