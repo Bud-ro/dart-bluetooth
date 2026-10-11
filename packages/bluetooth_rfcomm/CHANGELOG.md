@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.0
+
+**Rollback release.** 0.2.0 introduced performance regressions in the field
+that could not be isolated, so this release reverts the Windows, macOS, Linux
+and iOS backends and the `BluetoothConnection` data path to the
+hardware-proven 0.1.1 code. Two things from 0.2.0 are deliberately kept:
+
+- **The Android fixes** (0.2.0 Android discovery and connect were verified on
+  hardware): the `RECEIVER_EXPORTED` discovery receiver (Android 13+
+  sightings), R8/ProGuard consumer keep rules, app-classloader lookup from
+  Dart-attached threads, descriptive bridge/permission exceptions instead of
+  empty lists, a shared native inquiry across concurrent discovery streams,
+  honest `flush()`, the isolate-sendability fix for `connect`, 16 KB page
+  alignment, and the hot-restart native reset hooks.
+- **The scan-control API**, so user code decides when the radio scans instead
+  of relying on repeated listing calls that never stop: `startScan()` /
+  `stopScan()` / `isScanning`, `scannedDevices` / `scannedDevicesStream` /
+  `forgetScannedDevices()`, and the three listings `listScannedDevices()`,
+  `listPairedDevices()`, `listPairedAndScannedDevices()` (with `scanDuration`).
+  `bondedAndDiscoveredStream` keeps its 0.2.0 paired-AND-sighted semantics.
+
+Reverted (gone again until a measured, closed-loop fix lands):
+
+- Windows `startDiscovery` is back to the 0.1.x radio-silent paired-list shim
+  (no `WSALookupService` inquiry). The background scan therefore never
+  touches the radio on Windows; `listPairedAndScannedDevices` equals the
+  paired list there.
+- `BluetoothConnection.disconnect()`, `pendingWriteBytes`, `drain()`,
+  `maxPayloadSize` and `stats` are removed — use `finish()` / `close()`,
+  `flush()` and `write()` as in 0.1.x.
+- `BluetoothRfcommLoggers.root` / `.loggers` / `.setLevel()` are removed
+  (configure `Logger('bluetooth_rfcomm')` directly).
+- `checkRfcommTransportConformance` is no longer exported from `testing.dart`.
+- The 0.2.0 Windows/macOS/Linux/iOS reliability and teardown changes
+  (transient-send retry, ordered socket teardown, input replay buffering,
+  the macOS inquiry/SDP changes, the Linux shared-profile and suspend/resume
+  changes, the iOS/macOS permission diagnostics).
+
 ## 0.2.0
 
 The device-listing release: scanning is now a first-class, always-available

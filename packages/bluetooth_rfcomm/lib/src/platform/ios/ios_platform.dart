@@ -14,23 +14,7 @@ import '../../models/discovery_result.dart';
 import '../../models/enums.dart';
 import '../../models/uuid.dart';
 import '../platform_interface.dart';
-import '../transport_stats.dart';
 import 'ios_bindings.dart';
-
-// Additive binding for the transport-introspection C export. Declared here
-// (with an explicit assetId matching ios_bindings.dart's @DefaultAsset) rather
-// than in the shared bindings file to keep that file's surface stable.
-@ffi.Native<ffi.Int64 Function(ffi.Int64)>(
-  symbol: 'btc_ea_pending',
-  assetId: 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart',
-)
-external int _btcEaPending(int handle);
-
-@ffi.Native<ffi.Int32 Function()>(
-  symbol: 'btc_ea_plist_declared',
-  assetId: 'package:bluetooth_rfcomm/bluetooth_rfcomm.dart',
-)
-external int _btcEaPlistDeclared();
 
 /// iOS backend over ExternalAccessory (EASession).
 ///
@@ -43,18 +27,7 @@ external int _btcEaPlistDeclared();
 /// a MAC. RFCOMM channel / service UUID don't apply; the accessory's first
 /// declared protocol string is used.
 class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
-  IosBluetoothRfcomm() {
-    // The callables must pin this isolate while native sources can dial them.
-    _setCallablesKeepAlive(true);
-    // Hot-restart recovery: close any EA sessions a previous isolate left
-    // open before this isolate hands out fresh callback pointers.
-    btcEaReset();
-  }
-
-  static void _setCallablesKeepAlive(bool alive) {
-    _dataCb.keepIsolateAlive = alive;
-    _stateCb.keepIsolateAlive = alive;
-  }
+  IosBluetoothRfcomm();
 
   static const int _maxInboundChunk = 1 << 20;
   static int _nextToken = 1;
@@ -65,11 +38,6 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
   static final ffi.NativeCallable<StateCbNative> _stateCb =
       ffi.NativeCallable<StateCbNative>.listener(_onState);
 
-  // ExternalAccessory exposes NO radio-state API (that would need
-  // CoreBluetooth, which triggers the Bluetooth permission prompt just for a
-  // status read). These therefore report a FIXED optimistic `on` — unlike
-  // every other platform, they say nothing about the actual radio. Callers
-  // find out the truth from connect() failing.
   @override
   Future<bool> isSupported() async => true;
 
@@ -91,29 +59,12 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
   Future<List<BluetoothDevice>> bondedDevices() async => _accessories();
 
   @override
-  Stream<BluetoothDiscoveryResult> startDiscovery() {
+  Stream<BluetoothDiscoveryResult> startDiscovery() async* {
     // EA has no inquiry; surface the currently-connected MFi accessories.
-    // Broadcast, matching every other backend — the facade shares one platform
-    // stream among its listeners and relies on that.
-    late StreamController<BluetoothDiscoveryResult> controller;
-    controller = StreamController<BluetoothDiscoveryResult>.broadcast(
-      onListen: () async {
-        try {
-          final now = DateTime.now();
-          for (final d in await _accessories()) {
-            if (controller.isClosed) return;
-            controller.add(
-              BluetoothDiscoveryResult(device: d, rssi: null, timestamp: now),
-            );
-          }
-        } catch (e) {
-          if (!controller.isClosed) controller.addError(e);
-        } finally {
-          if (!controller.isClosed) unawaited(controller.close());
-        }
-      },
-    );
-    return controller.stream;
+    final now = DateTime.now();
+    for (final d in await _accessories()) {
+      yield BluetoothDiscoveryResult(device: d, rssi: null, timestamp: now);
+    }
   }
 
   @override
@@ -148,13 +99,6 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
       );
       if (handle == 0) {
         _transports.remove(token);
-        if (_btcEaPlistDeclared() != 0) {
-          throw const BluetoothException(
-            'ExternalAccessory session failed: this app declares no '
-            'UISupportedExternalAccessoryProtocols in its Info.plist. Add '
-            'your accessory protocol string(s) to that key.',
-          );
-        }
         throw const BluetoothUnsupportedException(
           'No MFi ExternalAccessory session could be opened. iOS only supports '
           'Bluetooth Classic with MFi-certified accessories; for a non-MFi '
@@ -188,33 +132,16 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
     for (final t in _transports.values.toList()) {
       await t.close();
     }
-    // Quiesce anything still live natively, then release the isolate pin.
-    btcEaReset();
-    _setCallablesKeepAlive(false);
-    BluetoothRfcommPlatform.detachInstance(this);
   }
 
   // --- helpers -------------------------------------------------------------
 
   Future<List<BluetoothDevice>> _accessories() async {
     final ptr = btcEaAccessoriesJson();
-    if (ptr == ffi.nullptr) {
-      // Genuine-empty is a non-NULL "[]"; NULL is an allocation/serialization
-      // failure in the native layer.
-      throw const BluetoothException('accessories native call failed');
-    }
+    if (ptr == ffi.nullptr) return const [];
     try {
       final list = (jsonDecode(ptr.cast<Utf8>().toDartString()) as List)
           .cast<Map<String, dynamic>>();
-      if (list.isEmpty && _btcEaPlistDeclared() != 0) {
-        // Without the plist key EA can never see ANY accessory — that's an
-        // app-configuration error, not "nothing is connected".
-        throw const BluetoothException(
-          'This app declares no UISupportedExternalAccessoryProtocols in its '
-          'Info.plist, so ExternalAccessory cannot surface any accessory. '
-          'Add your accessory protocol string(s) to that key.',
-        );
-      }
       return list
           .map(
             (j) => BluetoothDevice(
@@ -234,24 +161,10 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
     }
   }
 
-  // Process-wide RX drop accounting, mirroring the macOS backend: a chunk
-  // discarded here must show up in [nativeStats], not silently vanish.
-  static int _rxUnroutedEvents = 0;
-  static int _rxUnroutedBytes = 0;
-  static int _rxOversizeEvents = 0;
-
   static void _onData(int token, ffi.Pointer<ffi.Uint8> data, int len) {
     final t = _transports[token];
     try {
-      if (len <= 0) {
-        // Nothing to route or count.
-      } else if (t == null) {
-        _rxUnroutedEvents++;
-        _rxUnroutedBytes += len;
-      } else if (len > _maxInboundChunk) {
-        _rxOversizeEvents++;
-        logNative.warning(() => 'dropped oversize inbound chunk (${len}B)');
-      } else if (len > 0) {
+      if (t != null && len > 0 && len <= _maxInboundChunk) {
         t._deliver(Uint8List.fromList(data.asTypedList(len)));
       }
     } finally {
@@ -266,7 +179,7 @@ class IosBluetoothRfcomm extends BluetoothRfcommPlatform {
   }
 }
 
-class _IosEaTransport implements RfcommTransport, TransportStats {
+class _IosEaTransport implements RfcommTransport {
   _IosEaTransport(this._token);
 
   final int _token;
@@ -279,21 +192,6 @@ class _IosEaTransport implements RfcommTransport, TransportStats {
   final Completer<void> _connected = Completer<void>();
   ConnectionState _current = ConnectionState.connecting;
   bool _closed = false;
-
-  /// Bytes still in the native outBuffer when the session tore down — latched
-  /// BEFORE close zeroes the gauge, so the loss stays reportable (flush
-  /// throws; stats expose it) per the lossless-send contract, even though
-  /// this transport self-closes on the native state callback before the
-  /// connection layer can observe the queue.
-  int _droppedTxBytes = 0;
-
-  @override
-  Map<String, int> nativeStats() => {
-    'txDroppedBytes': _droppedTxBytes,
-    'rxUnroutedEvents': IosBluetoothRfcomm._rxUnroutedEvents,
-    'rxUnroutedBytes': IosBluetoothRfcomm._rxUnroutedBytes,
-    'rxOversizeEvents': IosBluetoothRfcomm._rxOversizeEvents,
-  };
 
   void bindHandle(int handle) => _handle = handle;
 
@@ -341,16 +239,6 @@ class _IosEaTransport implements RfcommTransport, TransportStats {
   @override
   ConnectionState get state => _current;
 
-  /// ExternalAccessory streams advertise no per-write payload limit.
-  @override
-  int? get maxPayloadSize => null;
-
-  /// Bytes accepted by [send] but not yet written to the accessory's output
-  /// stream (the native outBuffer backlog).
-  @override
-  int get pendingWriteBytes =>
-      (_closed || _handle == 0) ? 0 : _btcEaPending(_handle);
-
   @override
   void send(Uint8List data) {
     if (_closed || _handle == 0) {
@@ -360,43 +248,18 @@ class _IosEaTransport implements RfcommTransport, TransportStats {
     try {
       ptr.asTypedList(data.length).setAll(0, data);
       final rc = btcEaWrite(_handle, ptr, data.length);
-      if (rc != 0) {
-        throw BluetoothWriteException(
-          rc == -2
-              ? 'write rejected: native write backlog full (accessory '
-                    'stalled)'
-              : 'write failed: session is not open',
-          code: rc,
-        );
-      }
+      if (rc != 0) throw BluetoothWriteException('write failed', code: rc);
     } finally {
       calloc.free(ptr);
     }
   }
 
   @override
-  Future<void> flush() async {
-    // Drain the native outBuffer. Bounded: closing the session clears it.
-    while (!_closed && _handle != 0 && _btcEaPending(_handle) > 0) {
-      await Future<void>.delayed(const Duration(milliseconds: 5));
-    }
-    // A teardown that discarded queued bytes must be reported, matching
-    // every other platform's flush semantics.
-    if (_droppedTxBytes > 0) {
-      throw BluetoothWriteException(
-        'flush failed — $_droppedTxBytes bytes discarded at disconnect',
-      );
-    }
-  }
+  Future<void> flush() async {}
 
   @override
   Future<void> close() async {
     if (_closed) return;
-    // Latch the loss before the native close discards the outBuffer.
-    if (_handle != 0) {
-      final pend = _btcEaPending(_handle);
-      if (pend > 0) _droppedTxBytes += pend;
-    }
     _closed = true;
     final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;

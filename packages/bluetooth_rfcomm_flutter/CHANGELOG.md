@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Tracks `bluetooth_rfcomm` 0.3.0, the rollback of the 0.2.0 performance
+  regressions. The Android native layer (Kotlin + JNI) is unchanged from
+  0.2.0: every Android fix is kept (the Android 13+ discovery receiver,
+  R8/ProGuard keep rules, app-classloader lookup, honest flush, hot-restart
+  reset hooks). No API changes here; see the core's changelog for what was
+  reverted.
+
 ## 0.2.0
 
 - Tracks `bluetooth_rfcomm` 0.2.0 (background scan, list APIs, `disconnect()`,

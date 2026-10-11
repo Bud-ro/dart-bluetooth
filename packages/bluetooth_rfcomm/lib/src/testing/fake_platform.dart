@@ -7,7 +7,6 @@ import '../models/bluetooth_service.dart';
 import '../models/device_id.dart';
 import '../models/discovery_result.dart';
 import '../models/enums.dart';
-import '../platform/transport_stats.dart';
 import '../models/uuid.dart';
 import '../platform/platform_interface.dart';
 
@@ -53,11 +52,6 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
 
   /// If set, [openRfcomm] throws this instead of returning a transport.
   Object? connectError;
-
-  /// Seeds [FakeRfcommTransport.maxPayloadSize] on every transport handed out
-  /// by [openRfcomm]. Null (the default) models Windows/Linux/iOS, where the
-  /// OS advertises no per-write payload limit.
-  int? transportMaxPayloadSize;
 
   final StreamController<BluetoothAdapterState> _adapterController =
       StreamController<BluetoothAdapterState>.broadcast();
@@ -187,7 +181,6 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
       device: device,
       channel: channel,
       serviceUuid: serviceUuid,
-      maxPayloadSize: transportMaxPayloadSize,
     );
     transports.add(t);
     return t;
@@ -206,12 +199,11 @@ class FakeBluetoothRfcommPlatform extends BluetoothRfcommPlatform {
 }
 
 /// A controllable [RfcommTransport] for tests.
-class FakeRfcommTransport implements RfcommTransport, TransportStats {
+class FakeRfcommTransport implements RfcommTransport {
   FakeRfcommTransport({
     required this.device,
     required this.channel,
     required this.serviceUuid,
-    this.maxPayloadSize,
   });
 
   /// Which device this transport was opened for.
@@ -233,30 +225,6 @@ class FakeRfcommTransport implements RfcommTransport, TransportStats {
   /// (Windows/Linux/Android throw a BluetoothWriteException there).
   Object? flushError;
 
-  /// OS-advertised max single-write payload surfaced as
-  /// [RfcommTransport.maxPayloadSize]. Mutable so tests can model any
-  /// platform: null (the default) for Windows/Linux/iOS, ~1011 for a macOS
-  /// RFCOMM MTU, ~990 for an Android max-transmit-packet-size.
-  @override
-  int? maxPayloadSize;
-
-  /// Whether [flush] models a real drain acknowledgement (Windows, Linux,
-  /// Android) by zeroing [pendingWriteBytes] once it resolves. Set false to
-  /// model the best-effort platforms (macOS/iOS), where flush resolves
-  /// immediately and the queue drains on its own time — tests then lower
-  /// [pendingWriteBytes] themselves to simulate the OS draining.
-  bool flushDrains = true;
-
-  int _pendingWriteBytes = 0;
-
-  /// Bytes accepted by [send] but not yet "handed to the OS". Grows by
-  /// `data.length` on every [send]; returns to 0 on a successful [flush] when
-  /// [flushDrains] is true. Also settable, so tests can script arbitrary
-  /// queue depths and drain timelines.
-  @override
-  int get pendingWriteBytes => _pendingWriteBytes;
-  set pendingWriteBytes(int value) => _pendingWriteBytes = value;
-
   // Single-subscription, matching the RfcommTransport contract and every real
   // backend (the facade re-broadcasts via BluetoothConnection.input).
   final StreamController<Uint8List> _incoming = StreamController<Uint8List>();
@@ -275,24 +243,12 @@ class FakeRfcommTransport implements RfcommTransport, TransportStats {
   /// both the state and incoming streams on a peer-initiated disconnect.
   void dropPeer() {
     if (_closed) return;
-    // Real transports zero their pending gauge during teardown and latch the
-    // loss; the fake must behave identically or unit tests exercise a gauge
-    // contract that exists nowhere in production.
-    _txDroppedBytes += _pendingWriteBytes;
-    _pendingWriteBytes = 0;
     _closed = true;
     _current = ConnectionState.disconnected;
     _state.add(ConnectionState.disconnected);
     if (!_state.isClosed) unawaited(_state.close());
     if (!_incoming.isClosed) unawaited(_incoming.close());
   }
-
-  /// Bytes discarded by teardown (dropPeer/close with a non-empty queue),
-  /// latched like every real transport and reported via [nativeStats].
-  int _txDroppedBytes = 0;
-
-  @override
-  Map<String, int> nativeStats() => {'txDroppedBytes': _txDroppedBytes};
 
   @override
   Stream<Uint8List> get incoming => _incoming.stream;
@@ -307,7 +263,6 @@ class FakeRfcommTransport implements RfcommTransport, TransportStats {
   void send(Uint8List data) {
     if (_closed) throw const BluetoothWriteException('transport closed');
     sent.add(data);
-    _pendingWriteBytes += data.length;
   }
 
   @override
@@ -315,14 +270,11 @@ class FakeRfcommTransport implements RfcommTransport, TransportStats {
     flushCount++;
     final err = flushError;
     if (err != null && !_closed) throw err;
-    if (flushDrains) _pendingWriteBytes = 0;
   }
 
   @override
   Future<void> close() async {
     if (_closed) return;
-    _txDroppedBytes += _pendingWriteBytes;
-    _pendingWriteBytes = 0;
     _closed = true;
     final alreadyDisconnected = _current == ConnectionState.disconnected;
     _current = ConnectionState.disconnected;

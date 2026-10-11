@@ -10,5 +10,3 @@ library;
 
 export 'src/testing/fake_platform.dart'
     show FakeBluetoothRfcommPlatform, FakeRfcommTransport;
-export 'src/testing/transport_conformance.dart'
-    show checkRfcommTransportConformance;

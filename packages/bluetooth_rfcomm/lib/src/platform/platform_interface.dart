@@ -35,22 +35,10 @@ abstract interface class RfcommTransport {
 
   /// Queues [data] for transmission. Must return immediately without blocking;
   /// the platform drains the queue off the calling isolate.
-  ///
-  /// The queue is unbounded and lossless: every byte accepted here is either
-  /// eventually handed to the OS or reported lost via [flush] / the terminal
-  /// disconnect — a transport must never silently drop accepted bytes.
   void send(Uint8List data);
 
   /// Completes when all queued bytes have been handed to the OS.
   Future<void> flush();
-
-  /// OS-advertised largest single write payload (RFCOMM MTU on macOS, max
-  /// transmit packet size on Android); null where the OS exposes none
-  /// (Windows/Linux stream sockets, iOS EA).
-  int? get maxPayloadSize;
-
-  /// Bytes accepted by [send] but not yet handed to the OS.
-  int get pendingWriteBytes;
 
   /// Closes the channel. Idempotent.
   Future<void> close();
@@ -108,9 +96,10 @@ abstract class BluetoothRfcommPlatform {
   /// Paired (bonded) devices known to the OS.
   Future<List<BluetoothDevice>> bondedDevices();
 
-  /// Starts a real radio inquiry and streams sightings of nearby devices,
-  /// paired or not. Cancelling the subscription (or calling [stopDiscovery])
-  /// aborts the inquiry on every backend.
+  /// Starts an inquiry and streams sightings. Cancelling the subscription (or
+  /// calling [stopDiscovery]) stops the inquiry on every backend except Windows,
+  /// where the inquiry runs to completion (~10s) on a worker isolate and its
+  /// results are delivered in one batch; cancelling there only discards them.
   Stream<BluetoothDiscoveryResult> startDiscovery();
 
   /// Stops any in-progress inquiry.
@@ -141,7 +130,7 @@ abstract class BluetoothRfcommPlatform {
 
   /// Releases any global resources held by the backend.
   ///
-  /// Overrides MUST also call [detachInstance] (or super) so the shared
+  /// Overrides should also call [detachInstance] (or super) so the shared
   /// [instance] slot never hands a disposed backend to the next facade.
   Future<void> dispose() async {
     detachInstance(this);
