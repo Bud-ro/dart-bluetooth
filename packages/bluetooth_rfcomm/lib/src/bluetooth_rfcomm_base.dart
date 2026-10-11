@@ -96,12 +96,14 @@ class BluetoothRfcomm {
     return devices;
   }
 
-  /// Starts a radio inquiry and streams sightings of nearby devices, paired or
-  /// not. Stop by cancelling the subscription or calling [stopDiscovery].
+  /// Starts an inquiry and streams sightings. Stop by cancelling the
+  /// subscription or calling [stopDiscovery].
   ///
-  /// This is a real inquiry on every platform (Windows included, via
-  /// `WSALookupService` on a worker isolate — abortable, unlike a classic
-  /// HCI inquiry). An inquiry occupies the radio while it runs: the BACKGROUND
+  /// **Windows does not run a radio inquiry**: a Bluetooth Classic inquiry
+  /// monopolizes the radio for seconds and can't be aborted, which starves
+  /// connections — so here `startDiscovery` returns the **paired** devices only
+  /// (a fast, radio-silent registry read) and finds no nearby unpaired devices.
+  /// Elsewhere an inquiry occupies the radio while it runs: the BACKGROUND
   /// scan is paused automatically during a [connect], but a one-shot discovery
   /// you started here is yours to manage — cancel it before connecting or the
   /// handshake is delayed until the inquiry ends. RSSI is reported during
@@ -113,9 +115,15 @@ class BluetoothRfcomm {
   Stream<BluetoothDiscoveryResult> startDiscovery() {
     logDiscovery.fine('discovery requested');
     // One platform stream per startDiscovery() CALL, shared by every listener
-    // of the returned stream (platform streams are broadcast) — so two
-    // listeners never start two competing native inquiries.
-    final source = _platform.startDiscovery();
+    // of the returned stream — so two listeners never start two competing
+    // native inquiries. Some backends hand out single-subscription streams
+    // (an `async*` on Windows/iOS): wrap those as broadcast so a second
+    // listener can't throw "already listened to"; the source is cancelled
+    // when the last listener leaves.
+    final raw = _platform.startDiscovery();
+    final source = raw.isBroadcast
+        ? raw
+        : raw.asBroadcastStream(onCancel: (sub) => sub.cancel());
     return Stream<BluetoothDiscoveryResult>.multi((controller) {
       _activeDiscoveries++;
       _pauseScanCycle();
@@ -244,7 +252,7 @@ class BluetoothRfcomm {
   /// early (e.g. from `main`), and by the time you list devices the cache is
   /// already populated — combine [bondedDevices] with [scannedDevices] and you
   /// get paired *and* nearby devices in one instant, radio-silent read. Without
-  /// this, platforms whose inquiry takes ~10s (macOS, Windows) appear to
+  /// this, platforms whose inquiry takes ~10s (macOS, Android) appear to
   /// "return paired but not scanned devices" on a first listing.
   ///
   /// The scan runs real radio inquiries in a loop ([rescanDelay] apart, on
@@ -259,8 +267,10 @@ class BluetoothRfcomm {
   /// heavy transfer. [bondedAndDiscoveredStream] shares this same scan engine
   /// (it holds it running while listened), so combining them is fine.
   ///
-  /// Platform notes: on iOS there is no inquiry — the "scan" surfaces the
-  /// currently-connected MFi accessories.
+  /// Platform notes: on Windows the scan never touches the radio — each cycle
+  /// re-reads the paired list (see [startDiscovery]), so [scannedDevices]
+  /// there is the paired set, not a presence signal. On iOS there is no
+  /// inquiry — the "scan" surfaces the currently-connected MFi accessories.
   ///
   /// Scan errors (adapter off, permission missing, …) are reported on
   /// [scannedDevicesStream]; the loop keeps retrying on the [rescanDelay]
@@ -557,16 +567,16 @@ class BluetoothRfcomm {
   }
 
   /// One-shot snapshot of paired devices seen in a single inquiry — i.e. bonded
-  /// AND in range during the [timeout] window, on every platform (Windows runs
-  /// a real `WSALookupService` inquiry). For an always-on list prefer
+  /// AND in range during the [timeout] window. For an always-on list prefer
   /// [bondedAndDiscoveredStream], which keeps scanning and accumulates
   /// sightings; for the scan-cache-based intersection in one call see
   /// [listPairedAndScannedDevices].
   ///
   /// Returns as soon as discovery completes; [timeout] caps platforms whose
   /// discovery streams continuously (Linux) or whose inquiry outlasts it
-  /// (macOS/Windows/Android inquiries run ~10s — cancelling at [timeout]
-  /// aborts them).
+  /// (macOS/Android inquiries run ~10s — cancelling at [timeout] aborts
+  /// them). On Windows, where discovery is the radio-silent paired-list shim
+  /// (see [startDiscovery]), this completes instantly with the paired list.
   Future<List<BluetoothDevice>> bondedAndDiscovered({
     Duration timeout = const Duration(seconds: 8),
   }) async {
@@ -644,8 +654,9 @@ class BluetoothRfcomm {
   /// Live stream of devices that are **paired AND have been sighted by the
   /// scan** — "I care about it AND can probably connect to it", the streaming
   /// version of [listPairedAndScannedDevices]. Identical semantics on every
-  /// platform, Windows included: a device appears only once the radio has
-  /// actually seen it.
+  /// platform that inquires: a device appears only once the radio has
+  /// actually seen it. (On Windows, where discovery is the paired-list shim —
+  /// see [startDiscovery] — this is the paired list.)
   ///
   /// Listening holds the shared background scan engine running (the same one
   /// as [startScan] — they compose, never conflict), so sightings keep

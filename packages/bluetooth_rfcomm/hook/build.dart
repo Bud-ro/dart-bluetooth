@@ -26,9 +26,7 @@ void main(List<String> args) async {
     final (String relDir, List<String> frameworks) = switch (os) {
       OS.macOS => (
         'src/native/apple/macos/',
-        // CoreBluetooth only for CBCentralManager.authorization (the TCC
-        // probe in btc_adapter_state); RFCOMM itself is IOBluetooth.
-        const ['Foundation', 'IOBluetooth', 'CoreBluetooth'],
+        const ['Foundation', 'IOBluetooth'],
       ),
       OS.iOS => (
         'src/native/apple/ios/',

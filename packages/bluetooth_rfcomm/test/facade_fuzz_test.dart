@@ -199,7 +199,7 @@ Future<void> _fuzzOnce(int seed, int ops) async {
       } on BluetoothWriteException {
         // fine post-drop
       }
-      await c.disconnect();
+      await c.finish();
     },
     () async {
       if (fake.transports.isEmpty) return;
@@ -219,7 +219,7 @@ Future<void> _fuzzOnce(int seed, int ops) async {
 
   // Teardown: everything must quiesce cleanly regardless of live subs/conns.
   for (final c in conns) {
-    await c.disconnect();
+    await c.finish();
   }
   await bt.dispose();
   disposed = true;

@@ -164,7 +164,7 @@ Future<void> _connect(BluetoothRfcomm bt, List<String> args) async {
     conn.add(Uint8List.fromList(utf8.encode('$line\r\n')));
   }
   await rx.cancel();
-  await conn.disconnect();
+  await conn.finish();
 }
 
 void _usage() {
